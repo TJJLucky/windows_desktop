@@ -72,15 +72,26 @@ HTTP Client -> service/ -> Dispatcher -> utils/qq -> utils/vision + utils/core
 
 ## 独立 QQ Service
 
-服务运行于当前 Windows 登录用户的交互桌面会话，不注册为 Windows Service，也不开放公网端口。它只监听由系统分配的 `127.0.0.1:0` 动态端口，启动后将 endpoint 和一次性 token 原子写入调用方指定的 endpoint 文件。
+服务运行于当前 Windows 登录用户的交互桌面会话，不注册为 Windows Service，也不开放公网端口。它只监听由系统分配的 `127.0.0.1:0` 动态端口，启动后将 endpoint 和一次性 token 原子写入 endpoint 文件。
 
-启动：
+**默认模式（最终用户，双击即用）**：不带任何参数运行（exe 双击 / `python -m service`），数据目录自动落到 `%LOCALAPPDATA%\price-agent-qq-service\`：
 
 ```powershell
-conda run -n chip-price-consult python -m service `
+# exe
+qq-desktop-service.exe
+# 源码/环境
+python -m service
+```
+
+**显式模式（开发者/集成方）**：指定 endpoint 文件与状态目录：
+
+```powershell
+conda run -n qq-desktop-service python -m service `
   --endpoint-file C:\PriceAgent\state\qq-service-endpoint.json `
   --state-dir C:\PriceAgent\state\qq-service
 ```
+
+默认模式下若服务已在运行（endpoint 文件存在且进程存活），再次启动会提示并退出，防止双击重复拉起。启动日志会打印 endpoint 文件路径与调试页面地址。
 
 endpoint 文件包括动态 loopback URL 和本次启动 token。它必须保存到仅当前用户可读的目录；调用方读取后使用 `Authorization: Bearer <token>` 调用接口。
 
@@ -93,10 +104,11 @@ endpoint 文件包括动态 loopback URL 和本次启动 token。它必须保存
 | `POST` | `/v1/commands/read` | 读取指定联系人的可见消息 |
 | `POST` | `/v1/commands/send` | 向指定联系人发送消息 |
 | `GET` | `/v1/commands/{commandId}` | 查询发送命令状态 |
+| `POST` | `/v1/chat/history` | 查询聊天记录（查询前自动视觉更新一次） |
 
 `send` 必须提供调用方生成的稳定 `commandId`。相同 ID 与相同消息体只执行一次；相同 ID 配不同消息体返回 `409`。服务重启发现尚未确认的 `RUNNING` 命令时统一转为 `EFFECT_UNKNOWN`，不自动重发。
 
-FastAPI 提供机器可读合同：`GET /openapi.json`。Swagger/Redoc UI 在正式服务中关闭。
+**调试**：浏览器打开启动日志中的 `http://127.0.0.1:<port>/docs`（FastAPI Swagger UI），右上角 Authorize 填入 endpoint 文件里的 token 后即可直接选接口、填参数、发请求；机器可读合同见 `GET /openapi.json`。
 
 接口示例：
 

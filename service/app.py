@@ -29,7 +29,7 @@ def create_app(
     chat_history = ChatHistoryStore(chat_history_path)
     facade = automation or LegacyQqAutomationFacade()
     ledger = CommandLedger(ledger_path)
-    app = FastAPI(title="PriceAgent QQ Desktop Service", version=API_VERSION, docs_url=None, redoc_url=None)
+    app = FastAPI(title="PriceAgent QQ Desktop Service", version=API_VERSION)
 
     def require_token(authorization: Annotated[str | None, Header()] = None) -> None:
         if authorization != f"Bearer {token}":
