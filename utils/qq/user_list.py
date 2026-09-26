@@ -285,6 +285,11 @@ class UserList:
           1. refresh 已判定 user.active：顶部面板 OCR 的当前会话名包含该用户昵称；
           2. 行背景色为激活态（is_active_bg = 226 灰）：直接看用户列表行自身的高亮，
              顶部 OCR 漏判/名字截断时的可靠兜底——"根据用户列表已激活的用户不用激活"。
+
+        点击策略（可靠性优化）：
+          - 点击区收窄到"头像右边缘 +5px → 行右缘"的文字带，避开头像与行内空白；
+          - y 锁定行中线 ±3px，彻底避开上下相邻行的边界（防点错人）；
+          - 保留文字带内随机取点，模拟人工点击（避免每次都点同一点）。
         """
         # ① refresh 已判定为当前会话 → 无需点击
         if user.active:
@@ -304,13 +309,22 @@ class UserList:
             offset_left = self.userList_region.screen_region["left"]
             offset_top = self.userList_region.screen_region["top"]
             rect_left, rect_top, rect_right, rect_bottom = user.rect
-            # 在用户行区域内随机取点点击（模拟人工点击）
-            random_click(
-                offset_left + rect_left,
-                offset_top + rect_top,
-                rect_right - rect_left,
-                rect_bottom - rect_top,
-            )
+            # 行垂直中心（屏幕坐标）：y 锁定行中线，彻底避开上下相邻行的边界（点错人）
+            center_y = offset_top + (rect_top + rect_bottom) // 2
+            # 头像信息有效时：点击区收窄到"头像右边缘 +5px → 行右缘留 2px 余量"的文字带，
+            # 避开头像本身（点到头像在某些主题下无响应/易误触）
+            avatar_cx, _, avatar_r = user.avatar
+            if avatar_r > 0:
+                # 文字带左缘（屏幕坐标）
+                click_left = offset_left + avatar_cx + avatar_r + 5
+                # 文字带宽度：行右缘到文字带左缘，至少 20px（太窄则退化）
+                click_width = max(20, rect_right - (avatar_cx + avatar_r + 5) - 2)
+            else:
+                # 头像信息缺失（防御）→ 退化为整行点击（旧行为）
+                click_left = offset_left + rect_left
+                click_width = rect_right - rect_left
+            # 窄带随机点击：x 在文字带内随机（模拟人工），y 只在中线 ±3px 内随机（绝不越行）
+            random_click(click_left, center_y - 3, click_width, 6)
 
     def find_user(self, contact_name: str) -> "User | None":
         """按名字查找用户：直接使用包含匹配（OCR 名字可能截断/多符号），精确匹配天然被包含覆盖。
