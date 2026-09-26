@@ -173,21 +173,17 @@ class Dispatcher:
         return self.userList.get_user_list()
 
     def send_message_impl(self, contact_name: str, text: str) -> bool:
-        """实际实现：激活会话 → 输入文本 → 点击发送。"""
-        # 首先根据名字激活用户（点击其行切换会话）
-        self.userList.active_user_by_name(contact_name)
-        # 聚焦输入框 → 粘贴文本 → 点击发送
-        self.inputBox.send_text(text)
+        """实际实现：输入文本（内部自动激活会话）→ 快捷键发送。"""
+        # 发送方法内部自动激活用户（点击列表行切换会话，已激活跳过）→ 聚焦输入框 → 粘贴 → Enter 发送
+        self.inputBox.send_text(contact_name, text)
         # 发送后用户列表变化（未读红点可能消除），清缓存强制下次刷新
         self.userList.clear_user_list_cache()
         return True
 
     def read_message_list_impl(self, contact_name: str) -> list[dict]:
-        """实际实现：激活会话 → 读取消息，翻译为对外结构。"""
-        # 首先根据名字激活用户
-        self.userList.active_user_by_name(contact_name)
-        # 读取消息（自动截图 + 气泡检测 + OCR）
-        messages = self.messageList.read_messages()
+        """实际实现：读取消息（内部自动激活会话），翻译为对外结构。"""
+        # 读取方法内部自动激活用户（点击列表行切换会话，已激活跳过）→ 截图 + 气泡检测 + OCR
+        messages = self.messageList.read_messages(contact_name)
         # 读取后同样清缓存（会话切换会影响列表状态）
         self.userList.clear_user_list_cache()
         # 翻译为对外 dict 结构（text / is_self / rect）

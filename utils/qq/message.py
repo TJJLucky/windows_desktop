@@ -30,6 +30,8 @@ from ..vision.ocr import OCREngine
 from ..core.screenshot import getDPI
 # 计时装饰器
 from ..core.timing import timer
+# 用户列表（read_messages 内部激活目标会话）
+from .user_list import UserList
 
 
 class MessageList:
@@ -355,8 +357,14 @@ class MessageList:
         # 检测气泡 + OCR
         self.refresh_messageList()
 
-    def read_messages(self) -> list[Message]:
-        """供智能体读取消息的唯一入口：自动刷新后返回最新消息列表。"""
+    def read_messages(self, contact_name: str) -> list[Message]:
+        """供智能体读取消息的唯一入口：内部激活目标会话后自动刷新，返回最新消息列表。
+
+        读取前在方法内部自动激活该用户（点击列表行切换会话，已激活则跳过），
+        调用方无需（也不应）先单独激活——读取本身自带激活语义。
+        """
+        # 内部激活用户：根据名字点击列表行切换到目标会话（已激活则跳过点击）
+        UserList().active_user_by_name(contact_name)
         # 全量刷新（截图 + 气泡检测 + OCR）
         self.refresh()
         # 返回最新消息列表

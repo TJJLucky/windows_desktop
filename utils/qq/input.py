@@ -31,6 +31,8 @@ from ..core.timing import timer
 from ..core.mouse import random_click
 # 快捷键发送（Enter）与快捷键配置表
 from .hotkeys import send_hotkey, SEND_MESSAGE
+# 用户列表（send_text 内部激活目标会话）
+from .user_list import UserList
 
 
 class InputBox:
@@ -193,8 +195,14 @@ class InputBox:
         # 等发送完成（消息上屏渲染，避免紧接着截图到旧画面）
         time.sleep(0.3)
 
-    def send_text(self, text: str):
-        """便捷流程：聚焦 → 输入文本 → 发送。"""
+    def send_text(self, contact_name: str, text: str):
+        """便捷流程：内部激活目标会话 → 聚焦 → 输入文本 → 发送。
+
+        发送前在方法内部自动激活该用户（点击列表行切换会话，已激活则跳过），
+        调用方无需（也不应）先单独激活——发送本身自带激活语义。
+        """
+        # 内部激活用户：根据名字点击列表行切换到目标会话（已激活则跳过点击）
+        UserList().active_user_by_name(contact_name)
         # 刷新定位（含聚焦）
         self.refresh()
         # 粘贴文本
