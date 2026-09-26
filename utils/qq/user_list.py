@@ -287,9 +287,10 @@ class UserList:
              顶部 OCR 漏判/名字截断时的可靠兜底——"根据用户列表已激活的用户不用激活"。
 
         点击策略（可靠性优化）：
-          - 点击区收窄到"头像右边缘 +5px → 行右缘"的文字带，避开头像与行内空白；
+          - 点击区收窄到"头像右边缘 +5px"起的昵称区，宽度上限 120px，
+            避开头像、行右侧时间/红点/滚动条等"行外"区域；
           - y 锁定行中线 ±3px，彻底避开上下相邻行的边界（防点错人）；
-          - 保留文字带内随机取点，模拟人工点击（避免每次都点同一点）。
+          - 保留昵称区内随机取点，模拟人工点击（避免每次都点同一点）。
         """
         # ① refresh 已判定为当前会话 → 无需点击
         if user.active:
@@ -311,14 +312,17 @@ class UserList:
             rect_left, rect_top, rect_right, rect_bottom = user.rect
             # 行垂直中心（屏幕坐标）：y 锁定行中线，彻底避开上下相邻行的边界（点错人）
             center_y = offset_top + (rect_top + rect_bottom) // 2
-            # 头像信息有效时：点击区收窄到"头像右边缘 +5px → 行右缘留 2px 余量"的文字带，
-            # 避开头像本身（点到头像在某些主题下无响应/易误触）
+            # 昵称区典型宽度上限（物理像素）：QQ 会话列表昵称紧贴头像右侧，
+            # 通常 120px 内已覆盖；限制点击宽度避免随机点落到行右侧的时间/红点/滚动条等"行外"区域
+            nickname_band = 120
+            # 头像信息有效时：点击区收窄到"头像右边缘 +5px"起的昵称区，
+            # 同时宽度不超过昵称带（120px），避开头像本身与行右侧的无响应区
             avatar_cx, _, avatar_r = user.avatar
             if avatar_r > 0:
-                # 文字带左缘（屏幕坐标）
+                # 昵称区左缘（屏幕坐标）
                 click_left = offset_left + avatar_cx + avatar_r + 5
-                # 文字带宽度：行右缘到文字带左缘，至少 20px（太窄则退化）
-                click_width = max(20, rect_right - (avatar_cx + avatar_r + 5) - 2)
+                # 昵称区宽度 = min(整行剩余宽, 昵称带上限)，至少 20px（太窄则退化）
+                click_width = max(20, min(rect_right - (avatar_cx + avatar_r + 5) - 2, nickname_band))
             else:
                 # 头像信息缺失（防御）→ 退化为整行点击（旧行为）
                 click_left = offset_left + rect_left
