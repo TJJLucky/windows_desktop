@@ -35,6 +35,8 @@ from ..core.window import WindowCaptureCtx
 from ..core.timing import timer
 # OCR 引擎单例
 from ..vision.ocr import OCREngine
+# 拼图 OCR：多行文字区拼接一次识别 + 按 y 边界切分文本（性能优化）
+from ..vision.compose import compose_bubbles_to_one, split_ocr_by_bubble
 # 随机点击（激活会话时点用户行）
 from ..core.mouse import random_click
 
@@ -377,19 +379,38 @@ class UserList:
 
     @timer
     def refresh(self):
-        """全量重建用户列表，整体替换 self.users。"""
+        """全量重建用户列表，整体替换 self.users。
+
+        性能优化：所有用户行的"文字区"垂直拼成一张图 → 一次 OCR → 按 y 边界切分，
+        取代"每行单独 OCR"（N 次模型推理 → 1 次推理，显著降低刷新耗时）。
+        """
         # 1) 刷新截图与区域
         self.refresh_image()
         new_users: dict[str, User] = {}
         # 2) 顶部区域 OCR：拿到当前激活会话的用户名
         _, active_name = self.get_user_list_top_right_ocr()  # 顶部区域 OCR：active 用户的名字
 
-        # 3) 逐头像行处理
+        # 3) 逐头像行处理：先收集全部行（不立即 OCR）
+        rows: list[tuple[tuple[int, int, int], tuple[int, int, int, int], Image.Image]] = []
         for avatar, rect in self.crop_user_row_by_avatar(self.userList_region.image):
             # 裁切：排除头像，保留文字+红点区域
             image = self.get_user_image(rect, avatar)  # 裁切：排除头像，保留文字+红点区域
-            # 阈值140 OCR 提取黑色昵称
-            name = UserList.ocr_recognize(image)  # 阈值140 OCR 提取黑色昵称
+            # 暂存该行（avatar, rect, 文字区图）
+            rows.append((avatar, rect, image))
+
+        # 拼图：所有行的文字区垂直拼接成一张大图（保持原始宽高不拉伸，靠左留白）
+        composed, bounds = compose_bubbles_to_one([img for _, _, img in rows])
+        # 整图预处理一次（阈值140只保留黑色昵称，剔除灰字/背景）
+        proc = UserList.ocr_preprocess(composed)
+        # 一次 OCR 识别全部昵称（单例引擎复用）
+        lines = OCREngine().ocr(proc) or []
+        # 按 y 边界把识别行切分回每个用户行（顺序与 rows 一致）
+        raw_names = split_ocr_by_bubble(lines, bounds)
+
+        # 逐行组装 User（名字已从拼图 OCR 获得）
+        for (avatar, rect, image), name in zip(rows, raw_names, strict=True):
+            # 清洗：只保留中文和英文字母（剔除 OCR 误识别的特殊符号/省略号）
+            name = re.sub(r"[^\u4e00-\u9fffA-Za-z]", "", name.strip())
             # 包含匹配：列表名字较短，是顶部 OCR 结果的子串
             active = bool(name) and (name in active_name)  # 包含匹配：列表名字较短，是顶部 OCR 结果的子串
             # RGB(247,76,48) 红点检测
