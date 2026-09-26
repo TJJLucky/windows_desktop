@@ -3,15 +3,18 @@
 本文件是整个服务的进程入口，负责：
 1. 解析命令行参数（默认模式：无参数双击即用；显式模式：指定 endpoint 文件与状态目录）；
 2. 在 127.0.0.1 上绑定一个随机空闲端口（只服务本机，不开放公网）；
-3. 生成一次性访问 token，并把「端口 + token」原子写入 endpoint 文件，供调用方（如 UniApp 前端）读取后调用 API；
+3. 把「端口 + pid」原子写入 endpoint 文件，供调用方（如 UniApp 前端）读取后调用 API；
 4. 启动 uvicorn 事件循环托管 FastAPI 应用，服务退出时清理自己写出的 endpoint 文件。
+
+注意：服务不做 token 鉴权——安全边界是"仅监听 127.0.0.1（loopback）"，
+调用方不需要也无法使用 Authorization 头。
 """
 
 # 让类型注解支持"延迟求值"：字符串形式的注解不必在 import 阶段立即解析，
 # 从而允许模块内的前向引用（如函数返回自身类等），也加快启动速度。
 from __future__ import annotations
 
-# argparse：命令行参数解析（--endpoint-file / --state-dir / --token）
+# argparse：命令行参数解析（--endpoint-file / --state-dir）
 import argparse
 # asyncio：驱动 uvicorn 的异步事件循环
 import asyncio
@@ -23,8 +26,6 @@ import json
 import os
 # Path：跨平台路径对象，统一处理 endpoint 文件与状态目录
 from pathlib import Path
-# secrets：生成不可预测的一次性 token（secrets.token_urlsafe，密码学安全随机数）
-import secrets
 # socket：创建 loopback 监听套接字，绑定随机端口
 import socket
 # tempfile：以"先写临时文件再原子替换"的方式写 endpoint 文件，避免调用方读到半截内容
@@ -33,16 +34,16 @@ import tempfile
 # uvicorn：ASGI 服务器，负责把 HTTP 请求转交给 FastAPI 应用处理
 import uvicorn
 
-# create_app：构造受 token 保护的 FastAPI 应用（路由都在里面注册）
+# create_app：构造 FastAPI 应用（路由都在里面注册）
 from .app import create_app
 
 
 def main() -> None:
     """命令行入口：解析参数 → 准备运行目录 → 发布 endpoint → 启动 uvicorn 常驻服务。"""
 
-    # 用 argparse 声明三个可选参数：
+    # 用 argparse 声明两个可选参数：
     parser = argparse.ArgumentParser(description="PriceAgent QQ Desktop Service")
-    # endpoint 文件：调用方读取「端口 + token」的位置；缺省时使用默认运行目录下的 endpoint.json
+    # endpoint 文件：调用方读取「端口」的位置；缺省时使用默认运行目录下的 endpoint.json
     parser.add_argument(
         "--endpoint-file",
         type=Path,
@@ -56,13 +57,8 @@ def main() -> None:
         default=None,
         help="状态目录，存放聊天记录/账本数据库（缺省：同 endpoint 文件目录下 state\\）",
     )
-    # token：调用方可显式指定（便于与外部系统共享密钥）；缺省则每次启动随机生成
-    parser.add_argument("--token")
     # 解析命令行参数；argparse 会在参数非法时自动打印用法并退出
     arguments = parser.parse_args()
-
-    # 最终生效的 token = 显式传入的 token；没有就现场生成一个 32 字节随机串
-    token = arguments.token or secrets.token_urlsafe(32)
 
     # 默认模式判定：endpoint 文件与状态目录两个参数都未指定 → 走"双击即用"路径
     default_mode = arguments.endpoint_file is None and arguments.state_dir is None
@@ -85,19 +81,19 @@ def main() -> None:
     listener = _bind_loopback_listener()
     # 从套接字取回操作系统实际分配的端口号
     port = int(listener.getsockname()[1])
-    # 把「端口 + token + pid」原子写入 endpoint 文件（先写临时文件再 os.replace 覆盖）
-    _publish_endpoint(endpoint_file, port, token)
+    # 把「端口 + pid」原子写入 endpoint 文件（先写临时文件再 os.replace 覆盖）
+    _publish_endpoint(endpoint_file, port)
 
     # 默认模式额外打印数据目录，方便最终用户知道状态数据落在哪里
     if default_mode:
         print(f"[INFO] 默认运行模式，数据目录: {runtime_dir}")
-    # 打印 endpoint 文件路径（调用方需要读取它拿 token 和端口）
+    # 打印 endpoint 文件路径（调用方需要读取它拿端口）
     print(f"[INFO] endpoint 文件: {endpoint_file}")
-    # 打印调试页地址：Swagger UI（/docs），浏览器打开后填 token 即可直接发请求调试
+    # 打印调试页地址：Swagger UI（/docs），浏览器打开即可直接发请求调试（无需 token）
     print(f"[INFO] 调试页面(Swagger): http://127.0.0.1:{port}/docs")
 
-    # 构造 FastAPI 应用：传入 token 与账本数据库路径（聊天记录库路径由 create_app 自动推导）
-    app = create_app(token=token, ledger_path=state_dir / "qq-command-ledger.sqlite3")
+    # 构造 FastAPI 应用：传入账本数据库路径（聊天记录库路径由 create_app 自动推导）
+    app = create_app(ledger_path=state_dir / "qq-command-ledger.sqlite3")
     try:
         # 用 asyncio 运行 uvicorn 服务：serve 绑定到已就绪的 listener 上（不再二次 bind）
         # sockets 参数传入监听套接字，保证端口就是我们上面绑定的那个随机端口
@@ -105,9 +101,9 @@ def main() -> None:
     finally:
         # 无论正常退出还是异常中断，都要先关闭监听套接字
         listener.close()
-        # 再清理 endpoint 文件：只有确认该文件是本进程写出的（pid + token 都匹配）才删除，
+        # 再清理 endpoint 文件：只有确认该文件是本进程写出的（pid 匹配）才删除，
         # 避免误删其他实例或旧实例留下的文件
-        _delete_owned_endpoint(endpoint_file, token)
+        _delete_owned_endpoint(endpoint_file)
 
 
 def _default_runtime_dir() -> Path:
@@ -164,12 +160,13 @@ def _bind_loopback_listener() -> socket.socket:
         raise
 
 
-def _publish_endpoint(path: Path, port: int, token: str) -> None:
-    """把「端口 + token + pid」原子写入 endpoint 文件：先写同目录临时文件，再 os.replace 覆盖。"""
+def _publish_endpoint(path: Path, port: int) -> None:
+    """把「端口 + pid」原子写入 endpoint 文件：先写同目录临时文件，再 os.replace 覆盖。"""
     # 确保 endpoint 文件所在目录存在（默认模式首次运行需要创建目录）
     path.parent.mkdir(parents=True, exist_ok=True)
     # 组装要发布的元数据：schemaVersion 固定 1（契约版本）、服务名、API 版本、
-    # 当前进程 pid（供清理与防重复检测）、loopback 端点、一次性 token、发布时间（UTC）
+    # 当前进程 pid（供清理与防重复检测）、loopback 端点、发布时间（UTC）。
+    # 注意：本服务不做 token 鉴权，endpoint 文件不含 token 字段。
     payload = json.dumps(
         {
             "schemaVersion": 1,
@@ -177,7 +174,6 @@ def _publish_endpoint(path: Path, port: int, token: str) -> None:
             "apiVersion": "v1",
             "processId": os.getpid(),
             "endpoint": f"http://127.0.0.1:{port}",
-            "token": token,
             "issuedAt": datetime.now(timezone.utc).isoformat(),
         },
         ensure_ascii=False,      # 保留非 ASCII 字符原样输出（本项目字段均为 ASCII，防御性设置）
@@ -199,15 +195,15 @@ def _publish_endpoint(path: Path, port: int, token: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _delete_owned_endpoint(path: Path, token: str) -> None:
+def _delete_owned_endpoint(path: Path) -> None:
     """服务退出时清理 endpoint 文件：只有确认是本进程写出的才删除，防止误删他人文件。"""
     try:
         # 读回当前文件内容；不存在/损坏则无需清理
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, ValueError):
         return
-    # 双重校验：记录的进程 pid 是本进程，且 token 与本进程一致 → 才能删除
-    if payload.get("processId") == os.getpid() and payload.get("token") == token:
+    # 校验：记录的进程 pid 是本进程 → 才能删除（服务不做 token 鉴权，无需再比对 token）
+    if payload.get("processId") == os.getpid():
         path.unlink(missing_ok=True)
 
 

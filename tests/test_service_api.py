@@ -1,10 +1,11 @@
 """外部接口层合同测试；不操作真实 QQ。
 
 用 FakeAutomation 替身替换真实视觉 RPA，验证：
-- token 鉴权（无 token → 401）；
-- v1 合同映射（health / contacts / read 的结构正确）；
+- 无鉴权可访问（服务不做 token 校验，任何请求头/无请求头均可调用）；
+- v1 合同映射（health / contacts / read / capture 的结构正确）；
 - 发送幂等（同 commandId 只执行一次，可查询）；
-- 幂等键冲突（同 ID 不同消息体 → 409）。
+- 幂等键冲突（同 ID 不同消息体 → 409）；
+- 截图可用性探测（就绪 200+ready=true；不可用仍 200+ready=false）。
 """
 
 # 延迟求值类型注解
@@ -58,33 +59,34 @@ def service(tmp_path):
     """构建 (替身, 应用) 元组：每个测试独立临时账本库。"""
     # 创建替身
     automation = FakeAutomation()
-    # 用替身构造应用（token 固定测试值）
-    return automation, create_app(automation, token="test-token", ledger_path=tmp_path / "ledger.sqlite3")
+    # 用替身构造应用（无 token 参数——服务不做鉴权）
+    return automation, create_app(automation, ledger_path=tmp_path / "ledger.sqlite3")
 
 
 def client(app):
-    """构造带默认 Bearer 头的异步测试客户端。"""
+    """构造异步测试客户端（不携带任何鉴权头，验证无 token 可访问）。"""
     return httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
         base_url="http://qq-service.test",
-        headers={"Authorization": "Bearer test-token"},
     )
 
 
 @pytest.mark.asyncio
-async def test_api_requires_token(service) -> None:
-    """场景：不带 token 请求 → 应 401。"""
+async def test_api_works_without_token(service) -> None:
+    """场景：不带任何 Authorization 头请求 → 直接可用（项目不做 token 鉴权）。"""
     _, app = service
-    # 不带 Authorization 头直接请求
+    # 不带鉴权头直接请求健康检查
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://qq-service.test") as caller:
         response = await caller.get("/v1/health")
-    # 断言：未授权
-    assert response.status_code == 401
+    # 断言：200（无需 token）
+    assert response.status_code == 200
+    # 断言：健康状态固定值
+    assert response.json() == {"apiVersion": "v1", "status": "READY"}
 
 
 @pytest.mark.asyncio
 async def test_api_projects_legacy_automation_as_v1_contract(service) -> None:
-    """场景：带 token 调用三个接口 → 结构符合 v1 合同。"""
+    """场景：直接调用三个接口（无鉴权）→ 结构符合 v1 合同。"""
     _, app = service
     async with client(app) as caller:
         # 健康检查

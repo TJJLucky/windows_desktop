@@ -1,7 +1,7 @@
 """QQ Desktop Service 的外部 HTTP 接口层。
 
 本模块定义服务暴露给调用方（UniApp 前端 / 调试工具）的全部 HTTP 接口：
-- 每个接口都要求请求头 `Authorization: Bearer <token>`（token 由进程启动时生成并写入 endpoint 文件）；
+- 本机 loopback 服务不做 token 鉴权：所有接口均可直接访问（安全由"仅监听 127.0.0.1"保证）；
 - 阻塞型 QQ 操作（视觉识别 + 模拟点击）通过 asyncio.to_thread 放进线程池执行，避免阻塞事件循环；
 - 发送命令走"命令账本"（command_ledger）保证幂等：相同 commandId 只执行一次；
 - 聊天记录的读取与发送都会自动落库（chat_history），供后续查询。
@@ -14,11 +14,9 @@ from __future__ import annotations
 import asyncio
 # Path：数据库文件路径的类型标注
 from pathlib import Path
-# Annotated：给参数打元数据标签（配合 FastAPI 的 Header 提取请求头）
-from typing import Annotated
 
-# FastAPI 框架组件：Depends(依赖注入) / FastAPI(应用对象) / Header(取请求头) / HTTPException(标准错误响应) / status(HTTP 状态码常量)
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+# FastAPI 框架组件：FastAPI(应用对象) / HTTPException(标准错误响应)
+from fastapi import FastAPI, HTTPException
 
 # ChatHistoryStore：聊天记录 SQLite 存储（追加消息、按联系人查历史）
 from .chat_history import ChatHistoryStore
@@ -33,22 +31,17 @@ from .facade import LegacyQqAutomationFacade, QqAutomationError, QqAutomationPor
 def create_app(
     automation: QqAutomationPort | None = None,
     *,
-    token: str,
     ledger_path: Path,
     chat_history_path: Path | None = None,
 ) -> FastAPI:
-    """构造受 token 保护的 FastAPI 应用，注册全部 v1 接口并返回应用对象。
+    """构造 FastAPI 应用，注册全部 v1 接口并返回应用对象。
 
     参数：
     - automation：自动化实现（默认用真实视觉 RPA 门面；测试注入替身）；
-    - token：本次启动的一次性访问令牌（为空直接报错）；
     - ledger_path：命令账本数据库文件路径；
     - chat_history_path：聊天记录库路径（缺省自动放在账本同目录）。
     """
 
-    # 安全前提：token 为空就无法鉴权，直接拒绝构造应用
-    if not token:
-        raise ValueError("QQ Service token must not be empty")
     # 聊天记录库未显式指定时，默认与账本放同一目录，便于统一管理
     chat_history_path = chat_history_path or (ledger_path.parent / "qq-chat-history.sqlite3")
     # 初始化聊天记录存储（打开 SQLite、建表、启用 WAL）
@@ -60,21 +53,15 @@ def create_app(
     # 创建 FastAPI 应用：开启默认 /docs(Swagger) 与 /openapi.json，版本号取契约常量
     app = FastAPI(title="PriceAgent QQ Desktop Service", version=API_VERSION)
 
-    # 鉴权依赖函数：从请求头取 Authorization，必须等于 "Bearer <token>"，否则 401
-    def require_token(authorization: Annotated[str | None, Header()] = None) -> None:
-        # 请求头缺失或值不匹配 → 抛 401；匹配则正常返回（FastAPI 依赖通过 = 放行）
-        if authorization != f"Bearer {token}":
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="QQ_SERVICE_UNAUTHORIZED")
-
     # —— 健康检查接口 ——
     @app.get("/v1/health", response_model=ServiceHealthResponse)
-    async def health(_: None = Depends(require_token)) -> ServiceHealthResponse:
+    async def health() -> ServiceHealthResponse:
         # 返回固定状态 READY + API 版本；调用方用它探测服务是否存活
         return ServiceHealthResponse(apiVersion=API_VERSION, status="READY")
 
     # —— 截图可用性检查接口（探测） ——
     @app.post("/v1/capture:check", response_model=CaptureCheckResponse)
-    async def check_capture(_: None = Depends(require_token)) -> CaptureCheckResponse:
+    async def check_capture() -> CaptureCheckResponse:
         # 窗口就绪检测同样是阻塞操作（进程/窗口枚举 + 可能唤起 + WGC 试截），丢线程池执行
         result = await asyncio.to_thread(facade.check_capture_ready)
         # 组装响应：ready 透传；windowTitle 就绪时才有；error 不可用时才有
@@ -88,7 +75,7 @@ def create_app(
 
     # —— 读取联系人列表接口 ——
     @app.post("/v1/contacts:query", response_model=ListContactsResponse)
-    async def list_contacts(_: None = Depends(require_token)) -> ListContactsResponse:
+    async def list_contacts() -> ListContactsResponse:
         try:
             # QQ 视觉识别是阻塞操作：丢进线程池执行，防止整个事件循环被卡住
             contacts = await asyncio.to_thread(facade.list_contacts)
@@ -100,7 +87,7 @@ def create_app(
 
     # —— 读取指定联系人的可见消息接口 ——
     @app.post("/v1/commands/read", response_model=ReadMessagesResponse)
-    async def read_messages(request: ReadMessagesRequest, _: None = Depends(require_token)) -> ReadMessagesResponse:
+    async def read_messages(request: ReadMessagesRequest) -> ReadMessagesResponse:
         try:
             # 同样丢进线程池执行：视觉读取消息区 + OCR 识别文本
             payload = await asyncio.to_thread(facade.read_messages, request.contact_name)
@@ -114,7 +101,7 @@ def create_app(
 
     # —— 发送消息接口（幂等） ——
     @app.post("/v1/commands/send", response_model=CommandResponse)
-    async def send_message(request: SendMessageRequest, _: None = Depends(require_token)) -> CommandResponse:
+    async def send_message(request: SendMessageRequest) -> CommandResponse:
         try:
             # 先向账本申请执行：begin 返回 (是否真正执行, 当前状态, 已有结果)。
             # 相同 commandId 相同消息体 → 幂等返回已有结果不重发；相同 ID 不同消息体 → 抛 409
@@ -145,7 +132,7 @@ def create_app(
 
     # —— 查询发送命令状态接口 ——
     @app.get("/v1/commands/{command_id}", response_model=CommandResponse)
-    async def command_status(command_id: str, _: None = Depends(require_token)) -> CommandResponse:
+    async def command_status(command_id: str) -> CommandResponse:
         # 从账本按 commandId 查状态与结果
         record = await asyncio.to_thread(ledger.get, command_id)
         if record is None:
@@ -157,7 +144,7 @@ def create_app(
 
     # —— 查询聊天记录接口（查询前自动视觉更新一次） ——
     @app.post("/v1/chat/history", response_model=ChatHistoryResponse)
-    async def query_chat_history(request: ChatHistoryRequest, _: None = Depends(require_token)) -> ChatHistoryResponse:
+    async def query_chat_history(request: ChatHistoryRequest) -> ChatHistoryResponse:
         # 需求约定：每次查询先做一次视觉读取（拉到最新消息），再返回历史，保证数据新鲜
         try:
             payload = await asyncio.to_thread(facade.read_messages, request.contact_name)

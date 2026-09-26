@@ -5,7 +5,7 @@
 - QqAutomationPort：自动化实现抽象（测试可注入 fake）。
 """
 
-# 导出应用工厂：构造受 token 保护的 FastAPI 应用（路由在 service/app.py 中注册）
+# 导出应用工厂：构造 FastAPI 应用（无 token 鉴权，路由在 service/app.py 中注册）
 from .app import create_app
 # 导出自动化端口抽象：QQ 操作的接口定义（真实实现是 facade 中的门面）
 from .facade import QqAutomationPort

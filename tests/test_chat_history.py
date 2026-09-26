@@ -118,15 +118,14 @@ def test_create_app_writes_chat_history(tmp_path):
     automation = _RecordingAutomation()
     ledger_path = tmp_path / "ledger.sqlite3"
     chat_path = tmp_path / "chat.sqlite3"
-    # 应用工厂（注入聊天库路径）
-    app = create_app(automation, token="test-token", ledger_path=ledger_path, chat_history_path=chat_path)
+    # 应用工厂（注入聊天库路径；服务不做 token 鉴权）
+    app = create_app(automation, ledger_path=ledger_path, chat_history_path=chat_path)
 
     async def run():
-        # 带 token 调用 send 与 read
+        # 直接调用 send 与 read（无需鉴权头）
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app),
             base_url="http://qq-service.test",
-            headers={"Authorization": "Bearer test-token"},
         ) as caller:
             # 发送（应落一条 out）
             await caller.post(
@@ -155,18 +154,17 @@ def test_chat_history_query_auto_updates(tmp_path):
     """查询聊天记录：先自动更新一次（读取落库），再返回历史。"""
     # 临时聊天库
     chat_path = tmp_path / "chat.sqlite3"
-    # 应用工厂
+    # 应用工厂（服务不做 token 鉴权）
     app = create_app(
-        _RecordingAutomation(), token="test-token",
+        _RecordingAutomation(),
         ledger_path=tmp_path / "ledger.sqlite3", chat_history_path=chat_path,
     )
 
     async def run():
-        # 查询聊天记录
+        # 查询聊天记录（无需鉴权头）
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app),
             base_url="http://qq-service.test",
-            headers={"Authorization": "Bearer test-token"},
         ) as caller:
             return await caller.post("/v1/chat/history", json={"contactName": "华强电子"})
 
@@ -196,18 +194,17 @@ def test_chat_history_query_update_failure_keeps_history(tmp_path):
     # 先预置一条历史消息
     store = ChatHistoryStore(chat_path)
     store.append("华强电子", "out", "历史消息", "effect-key-0000200")
-    # 应用工厂（读取必失败）
+    # 应用工厂（读取必失败；服务不做 token 鉴权）
     app = create_app(
-        _ReadFailAutomation(), token="test-token",
+        _ReadFailAutomation(),
         ledger_path=tmp_path / "ledger.sqlite3", chat_history_path=chat_path,
     )
 
     async def run():
-        # 查询聊天记录
+        # 查询聊天记录（无需鉴权头）
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app),
             base_url="http://qq-service.test",
-            headers={"Authorization": "Bearer test-token"},
         ) as caller:
             return await caller.post("/v1/chat/history", json={"contactName": "华强电子"})
 

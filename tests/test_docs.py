@@ -20,8 +20,7 @@ from service.app import create_app
 @pytest.fixture
 def client(tmp_path: Path):
     # 每个测试都用独立临时目录放账本库，避免测试间相互污染
-    # token 用固定值（仅测试用，无需密码学强度）
-    app = create_app(token="docs-token-000000000001", ledger_path=tmp_path / "ledger.sqlite3")
+    app = create_app(ledger_path=tmp_path / "ledger.sqlite3")
     # 返回一个不发真实网络请求的测试客户端（直接调用 ASGI 应用）
     return TestClient(app)
 
@@ -41,6 +40,6 @@ def test_openapi_lists_v1_apis(client):
     assert resp.status_code == 200
     # 取出 OpenAPI 契约中的路径表
     paths = resp.json()["paths"]
-    # 断言：五个 v1 业务接口全部登记在案（任何一个被误删/改名都会在此暴露）
-    for path in ("/v1/health", "/v1/contacts:query", "/v1/commands/read", "/v1/commands/send", "/v1/chat/history"):
+    # 断言：六个 v1 业务接口全部登记在案（任何一个被误删/改名都会在此暴露）
+    for path in ("/v1/health", "/v1/capture:check", "/v1/contacts:query", "/v1/commands/read", "/v1/commands/send", "/v1/chat/history"):
         assert path in paths
