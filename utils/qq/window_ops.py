@@ -33,8 +33,8 @@ from ..core.screenshot import WGCCapture, getDPI
 from ..core.window import layout_window_left_half, set_window_z_pos
 # 模板匹配（模式切换按钮）
 from ..vision.matcher import find_template
-# 快捷键发送与配置表（唤醒/打开最新未读）
-from .hotkeys import send_hotkey, TOGGLE_QQ_WINDOWS, OPEN_LATEST_UNREAD_WINDOW
+# 快捷键发送与配置表（唤醒主面板）
+from .hotkeys import send_hotkey, TOGGLE_QQ_WINDOWS
 
 # 模板目录：本文件在 utils/qq/，上溯三级到项目根再进 templates/
 _TEMPLATE_DIR = os.path.join(Path(__file__).parent.parent.parent, "templates")
@@ -183,17 +183,6 @@ def activate_qq(retry: int = 2) -> bool:
         time.sleep(0.5)
     print("快捷键唤起后 QQ 主窗口未出现")
     return False
-
-
-def open_latest_unread_message_window() -> None:
-    """按 Ctrl+Alt+Z 打开最新未读消息窗口（QQ 全局快捷键，无需窗口在前台）。
-
-    场景：处理未读消息前，先切到最新的未读会话窗口再读取。
-    """
-    # 发送全局快捷键（QQ 在系统层注册，焦点不在 QQ 也能响应）
-    send_hotkey(*OPEN_LATEST_UNREAD_WINDOW)
-    # 等窗口切换动画完成
-    time.sleep(0.8)
 
 
 class QQWindowNotReadyError(RuntimeError):
