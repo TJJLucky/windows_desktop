@@ -19,14 +19,14 @@ def make_bubble(width: int, height: int, color=(255, 255, 255)):
     return img
 
 
-def test_compose_unifies_width_and_adds_gap():
-    """场景：两个不同尺寸气泡 → 拼图宽=最大宽，高=两高和+1个间隔，区间正确。"""
+def test_compose_canvas_width_is_max_without_stretch():
+    """场景：两个不同尺寸气泡 → 画布宽=最大宽，气泡保持原始尺寸不拉伸，间隔正确。"""
     # 气泡 A：宽 100 高 30；气泡 B：宽 200 高 50
     composed, bounds = compose_bubbles_to_one([
         make_bubble(100, 30),
         make_bubble(200, 50),
     ])
-    # 断言：宽度统一为最大宽 200
+    # 断言：画布宽度为最大宽 200（气泡 A 不拉伸，靠左留白）
     assert composed.width == 200
     # 断言：总高 = 30 + 50 + 4（一个间隔）
     assert composed.height == 30 + 50 + 4

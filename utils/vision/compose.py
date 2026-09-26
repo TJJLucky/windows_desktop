@@ -18,7 +18,8 @@ def compose_bubbles_to_one(bubbles: list[Image.Image]) -> tuple[Image.Image, lis
     """把多个气泡小图垂直拼接为一张大图，返回 (大图, 各气泡的 y 区间)。
 
     规则：
-      - 统一宽度 = 最大气泡宽度：短气泡被等比放大到同一宽度（放大文字 OCR 更稳，不缩小）；
+      - 画布宽度 = 最大气泡宽度，但每个气泡**保持原始宽高**靠左粘贴（不拉伸、
+        不缩放，右侧留白）——拉伸文字会改变字形导致 OCR 识别错误；
       - 气泡间插入 BUBBLE_GAP 像素的黑色分隔线，防止跨气泡粘连，并给出明确的 y 边界；
       - 返回的 y 区间 [(top, bottom), ...] 对应每个气泡在拼图中的纵向范围（不含间隔区）。
 
@@ -28,21 +29,18 @@ def compose_bubbles_to_one(bubbles: list[Image.Image]) -> tuple[Image.Image, lis
     # 空列表：返回 1x1 白图 + 空区间（调用方据此跳过组装）
     if not bubbles:
         return Image.new("RGB", (1, 1), (255, 255, 255)), []
-    # 统一宽度：取最大气泡宽度（其余气泡等比放大）
+    # 画布宽度 = 最大气泡宽度（仅用于画布尺寸，不拉伸任何气泡）
     width = max(b.width for b in bubbles)
-    # 总高度 = 各气泡高度之和 + 间隔数 × 间隔高
+    # 总高度 = 各气泡原始高度之和 + 间隔数 × 间隔高
     total_h = sum(b.height for b in bubbles) + BUBBLE_GAP * (len(bubbles) - 1)
     # 白底画布（气泡背景为白/浅色，分隔线为黑，对比清晰）
     canvas = Image.new("RGB", (width, total_h), (255, 255, 255))
     draw = ImageDraw.Draw(canvas)
     bounds: list[tuple[int, int]] = []
     y = 0
-    # 逐气泡：统一宽度 → 粘贴 → 记录区间 → 画分隔线（最后一个不画）
+    # 逐气泡：按原始尺寸靠左粘贴 → 记录区间 → 画分隔线（最后一个不画）
     for i, bubble in enumerate(bubbles):
-        # 宽度不足统一宽的气泡放大到同一宽度（LANCZOS 高质量缩放）
-        if bubble.width != width:
-            bubble = bubble.resize((width, bubble.height), Image.Resampling.LANCZOS)
-        # 粘贴到画布当前位置
+        # 保持原始宽高粘贴（靠左，右侧留白；不做任何缩放）
         canvas.paste(bubble, (0, y))
         # 记录该气泡的纵向区间
         bounds.append((y, y + bubble.height))
