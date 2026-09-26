@@ -45,3 +45,23 @@ class CommandResponse(StrictModel):
     command_id: str = Field(alias="commandId")
     status: Literal["RUNNING", "SUCCEEDED", "FAILED", "EFFECT_UNKNOWN"]
     result: dict[str, Any] | None = None
+
+
+class ChatHistoryItem(StrictModel):
+    id: int
+    direction: Literal["in", "out"]
+    text: str
+    seq: int
+    command_id: str | None = Field(alias="commandId", default=None)
+    created_at: str = Field(alias="createdAt")
+
+
+class ChatHistoryRequest(StrictModel):
+    contact_name: str = Field(alias="contactName", min_length=1, max_length=256)
+
+
+class ChatHistoryResponse(StrictModel):
+    contact_name: str = Field(alias="contactName")
+    count: int = Field(ge=0)
+    messages: list[ChatHistoryItem]
+    update: Literal["ok", "failed"]  # 本次查询前自动更新的结果

@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 
 from .chat_history import ChatHistoryStore
 from .command_ledger import CommandConflictError, CommandLedger
-from .contracts import API_VERSION, CommandResponse, ListContactsResponse, ReadMessagesRequest, ReadMessagesResponse, SendMessageRequest, ServiceHealthResponse
+from .contracts import API_VERSION, ChatHistoryRequest, ChatHistoryResponse, CommandResponse, ListContactsResponse, ReadMessagesRequest, ReadMessagesResponse, SendMessageRequest, ServiceHealthResponse
 from .facade import LegacyQqAutomationFacade, QqAutomationError, QqAutomationPort
 
 
@@ -53,8 +53,7 @@ def create_app(
             payload = await asyncio.to_thread(facade.read_messages, request.contact_name)
         except QqAutomationError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
-        for item in payload["messages"]:
-            _try_record(chat_history, request.contact_name, "out" if item["isSelf"] else "in", item["text"])
+        _record_payload(chat_history, request.contact_name, payload)
         return ReadMessagesResponse.model_validate(payload)
 
     @app.post("/v1/commands/send", response_model=CommandResponse)
@@ -85,7 +84,28 @@ def create_app(
         current_status, result = record
         return CommandResponse(commandId=command_id, status=current_status, result=result)
 
+    @app.post("/v1/chat/history", response_model=ChatHistoryResponse)
+    async def query_chat_history(request: ChatHistoryRequest, _: None = Depends(require_token)) -> ChatHistoryResponse:
+        """每次查询聊天记录时，先自动视觉读取一次（更新存储），再返回最新历史。"""
+        try:
+            payload = await asyncio.to_thread(facade.read_messages, request.contact_name)
+        except QqAutomationError:
+            update = "failed"  # 自动更新失败不阻断历史查询
+        else:
+            _record_payload(chat_history, request.contact_name, payload)
+            update = "ok"
+        messages = chat_history.get_history(request.contact_name)
+        return ChatHistoryResponse(
+            contactName=request.contact_name, count=len(messages), messages=messages, update=update
+        )
+
     return app
+
+
+def _record_payload(chat_history: ChatHistoryStore, contact_name: str, payload: dict) -> None:
+    """把一次读取结果（可见消息）写入聊天记录。"""
+    for item in payload["messages"]:
+        _try_record(chat_history, contact_name, "out" if item["isSelf"] else "in", item["text"])
 
 
 def _try_record(
