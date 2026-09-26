@@ -11,6 +11,9 @@ MessageList（单例）：
 # deque：行去重缓冲（本模块当前用列表实现，保留导入待用）
 from collections import deque
 
+# os：环境变量读取（拼图调试展示开关 QQ_SHOW_COMPOSE）
+import os
+
 # cv2：轮廓检测（findContours/boundingRect）
 import cv2
 # numpy：像素数组与颜色掩码运算
@@ -34,6 +37,29 @@ from ..core.screenshot import getDPI
 from ..core.timing import timer
 # 用户列表（read_messages 内部激活目标会话）
 from .user_list import UserList
+
+
+def _show_composed_image(composed: Image.Image) -> None:
+    """保存拼图到项目 debug/ 目录并调用系统查看器打开（运行时调试展示）。
+
+    受环境变量 QQ_SHOW_COMPOSE=1 控制：置位时每次读取消息都会弹窗显示
+    拼装好的气泡大图；默认关闭（生产零开销、不弹窗）。
+    """
+    # Path：拼接 debug 目录；time：文件名时间戳（避免覆盖）
+    from pathlib import Path
+    import time as _time
+    # debug 目录 = 项目根/debug（已被 .gitignore 排除，不进入版本库）
+    debug_dir = Path(__file__).parent.parent.parent / "debug"
+    # 目录不存在则创建
+    debug_dir.mkdir(exist_ok=True)
+    # 文件名带时间戳：每次刷新独立文件，不互相覆盖
+    path = debug_dir / f"qq_compose_{int(_time.time())}.png"
+    # 保存拼图
+    composed.save(path)
+    # 打印保存路径（控制台可追踪）
+    print(f"[DEBUG] 拼图已保存: {path}")
+    # 调用系统默认图片查看器打开（用户实时查看拼图效果）
+    composed.show()
 
 
 class MessageList:
@@ -335,6 +361,11 @@ class MessageList:
         bubble_images = [self.crop_bubble((x, y, w, h)) for (x, y, w, h, _) in boxes]
         # 拼图：统一宽度垂直拼接，返回 (大图, 各气泡 y 区间)。
         composed, bounds = compose_bubbles_to_one(bubble_images)
+
+        # 运行时调试展示：QQ_SHOW_COMPOSE=1 时保存拼图并弹窗给用户查看（默认关闭零开销）
+        if os.environ.get("QQ_SHOW_COMPOSE") == "1":
+            _show_composed_image(composed)
+
         # 一次 OCR 整张拼图（单例引擎复用，避免重复加载模型）。
         ocr_engine = OCREngine()
         lines = ocr_engine.ocr(np.array(composed)) or []
