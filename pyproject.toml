@@ -17,6 +17,7 @@ dependencies = [
   "opencv-python>=4.8,<6",
   "Pillow>=10,<12",
   "pyautogui>=0.9.54,<1",
+  "psutil>=5.9,<8",
   "pyperclip>=1.8,<2",
   "pywin32>=306,<307 ; sys_platform == 'win32'",
   "pywinauto>=0.6.8,<1",
@@ -34,6 +35,20 @@ price-agent-qq-service = "service.__main__:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
+exclude = [
+  "native", "dist", "docs", "debug", "tests", ".idea",
+  "agent.md", "chat-schema.sql",
+  "utils结构调整方案.md", "修改计划_定稿.md", "总体优化计划.md",
+  "结构重组计划_激进版.md", "聊天记录存储设计.md",
+]
+
+# 运行时资源按代码的相对路径打进 wheel：
+#   - templates/ → site-packages/templates（regions.py / window_ops.py 的 _TEMPLATE_DIR）
+#   - libs/wgc_capture.dll → site-packages/libs/（screenshot.py 的 WGC DLL 加载路径）
+# native/ 为 DLL 构建产物目录，运行时不需要，已排除。
+[tool.hatch.build.targets.wheel.force-include]
+"templates" = "templates"
+"libs/wgc_capture.dll" = "libs/wgc_capture.dll"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
