@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="wgc_capture.vcxproj" Id="4538a8bd-0165-4906-9d87-6ba292165015" />
+</Solution>

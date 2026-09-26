@@ -1,0 +1,6 @@
+﻿  pch.cpp
+  dllmain.cpp
+  wgc.cpp
+  正在生成代码...
+    正在创建库 E:\Project\agent\chip-price-consult\client-runtime\python-runtime\src\agent_runtime\native\wgc_capture\x64\Debug\wgc_capture.lib 和对象 E:\Project\agent\chip-price-consult\client-runtime\python-runtime\src\agent_runtime\native\wgc_capture\x64\Debug\wgc_capture.exp
+  wgc_capture.vcxproj -> E:\Project\agent\chip-price-consult\client-runtime\python-runtime\src\agent_runtime\native\wgc_capture\x64\Debug\wgc_capture.dll

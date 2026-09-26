@@ -1,0 +1,76 @@
+"""QQ Desktop Service 的外部 HTTP 接口层。"""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, Header, HTTPException, status
+
+from .command_ledger import CommandConflictError, CommandLedger
+from .contracts import API_VERSION, CommandResponse, ListContactsResponse, ReadMessagesRequest, ReadMessagesResponse, SendMessageRequest, ServiceHealthResponse
+from .facade import LegacyQqAutomationFacade, QqAutomationError, QqAutomationPort
+
+
+def create_app(automation: QqAutomationPort | None = None, *, token: str, ledger_path: Path) -> FastAPI:
+    """创建受每次启动 token 保护的 v1 API。"""
+
+    if not token:
+        raise ValueError("QQ Service token must not be empty")
+    facade = automation or LegacyQqAutomationFacade()
+    ledger = CommandLedger(ledger_path)
+    app = FastAPI(title="PriceAgent QQ Desktop Service", version=API_VERSION, docs_url=None, redoc_url=None)
+
+    def require_token(authorization: Annotated[str | None, Header()] = None) -> None:
+        if authorization != f"Bearer {token}":
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="QQ_SERVICE_UNAUTHORIZED")
+
+    @app.get("/v1/health", response_model=ServiceHealthResponse)
+    async def health(_: None = Depends(require_token)) -> ServiceHealthResponse:
+        return ServiceHealthResponse(apiVersion=API_VERSION, status="READY")
+
+    @app.post("/v1/contacts:query", response_model=ListContactsResponse)
+    async def list_contacts(_: None = Depends(require_token)) -> ListContactsResponse:
+        try:
+            contacts = await asyncio.to_thread(facade.list_contacts)
+        except QqAutomationError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return ListContactsResponse(contacts=contacts, count=len(contacts))
+
+    @app.post("/v1/commands/read", response_model=ReadMessagesResponse)
+    async def read_messages(request: ReadMessagesRequest, _: None = Depends(require_token)) -> ReadMessagesResponse:
+        try:
+            payload = await asyncio.to_thread(facade.read_messages, request.contact_name)
+        except QqAutomationError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return ReadMessagesResponse.model_validate(payload)
+
+    @app.post("/v1/commands/send", response_model=CommandResponse)
+    async def send_message(request: SendMessageRequest, _: None = Depends(require_token)) -> CommandResponse:
+        try:
+            execute, current_status, result = await asyncio.to_thread(
+                ledger.begin, request.command_id, request.contact_name, request.text
+            )
+        except CommandConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not execute:
+            return CommandResponse(commandId=request.command_id, status=current_status, result=result)
+        try:
+            result = await asyncio.to_thread(facade.send_message, request.contact_name, request.text)
+        except QqAutomationError as exc:
+            result = {"ok": False, "sent": False, "textLength": len(request.text), "error": str(exc)}
+            await asyncio.to_thread(ledger.resolve, request.command_id, "FAILED", result)
+            return CommandResponse(commandId=request.command_id, status="FAILED", result=result)
+        await asyncio.to_thread(ledger.resolve, request.command_id, "SUCCEEDED", result)
+        return CommandResponse(commandId=request.command_id, status="SUCCEEDED", result=result)
+
+    @app.get("/v1/commands/{command_id}", response_model=CommandResponse)
+    async def command_status(command_id: str, _: None = Depends(require_token)) -> CommandResponse:
+        record = await asyncio.to_thread(ledger.get, command_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="QQ_COMMAND_NOT_FOUND")
+        current_status, result = record
+        return CommandResponse(commandId=command_id, status=current_status, result=result)
+
+    return app

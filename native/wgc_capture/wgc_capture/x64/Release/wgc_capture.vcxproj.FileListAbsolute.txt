@@ -1,0 +1,3 @@
+E:\Project\agent\chip-price-consult\client-runtime\python-runtime\src\agent_runtime\native\wgc_capture\wgc_capture\x64\Release\wgc_capture.vcxproj.MdMergeInputs.cache
+E:\Project\agent\chip-price-consult\client-runtime\python-runtime\src\agent_runtime\native\wgc_capture\wgc_capture\x64\Release\wgc_capture.vcxproj.cppwinrt_plat.cache
+E:\Project\agent\chip-price-consult\client-runtime\python-runtime\src\agent_runtime\native\wgc_capture\wgc_capture\x64\Release\wgc_capture.vcxproj.cppwinrt_comp.cache
