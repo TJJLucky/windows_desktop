@@ -37,7 +37,7 @@ price-agent-qq-service = "service.__main__:main"
 packages = ["."]
 exclude = [
   "native", "dist", "docs", "debug", "tests", ".idea",
-  "agent.md", "chat-schema.sql",
+  "agent.md", "chat-schema.sql", "entry.py",
   "utils结构调整方案.md", "修改计划_定稿.md", "总体优化计划.md",
   "结构重组计划_激进版.md", "聊天记录存储设计.md",
 ]

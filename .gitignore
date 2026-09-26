@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 打包构建产物（wheel / exe）
+dist/
+dist-exe/
+build-exe/
+build/
+*.egg-info/
+
+# IDE
+.idea/
+
+# 运行时状态文件
+*.sqlite3
