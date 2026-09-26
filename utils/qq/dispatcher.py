@@ -1,19 +1,14 @@
-try:
-    from .userList import UserList
-    from .input import InputBox
-    from .message import MessageList
-except ImportError:
-    from utils.qq.userList import UserList
-    from utils.qq.input import InputBox
-    from utils.qq.message import MessageList
-
 import queue
 import threading
 from typing import Any, Optional, Tuple
 
+from .user_list import UserList
+from .input import InputBox
+from .message import MessageList
 
-class QQAtomicOperator:
-    _instance: "QQAtomicOperator | None" = None
+
+class Dispatcher:
+    _instance: "Dispatcher | None" = None
 
     def __new__(cls):
         if cls._instance is None:

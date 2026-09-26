@@ -1,49 +1,143 @@
-"""QQ 业务组合函数：窗口截图、激活、托盘图标匹配。
+"""QQ 业务组合函数：窗口截图、激活、托盘图标匹配、QQ 进程/窗口枚举。
 
 依赖 core + vision 子包，处于依赖链顶端，全部 import 均为单向向下。
 """
 
-import sys
 import os
 import time
 from pathlib import Path
 
-if __name__ == "__main__":
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+import psutil
+import pygetwindow as gw
+import win32gui
+import win32process
+from pywinauto import Desktop
+from PIL import Image, ImageGrab
 
-from PIL import Image
-try:
-    from ..core.screenshot import WGCCapture, getDPI
-    from ..core.windows import (
-        close_all_qq_windows,
-        clickExpandBtn,
-        click_qq_tray_icon,
-        get_qq_windows,
-        get_qq_pids,
-        get_overflow,
-        maximize_window,
-        set_window_z_pos,
-        start_qq,
-    )
-    from ..core.mouse import random_click
-    from ..vision.matcher import find_template
-except ImportError:
-    from utils.core.screenshot import WGCCapture, getDPI
-    from utils.core.windows import (
-        close_all_qq_windows,
-        clickExpandBtn,
-        click_qq_tray_icon,
-        get_qq_windows,
-        get_qq_pids,
-        get_overflow,
-        maximize_window,
-        set_window_z_pos,
-        start_qq,
-    )
-    from utils.core.mouse import random_click
-    from utils.vision.matcher import find_template
+from ..core.screenshot import WGCCapture, getDPI
+from ..core.window import maximize_window, set_window_z_pos
+from ..core.mouse import random_click
+from ..vision.matcher import find_template
 
 _TEMPLATE_DIR = os.path.join(Path(__file__).parent.parent.parent, "templates")
+
+
+def start_qq():
+    """唤醒登录"""
+    os.startfile("tencent://")
+
+
+def get_qq_pids():
+    """获取所有 QQ.exe 进程的 PID 列表"""
+    qq_pids = []
+    for proc in psutil.process_iter(["name"]):  # 遍历所有进程
+        if proc.info["name"].lower() == "qq.exe":  # 匹配进程名
+            qq_pids.append(proc.pid)  # 收集 PID
+    return qq_pids
+
+
+def get_qq_windows():
+    """遍历所有可见窗口，通过 PID 匹配哪些属于 QQ"""
+    qq_pids = get_qq_pids()  # 获取 QQ 所有 PID
+    if not qq_pids:
+        print("[FAIL] QQ.exe 未运行")
+        return []
+
+    qq_windows = []
+    for win in gw.getAllWindows():
+        title = win.title.strip()  # 窗口标题
+        # if not title or not win.visible:  # 跳过无标题或不可见
+        #     continue
+        _, pid = win32process.GetWindowThreadProcessId(win._hWnd)  # 获取窗口 PID
+        if pid in qq_pids:  # PID 匹配则属于 QQ
+            qq_windows.append(win)
+            print(pid, win.title)
+
+    print(f"[OK] QQ 可见窗口共 {len(qq_windows)} 个")
+    return qq_windows
+
+
+def close_all_qq_windows():
+    """关闭所有 QQ 可见窗口"""
+    windows = get_qq_windows()  # 获取所有 QQ 窗口
+    if not windows:
+        print("[INFO] 没有 QQ 窗口需要关闭")
+        return
+
+    for win in windows:
+        title = win.title.strip()  # 窗口标题
+        try:
+            win32gui.PostMessage(win._hWnd, 0x0010, 0, 0)  # WM_CLOSE 关闭窗口
+            print(f"[OK] 已关闭: 「{title}」")
+        except:
+            print(f"[WARN] 关闭失败: 「{title}」")
+
+
+def clickExpandBtn():
+    """点击任务栏托盘溢出区的展开按钮"""
+    # 桌面
+    desktop_uia = Desktop(backend="uia")
+    # 任务栏的顶层窗口
+    shell_tray = desktop_uia.window(class_name="Shell_TrayWnd")
+    tray_notify = shell_tray.child_window(class_name="TrayNotifyWnd")  # 右下角托盘容器
+
+    EXPAND_BTN_TEXTS = {"通知 V 形", "显示隐藏的图标", "Show hidden icons"}
+    for ctrl in tray_notify.descendants(control_type="Button"):
+        txt = ctrl.window_text().strip()  # 按钮文本
+        cls = ctrl.class_name()
+        if cls == "Button" and txt in EXPAND_BTN_TEXTS:  # 匹配展开按钮
+            ctrl.click_input()  # 点击
+            print(f"[OK] 已点击托盘展开按钮")
+            time.sleep(0.3)
+            return True
+    print("[WARN] 未找到托盘展开按钮")
+    return False
+
+
+def click_qq_tray_icon(qq_number=""):
+    """在托盘溢出窗口中查找 QQ ,还要根据QQ号筛选,如果有多个QQ同时运行"""
+    desktop_uia = Desktop(backend="uia")  # UIA 桌面
+    overflow = desktop_uia.window(class_name="NotifyIconOverflowWindow")  # 溢出窗口
+    if not overflow.exists():
+        clickExpandBtn()
+    toolbar = overflow.child_window(class_name="ToolbarWindow32")  # 图标工具栏
+    for btn in toolbar.children():
+        btn_text = btn.window_text().strip()  # 图标提示文本
+
+        if "QQ" in btn_text and qq_number in btn_text and "音乐" not in btn_text:  # 匹配 QQ，排除 QQ音乐
+            btn.click_input()  # 点击唤醒
+            print(f"[OK] 已点击 QQ 托盘图标: 「{btn_text}」")
+            time.sleep(0.5)
+            return True
+    print('-' * 20)
+    print("[FAIL] 未在托盘溢出区找到 QQ 图标")
+    return False
+
+
+def get_main_qq_windows():
+    """通过关闭QQ窗口,再通过后台的图标打开,从而获得QQ唯一窗口"""
+    close_all_qq_windows()
+    click_qq_tray_icon()
+    return get_qq_windows()[0]
+
+
+def get_overflow():
+    """截取任务栏托盘溢出窗口的屏幕截图 → PIL.Image
+
+    用 ImageGrab 而非 WGC —— 系统托盘窗口受保护，WGC 无法捕获。
+    """
+    time.sleep(0.3)  # 等弹出动画完成
+
+    desktop_uia = Desktop(backend="uia")  # UIA 桌面根
+    overflow = desktop_uia.window(
+        class_name="NotifyIconOverflowWindow")  # 溢出窗口类名
+    if not overflow.exists():  # 没展开成功
+        return None
+
+    rect = overflow.rectangle()  # pywinauto 矩形对象
+    bbox = (rect.left, rect.top,  # 屏幕像素坐标
+            rect.right, rect.bottom)
+    return ImageGrab.grab(bbox=bbox), bbox  # PIL.Image (RGB) # 屏幕像素坐标
 
 
 def get_qq_window_image(window=None):
@@ -211,7 +305,3 @@ def ensure_qq_window_with_retry(retry: int = 3):
         if i < retry - 1:
             time.sleep(1)
     return None
-
-
-if __name__ == "__main__":
-    ensure_qq_window_with_retry()

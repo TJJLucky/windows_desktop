@@ -1,13 +1,6 @@
-"""QQ 用户列表模块：头像检测、用户行裁切、QQUser 数据模型、列表解析。"""
-
-import sys
-from pathlib import Path
-
-if __name__ == "__main__":
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+"""QQ 用户列表模块：头像检测、用户行裁切、User 数据模型、列表解析。"""
 
 from collections import Counter
-from dataclasses import dataclass
 import time
 import re
 
@@ -15,71 +8,13 @@ import cv2
 import numpy as np
 from PIL import Image
 
-try:
-    from .regions import get_userList_region_and_image, RegionResult
-    from .composites import ensure_qq_window_with_retry
-    from ..core.windows import WindowCaptureCtx
-    from ..vision.ocr import OCREngine
-    from ..core.mouse import random_click
-    from ..core.windows import timer
-except ImportError:
-    from utils.qq.regions import get_userList_region_and_image, RegionResult
-    from utils.qq.composites import ensure_qq_window_with_retry
-    from utils.core.windows import WindowCaptureCtx
-    from utils.vision.ocr import OCREngine
-    from utils.core.mouse import random_click
-    from utils.core.windows import timer
-
-
-# ── 数据模型 ────────────────────────────────────────────────────────
-@dataclass
-class QQUser:
-    """QQ 好友数据模型，含截图坐标、屏幕坐标换算与点击方法。"""
-
-    # 文字信息
-    name: str = ""  # 好友昵称/备注
-
-    # 列表内行区域坐标 (left, top, right, bottom) rect为截图内坐标
-    rect: tuple[int, int, int, int] = (0, 0, 0, 0)
-
-    # 头像圆心 + 半径 (cx, cy, r)
-    avatar: tuple[int, int, int] = (0, 0, 0)
-
-    active: bool = False
-    new_msg: bool = False  # 是否有未读消息红点
-
-    def setAvatar(self, avatar: tuple[int, int, int]) -> "QQUser":
-        """设置头像圆心 + 半径，返回 self 支持链式调用。"""
-        self.avatar = avatar
-        return self
-
-    def setRect(self, rect: tuple[int, int, int, int]) -> "QQUser":
-        """设置列表内行区域坐标，返回 self 支持链式调用。"""
-        self.rect = rect
-        return self
-
-    def setActive(self, active: bool):
-        self.active = active
-        return self
-
-    def setName(self, name: str) -> "QQUser":
-        """设置昵称，返回 self 支持链式调用。"""
-        self.name = name
-        return self
-
-    def setNewMsg(self, new_msg: bool) -> "QQUser":
-        self.new_msg = new_msg
-        return self
-
-    def to_dict(self) -> dict:
-        """返回 QQUser 的可序列化完整信息（name/avatar/rect/active/new_msg）。"""
-        return {
-            "name": self.name,
-            "avatar": list(self.avatar),  # (cx, cy, r)
-            "rect": list(self.rect),  # (left, top, right, bottom)
-            "active": self.active,
-            "new_msg": self.new_msg,
-        }
+from .models import User
+from .regions import get_userList_region_and_image, RegionResult
+from .window_ops import ensure_qq_window_with_retry
+from ..core.window import WindowCaptureCtx
+from ..core.timing import timer
+from ..vision.ocr import OCREngine
+from ..core.mouse import random_click
 
 
 # ── 用户列表管理器 ──────────────────────────────────────────────────
@@ -101,7 +36,7 @@ class UserList:
         if hasattr(self, "_initialized"):
             return
         self._initialized = True
-        self.users: dict[str, QQUser] = {}
+        self.users: dict[str, User] = {}
         self.userList_region: RegionResult | None = None
         self.hwnd: int = 0
 
@@ -278,7 +213,7 @@ class UserList:
         return self.userList_region.image.crop(rect)
 
     @timer
-    def active_user(self, user: QQUser):
+    def active_user(self, user: User):
         """激活指定用户（若非当前激活）。
         """
         if user.active:
@@ -296,7 +231,7 @@ class UserList:
                 rect_bottom - rect_top,
             )
 
-    def find_user(self, contact_name: str) -> "QQUser | None":
+    def find_user(self, contact_name: str) -> "User | None":
         """按名字查找用户：直接使用包含匹配（OCR 名字可能截断/多符号），精确匹配天然被包含覆盖。
 
         返回第一个匹配的用户，找不到返回 None。
@@ -338,7 +273,7 @@ class UserList:
     def refresh(self):
         """全量重建用户列表，整体替换 self.users。"""
         self.refresh_image()
-        new_users: dict[str, QQUser] = {}
+        new_users: dict[str, User] = {}
         _, active_name = self.get_user_list_top_right_ocr()  # 顶部区域 OCR：active 用户的名字
 
         for avatar, rect in self.crop_user_row_by_avatar(self.userList_region.image):
@@ -346,14 +281,14 @@ class UserList:
             name = UserList.ocr_recognize(image)  # 阈值140 OCR 提取黑色昵称
             active = bool(name) and (name in active_name)  # 包含匹配：列表名字较短，是顶部 OCR 结果的子串
             new_msg = UserList.check_new_msg(np.array(image))  # RGB(247,76,48) 红点检测
-            new_users[name] = QQUser().setName(name).setAvatar(avatar).setRect(rect).setActive(active).setNewMsg(
+            new_users[name] = User().setName(name).setAvatar(avatar).setRect(rect).setActive(active).setNewMsg(
                 new_msg)
 
         self.users = new_users
         self.clear_user_list_cache()
 
     def to_dict(self) -> dict[str, dict]:
-        """返回用户列表的完整可序列化信息 {name: QQUser.to_dict()}。"""
+        """返回用户列表的完整可序列化信息 {name: User.to_dict()}。"""
         return {
             name: u.to_dict()
             for name, u in self.users.items()
@@ -401,12 +336,3 @@ class UserList:
         self.cache_data = self.to_dict().copy()
         self.cache_ts = now
         return self.cache_data.copy()
-
-
-if __name__ == "__main__":
-    userList = UserList()
-    userList.refresh()
-    # userList.active_user(list(userList.users.values())[1])
-    # userList.refresh()
-    print(list(userList.users.values())[3])
-    userList.active_user(list(userList.users.values())[3])
