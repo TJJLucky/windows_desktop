@@ -130,7 +130,8 @@ class InputBox:
     def click_inputbox(self):
         """在输入框区域内随机取点点击，把输入焦点交给聊天输入控件。
 
-        进入上下文时置顶并最大化窗口，确保整个输入框都在屏幕可点击范围内。
+        进入上下文时置顶并整理窗口形态（高度铺满 + 宽 50% + 靠左），
+        确保整个输入框都在屏幕可点击范围内。
         """
         # 未 refresh 过则无法点击
         if self.input_region is None:
@@ -138,8 +139,8 @@ class InputBox:
             return
         # 取输入框屏幕区域
         region = self.input_region.screen_region
-        # 置顶 + 最大化窗口（不抢焦点），保证输入框完整在屏内
-        with WindowCaptureCtx(self.hwnd, maximize=True):
+        # 置顶 + 整理窗口形态（不抢焦点），保证输入框完整在屏内
+        with WindowCaptureCtx(self.hwnd, layout=True):
             # 区域内随机取点点击（模拟人工点击）
             random_click(region["x"], region["y"], region["w"], region["h"])
 
@@ -176,7 +177,8 @@ class InputBox:
     def click_send(self):
         """点击发送按钮（取中心点），把输入框当前内容发送出去。
 
-        进入上下文时置顶并最大化窗口，确保发送按钮不会因窗口部分出屏而点不到。
+        进入上下文时置顶并整理窗口形态（高度铺满 + 宽 50% + 靠左），
+        确保发送按钮不会因窗口部分出屏而点不到。
         """
         # 未定位到发送按钮则无法点击
         if self.input_region is None or self.input_region.send_button_region is None:
@@ -184,8 +186,8 @@ class InputBox:
             return
         # 发送按钮屏幕区域
         region = self.input_region.send_button_region
-        # 置顶 + 最大化窗口，保证按钮在屏内
-        with WindowCaptureCtx(self.hwnd, maximize=True):
+        # 置顶 + 整理窗口形态，保证按钮在屏内
+        with WindowCaptureCtx(self.hwnd, layout=True):
             # 精确点击按钮中心点（按钮较小，点中心最稳）
             click_at(region["x"] + region["w"] // 2,
                      region["y"] + region["h"] // 2)

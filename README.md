@@ -142,7 +142,7 @@ Content-Type: application/json
 | --- | --- |
 | `screenshot.py` | `ensure_dpi_aware()` / `getDPI()` / `calc_buf_size()` / `WGCCapture`（后台截图单例） |
 | `mouse.py` | `random_point` / `random_click` / `click_at` / `drag`（`SetCursorPos` + `mouse_event`） |
-| `window.py` | `WindowCaptureCtx`（无焦点置顶上浮）、`set_window_z_pos`、窗口移动/最大化/贴边检测 |
+| `window.py` | `WindowCaptureCtx`（无焦点置顶上浮）、`set_window_z_pos`、`layout_window_left_half`（高度铺满+宽50%+靠左，取代最大化）、贴边检测 |
 | `timing.py` | `timer` 装饰器（函数耗时输出） |
 
 ### `utils/vision`

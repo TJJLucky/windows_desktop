@@ -30,8 +30,8 @@ from PIL import Image, ImageGrab
 
 # WGC 截图单例 / DPI 查询
 from ..core.screenshot import WGCCapture, getDPI
-# 窗口最大化 / 层级控制
-from ..core.window import maximize_window, set_window_z_pos
+# 窗口形态整理（高度铺满 + 宽 50% + 靠左）/ 层级控制
+from ..core.window import layout_window_left_half, set_window_z_pos
 # 随机点击（视觉兜底点托盘图标）
 from ..core.mouse import random_click
 # 模板匹配（托盘图标/模式切换按钮）
@@ -339,7 +339,7 @@ class _WindowState:
         self.hwnd: int = 0
         # 快照时的窗口几何（left, top, right, bottom）
         self.rect: tuple[int, int, int, int] | None = None
-        # 快照时的最大化状态
+        # 快照时的最大化状态（目标形态非最大化；用户手动最大化会被识别为变化并恢复）
         self.maximized: bool = False
         # 快照是否有效（首次校验成功后才为 True）
         self.valid: bool = False
@@ -358,18 +358,18 @@ def _window_l2_changed(win) -> bool:
     rect = (win.left, win.top, win.right, win.bottom)
     if rect != _window_state.rect:
         return True
-    # 最大化状态变化 → 用户切换过
+    # 最大化状态变化 → 用户切换过（目标形态应为非最大化）
     if bool(win.isMaximized) != _window_state.maximized:
         return True
     return False
 
 
 def _snapshot_and_verify(win) -> bool:
-    """L3 深度校验：置顶 + 最大化 + WGC 试截，成功后更新快照。"""
+    """L3 深度校验：置顶 + 形态整理 + WGC 试截，成功后更新快照。"""
     # 置顶（把窗口带到最前，不抢焦点）
     set_window_z_pos(win._hWnd)
-    # 最大化（撑满工作区，保证控件可点）
-    maximize_window(win._hWnd)
+    # 整理窗口形态：工作区高度铺满 + 宽 50% + 靠左（取代最大化，保证控件完整在屏内可点）
+    layout_window_left_half(win._hWnd)
     # 等窗口重绘
     time.sleep(0.2)
     # WGC 试截：能截到画面 = 窗口真实可截图（不是黑块/缩略图）
@@ -386,14 +386,14 @@ def _snapshot_and_verify(win) -> bool:
 
 
 def ensure_qq_window():
-    """对外统一入口：保证 QQ 主窗口处于前置、最大化、可截图状态。
+    """对外统一入口：保证 QQ 主窗口处于前置、左半铺满（高度占满+宽50%+靠左）、可截图状态。
 
     分级校验（成本从低到高）：
       L1（每次）   主窗口存在（get_main_window 枚举可见窗口）。
-      L2（快照比对）窗口几何/最大化与快照一致 → 用户未动 → 直接复用，
-                   跳过置顶/最大化/试截等昂贵动作。
-      L3（仅变化时）置顶 + 最大化 + WGC 试截确认可截图，成功后更新快照。
-                   窗口最小化等同状态变化，走 L3 恢复。
+      L2（快照比对）窗口几何/形态与快照一致 → 用户未动 → 直接复用，
+                   跳过置顶/形态整理/试截等昂贵动作。
+      L3（仅变化时）置顶 + 形态整理（高度铺满/宽 50%/靠左）+ WGC 试截确认可截图，
+                   成功后更新快照。窗口最小化等同状态变化，走 L3 恢复。
 
     :return: 主窗口对象；失败返回 None（由 with_retry 决定重试/抛错）
     """
@@ -418,7 +418,7 @@ def ensure_qq_window_with_retry(retry: int = 3):
       1. 无 QQ 进程 —— 首次尝试调用 start_qq() 唤起登录，随后继续轮询，
          给 QQ 启动或用户登录留出时间；后续重试不重复启动。
       2. 有 QQ 进程（已登录/运行中）—— 走 ensure_qq_window 分级校验
-         （用户未动窗口时直接复用快照，省去置顶/最大化/试截），失败重试。
+         （用户未动窗口时直接复用快照，省去置顶/形态整理/试截），失败重试。
       3. 重试耗尽仍未就绪 —— 抛 QQWindowNotReadyError，保证每次操作
          要么成功要么显式失败，不静默降级为空数据。
 
