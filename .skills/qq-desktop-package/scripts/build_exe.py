@@ -90,10 +90,10 @@ def verify_exe(exe: Path, smoke_start: bool) -> None:
     except subprocess.TimeoutExpired:
         fail("exe --help 超时（180s），疑似打包后启动异常")
     out = help_run.stdout + help_run.stderr
-    for key in ("endpoint-file", "state-dir"):
+    for key in ("endpoint-file", "state-dir", "log-dir"):
         if key not in out:
             fail(f"--help 输出缺少参数: {key}")
-    print("  --help 冒烟通过（endpoint-file / state-dir 均在）")
+    print("  --help 冒烟通过（endpoint-file / state-dir / log-dir 均在）")
 
     if smoke_start:
         _smoke_start(exe)

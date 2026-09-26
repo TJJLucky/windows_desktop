@@ -4,17 +4,16 @@ __pycache__/
 .pytest_cache/
 
 # 打包构建产物（仅支持 exe 发行）
-dist/
 dist-exe/
 build-exe/
-build/
-*.egg-info/
 
 # IDE
 .idea/
 
 # 运行时状态文件
 *.sqlite3
+*.log
+logs/
 
 # VS 原生工程中间产物（源码已跟踪，产物可重建）
 native/wgc_capture/.vs/

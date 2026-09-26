@@ -18,6 +18,8 @@ from __future__ import annotations
 import argparse
 # asyncio：驱动 uvicorn 的异步事件循环
 import asyncio
+# logging：记录服务启动、接口执行和异常明细
+import logging
 # datetime / timezone：生成 endpoint 文件的 issuedAt（UTC 时间戳）
 from datetime import datetime, timezone
 # json：endpoint 文件的序列化 / 反序列化
@@ -36,6 +38,7 @@ import uvicorn
 
 # create_app：构造 FastAPI 应用（路由都在里面注册）
 from .app import create_app
+from .logging_setup import log_environment, setup_logging
 
 
 def main() -> None:
@@ -57,17 +60,46 @@ def main() -> None:
         default=None,
         help="状态目录，存放聊天记录/账本数据库（缺省：同 endpoint 文件目录下 state\\）",
     )
+    # 日志目录：应用结构化日志和控制台捕获日志都放在这里
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        default=None,
+        help="日志目录（缺省：state-dir\\logs）",
+    )
     # 解析命令行参数；argparse 会在参数非法时自动打印用法并退出
     arguments = parser.parse_args()
 
     # 默认模式判定：endpoint 文件与状态目录两个参数都未指定 → 走"双击即用"路径
     default_mode = arguments.endpoint_file is None and arguments.state_dir is None
-    # 默认模式时计算默认运行目录（Windows 为 %LOCALAPPDATA%\price-agent-qq-service）
-    runtime_dir = _default_runtime_dir() if default_mode else None
-    # endpoint 文件最终路径：显式参数优先；否则放在默认运行目录下
-    endpoint_file = (arguments.endpoint_file or (runtime_dir / "endpoint.json")).resolve()
-    # 状态目录最终路径：显式参数优先；否则为默认运行目录下的 state 子目录
-    state_dir = (arguments.state_dir or (runtime_dir / "state")).resolve()
+    default_runtime_dir = _default_runtime_dir()
+    if arguments.endpoint_file is not None:
+        endpoint_file = arguments.endpoint_file.expanduser().resolve()
+    elif arguments.state_dir is not None:
+        endpoint_file = (arguments.state_dir.expanduser().resolve().parent / "endpoint.json").resolve()
+    else:
+        endpoint_file = (default_runtime_dir / "endpoint.json").resolve()
+
+    if arguments.state_dir is not None:
+        state_dir = arguments.state_dir.expanduser().resolve()
+    elif arguments.endpoint_file is not None:
+        state_dir = (endpoint_file.parent / "state").resolve()
+    else:
+        state_dir = (default_runtime_dir / "state").resolve()
+
+    log_dir = (arguments.log_dir or (state_dir / "logs")).expanduser().resolve()
+    app_log, console_log = setup_logging(log_dir)
+    log_environment()
+    logger = logging.getLogger("qq_service.startup")
+    logger.info(
+        "service.config mode=%s endpoint_file=%s state_dir=%s log_dir=%s app_log=%s console_log=%s",
+        "default" if default_mode else "explicit",
+        endpoint_file,
+        state_dir,
+        log_dir,
+        app_log,
+        console_log,
+    )
 
     # 默认模式下做"防重复拉起"检查：若已有实例在跑，直接提示并退出，避免双击两次起两个服务
     if default_mode:
@@ -81,14 +113,18 @@ def main() -> None:
     listener = _bind_loopback_listener()
     # 从套接字取回操作系统实际分配的端口号
     port = int(listener.getsockname()[1])
-    # 把「端口 + pid」原子写入 endpoint 文件（先写临时文件再 os.replace 覆盖）
-    _publish_endpoint(endpoint_file, port)
+    # 把「端口 + pid + 日志目录」原子写入 endpoint 文件（先写临时文件再 os.replace 覆盖）
+    _publish_endpoint(endpoint_file, port, log_dir, app_log, console_log)
+    logger.info("service.listening port=%d endpoint=http://127.0.0.1:%d", port, port)
 
     # 默认模式额外打印数据目录，方便最终用户知道状态数据落在哪里
     if default_mode:
-        print(f"[INFO] 默认运行模式，数据目录: {runtime_dir}")
-    # 打印 endpoint 文件路径（调用方需要读取它拿端口）
+        print(f"[INFO] 默认运行模式，数据目录: {default_runtime_dir}")
+    # 打印 endpoint 与日志路径，方便最终用户直接定位
     print(f"[INFO] endpoint 文件: {endpoint_file}")
+    print(f"[INFO] 日志目录: {log_dir}")
+    print(f"[INFO] 应用日志: {app_log}")
+    print(f"[INFO] 控制台日志: {console_log}")
     # 打印调试页地址：Swagger UI（/docs），浏览器打开即可直接发请求调试（无需 token）
     print(f"[INFO] 调试页面(Swagger): http://127.0.0.1:{port}/docs")
 
@@ -97,8 +133,13 @@ def main() -> None:
     try:
         # 用 asyncio 运行 uvicorn 服务：serve 绑定到已就绪的 listener 上（不再二次 bind）
         # sockets 参数传入监听套接字，保证端口就是我们上面绑定的那个随机端口
-        asyncio.run(uvicorn.Server(uvicorn.Config(app, log_level="info")).serve(sockets=[listener]))
+        # use_colors=False：关闭 ANSI 颜色码，避免 exe 控制台/日志查看器显示乱码
+        asyncio.run(uvicorn.Server(uvicorn.Config(app, log_level="info", use_colors=False)).serve(sockets=[listener]))
+    except Exception:
+        logger.exception("service.crashed")
+        raise
     finally:
+        logger.info("service.stopping")
         # 无论正常退出还是异常中断，都要先关闭监听套接字
         listener.close()
         # 再清理 endpoint 文件：只有确认该文件是本进程写出的（pid 匹配）才删除，
@@ -160,7 +201,7 @@ def _bind_loopback_listener() -> socket.socket:
         raise
 
 
-def _publish_endpoint(path: Path, port: int) -> None:
+def _publish_endpoint(path: Path, port: int, log_dir: Path, app_log: Path, console_log: Path) -> None:
     """把「端口 + pid」原子写入 endpoint 文件：先写同目录临时文件，再 os.replace 覆盖。"""
     # 确保 endpoint 文件所在目录存在（默认模式首次运行需要创建目录）
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -174,6 +215,9 @@ def _publish_endpoint(path: Path, port: int) -> None:
             "apiVersion": "v1",
             "processId": os.getpid(),
             "endpoint": f"http://127.0.0.1:{port}",
+            "logDirectory": str(log_dir),
+            "applicationLog": str(app_log),
+            "consoleLog": str(console_log),
             "issuedAt": datetime.now(timezone.utc).isoformat(),
         },
         ensure_ascii=False,      # 保留非 ASCII 字符原样输出（本项目字段均为 ASCII，防御性设置）

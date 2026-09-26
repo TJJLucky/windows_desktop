@@ -34,7 +34,7 @@ python scripts\build_exe.py --project-dir <dir> --python D:\anaconda3\envs\<env>
    - `--add-data templates;templates`、`--add-data libs/wgc_capture.dll;libs`
      （onefile 解压根 `_MEIPASS`，代码 `__file__` 上溯三级的相对路径恰好指向 `_MEIPASS/templates`、`_MEIPASS/libs`）；
    - `--collect-data rapidocr_onnxruntime`（OCR 模型在包内，缺失则 exe 运行时 OCR 找不到模型）。
-3. **冒烟**：`--help` 必须含 `endpoint-file`/`state-dir`；`--smoke-start` 时临时启动 exe 并请求 `/v1/health == READY`。
+3. **冒烟**：`--help` 必须含 `endpoint-file`/`state-dir`/`log-dir`；`--smoke-start` 时临时启动 exe 并请求 `/v1/health == READY`。
 4. **已知陷阱**：
    - exe 常驻持有输出管道句柄 → 父进程等 EOF 永久卡住。脚本内所有 exe 子进程必须重定向 stdout/stderr。
    - PyInstaller onefile 是**父子进程模型**（bootloader 派生 app 子进程）→ 清理用 `taskkill /PID <bootloader> /T /F` 连树杀，单 terminate 会留子进程残留。

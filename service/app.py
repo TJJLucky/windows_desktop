@@ -11,6 +11,10 @@
 # 延迟求值类型注解：允许前向引用，加快 import 速度
 from __future__ import annotations
 
+import logging
+import time
+import uuid
+
 # Path：数据库文件路径的类型标注
 from pathlib import Path
 
@@ -25,6 +29,8 @@ from .command_ledger import CommandConflictError, CommandLedger
 from .contracts import API_VERSION, CaptureCheckResponse, ChatHistoryRequest, ChatHistoryResponse, CommandResponse, ListContactsResponse, ReadMessagesRequest, ReadMessagesResponse, SendMessageRequest, ServiceHealthResponse
 # QqAutomationPort：自动化端口抽象（测试时可注入替身）；LegacyQqAutomationFacade：真实实现（视觉 RPA）；QqAutomationError：QQ 操作失败统一异常
 from .facade import LegacyQqAutomationFacade, QqAutomationError, QqAutomationPort
+
+logger = logging.getLogger("qq_service.api")
 
 
 def create_app(
@@ -51,6 +57,49 @@ def create_app(
     ledger = CommandLedger(ledger_path)
     # 创建 FastAPI 应用：开启默认 /docs(Swagger) 与 /openapi.json，版本号取契约常量
     app = FastAPI(title="PriceAgent QQ Desktop Service", version=API_VERSION)
+    logger.info(
+        "application.create ledger_path=%s chat_history_path=%s automation=%s",
+        ledger_path,
+        chat_history_path,
+        type(facade).__name__,
+    )
+
+    @app.middleware("http")
+    async def log_request(request, call_next):
+        """记录每个 HTTP 请求的 requestId、耗时、状态码和异常。"""
+        request_id = uuid.uuid4().hex[:12]
+        started = time.perf_counter()
+        client = request.client.host if request.client else "-"
+        logger.info(
+            "http.request.start request_id=%s method=%s path=%s query=%r client=%s",
+            request_id,
+            request.method,
+            request.url.path,
+            request.url.query,
+            client,
+        )
+        try:
+            response = await call_next(request)
+        except Exception:
+            logger.exception(
+                "http.request.error request_id=%s method=%s path=%s duration_ms=%.2f",
+                request_id,
+                request.method,
+                request.url.path,
+                (time.perf_counter() - started) * 1000,
+            )
+            raise
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        response.headers["X-Request-ID"] = request_id
+        logger.info(
+            "http.request.end request_id=%s method=%s path=%s status=%d duration_ms=%.2f",
+            request_id,
+            request.method,
+            request.url.path,
+            response.status_code,
+            elapsed_ms,
+        )
+        return response
 
     # —— 健康检查接口 ——
     @app.get("/v1/health", response_model=ServiceHealthResponse)
@@ -63,6 +112,12 @@ def create_app(
     def check_capture() -> CaptureCheckResponse:
         # 同步端点：FastAPI 自动放入线程池执行窗口就绪检测（进程/窗口枚举 + 可能唤起 + WGC 试截）
         result = facade.check_capture_ready()
+        logger.info(
+            "capture.check ready=%s window_title=%r error=%s",
+            result.get("ready"),
+            result.get("windowTitle"),
+            result.get("error"),
+        )
         # 组装响应：ready 透传；windowTitle 就绪时才有；error 不可用时才有
         # 注意：窗口不可用返回 200 + ready=false（探测语义），不投影为 503
         return CaptureCheckResponse(
@@ -78,7 +133,9 @@ def create_app(
         try:
             # 同步端点：FastAPI 自动在（线程池）执行 QQ 视觉识别，事件循环不被阻塞
             contacts = facade.list_contacts()
+            logger.info("contacts.query.success count=%d", len(contacts))
         except QqAutomationError as exc:
+            logger.exception("contacts.query.error")
             # QQ 操作失败（窗口不可用、识别失败等）统一返回 503，并把内部原因带给调用方
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         # 组装响应：联系人数组 + 数量
@@ -90,7 +147,13 @@ def create_app(
         try:
             # 同步端点：FastAPI 自动在（线程池）执行视觉读取消息区 + OCR 识别文本
             payload = facade.read_messages(request.contact_name)
+            logger.info(
+                "messages.read.success contact=%s count=%d",
+                request.contact_name,
+                len(payload.get("messages", [])),
+            )
         except QqAutomationError as exc:
+            logger.exception("messages.read.error contact=%s", request.contact_name)
             # QQ 操作失败 → 503（不会把读取结果落库，因为根本没读到）
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         # 读到的可见消息自动落库（供聊天记录查询），失败仅告警不阻断
@@ -101,6 +164,12 @@ def create_app(
     # —— 发送消息接口（幂等） ——
     @app.post("/v1/commands/send", response_model=CommandResponse)
     def send_message(request: SendMessageRequest) -> CommandResponse:
+        logger.info(
+            "message.send.begin command_id=%s contact=%s text_length=%d",
+            request.command_id,
+            request.contact_name,
+            len(request.text),
+        )
         try:
             # 先向账本申请执行：begin 返回 (是否真正执行, 当前状态, 已有结果)。
             # 相同 commandId 相同消息体 → 幂等返回已有结果不重发；相同 ID 不同消息体 → 抛 409
@@ -108,15 +177,22 @@ def create_app(
                 request.command_id, request.contact_name, request.text
             )
         except CommandConflictError as exc:
+            logger.warning("message.send.conflict command_id=%s", request.command_id)
             # 冲突（同一 commandId 配不同消息体）→ 409，明确告知调用方
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if not execute:
+            logger.info(
+                "message.send.idempotent command_id=%s status=%s",
+                request.command_id,
+                current_status,
+            )
             # 账本判定无需再次执行（已在跑或已完成）：直接把当前状态与结果原样返回
             return CommandResponse(commandId=request.command_id, status=current_status, result=result)
         try:
             # 真正执行发送：FastAPI 线程池里跑视觉定位输入框 + 粘贴 + 快捷键发送
             result = facade.send_message(request.contact_name, request.text)
         except QqAutomationError as exc:
+            logger.exception("message.send.failed command_id=%s", request.command_id)
             # 发送失败：构造失败结果并让账本落 FAILED 终态（不会留下悬空的 RUNNING）
             result = {"ok": False, "sent": False, "textLength": len(request.text), "error": str(exc)}
             ledger.resolve(request.command_id, "FAILED", result)
@@ -126,6 +202,7 @@ def create_app(
         ledger.resolve(request.command_id, "SUCCEEDED", result)
         # 发出的消息自动落库为 out（我方发出），关联 commandId 便于追溯；失败仅告警
         _try_mark_outbound(chat_history, request.contact_name, request.text, request.command_id)
+        logger.info("message.send.success command_id=%s", request.command_id)
         # 返回 SUCCEEDED 状态 + 实际执行结果
         return CommandResponse(commandId=request.command_id, status="SUCCEEDED", result=result)
 
@@ -135,10 +212,12 @@ def create_app(
         # 从账本按 commandId 查状态与结果（SQLite 毫秒级，同步直调）
         record = ledger.get(command_id)
         if record is None:
+            logger.warning("command.status.not_found command_id=%s", command_id)
             # 账本中不存在该 commandId → 404，防止调用方把未知 ID 当成功
             raise HTTPException(status_code=404, detail="QQ_COMMAND_NOT_FOUND")
         # 解包 (当前状态, 结果) 并返回
         current_status, result = record
+        logger.info("command.status command_id=%s status=%s", command_id, current_status)
         return CommandResponse(commandId=command_id, status=current_status, result=result)
 
     # —— 查询聊天记录接口（查询前自动视觉更新一次） ——
@@ -149,13 +228,20 @@ def create_app(
             payload = facade.read_messages(request.contact_name)
         except QqAutomationError:
             # 视觉读取失败（如窗口不可用）：不阻断历史查询，只把更新标记为 failed 告知调用方
+            logger.warning("chat.history.update_failed contact=%s", request.contact_name)
             update = "failed"  # 自动更新失败不阻断历史查询
         else:
             # 读取成功：把新消息落库，更新标记为 ok
             _record_payload(chat_history, request.contact_name, payload)
+            logger.info(
+                "chat.history.update_ok contact=%s visible_count=%d",
+                request.contact_name,
+                len(payload.get("messages", [])),
+            )
             update = "ok"
         # 从存储中取出该联系人的历史消息（按 seq 升序）
         messages = chat_history.get_history(request.contact_name)
+        logger.info("chat.history.query contact=%s update=%s count=%d", request.contact_name, update, len(messages))
         # 返回联系人名、消息条数、消息列表与本次更新状态
         return ChatHistoryResponse(
             contactName=request.contact_name, count=len(messages), messages=messages, update=update
@@ -168,9 +254,10 @@ def create_app(
 def _record_payload(chat_history: ChatHistoryStore, contact_name: str, payload: dict) -> None:
     """把一次视觉读取结果作为可见窗口差异写入聊天记录存储。"""
     try:
-        chat_history.append_visible(contact_name, payload["messages"])
-    except Exception as exc:
-        print(f"[WARN] 聊天记录写入失败: {exc}")
+        inserted = chat_history.append_visible(contact_name, payload["messages"])
+        logger.info("chat.history.append contact=%s inserted=%d", contact_name, inserted)
+    except Exception:
+        logger.exception("chat.history.append_failed contact=%s", contact_name)
 
 
 def _try_mark_outbound(
@@ -182,5 +269,6 @@ def _try_mark_outbound(
     """登记已发送消息；写入失败仅打印告警，不阻断主流程。"""
     try:
         chat_history.mark_outbound(contact_name, text, command_id)
-    except Exception as exc:
-        print(f"[WARN] 聊天记录写入失败: {exc}")
+        logger.info("chat.history.mark_outbound contact=%s command_id=%s", contact_name, command_id)
+    except Exception:
+        logger.exception("chat.history.mark_outbound_failed contact=%s command_id=%s", contact_name, command_id)

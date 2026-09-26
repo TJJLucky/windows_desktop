@@ -19,6 +19,8 @@ from contextlib import closing
 import hashlib
 # json：结果序列化/反序列化（结果存 JSON 文本列）
 import json
+# logging：记录命令状态迁移
+import logging
 # Path：数据库文件路径
 from pathlib import Path
 # sqlite3：标准库 SQLite 驱动（短连接，用完即关）
@@ -27,6 +29,8 @@ import sqlite3
 import threading
 # Any：宽松结果类型；Literal：命令状态的字面量约束
 from typing import Any, Literal
+
+logger = logging.getLogger("qq_service.command_ledger")
 
 
 # 命令状态机：RUNNING(执行中) → SUCCEEDED(成功) / FAILED(失败)；重启后 RUNNING → EFFECT_UNKNOWN(结果未知)
@@ -64,7 +68,9 @@ class CommandLedger:
             )
             # 启动迁移：任何上次运行遗留的 RUNNING（进程崩溃/被杀导致）都转为 EFFECT_UNKNOWN，
             # 语义是"发送结果不确定"，绝不自动重发（避免重复给用户发消息）
-            connection.execute("UPDATE qq_send_command SET status = 'EFFECT_UNKNOWN' WHERE status = 'RUNNING'")
+            cursor = connection.execute("UPDATE qq_send_command SET status = 'EFFECT_UNKNOWN' WHERE status = 'RUNNING'")
+            if cursor.rowcount:
+                logger.warning("ledger.startup_migration running_to_effect_unknown count=%d", cursor.rowcount)
 
     def begin(self, command_id: str, contact_name: str, text: str) -> tuple[bool, CommandStatus, dict[str, Any] | None]:
         """申请执行命令：决定「本次是否真正执行」。
@@ -88,11 +94,14 @@ class CommandLedger:
                     "INSERT INTO qq_send_command(command_id, payload_hash, status) VALUES (?, ?, 'RUNNING')",
                     (command_id, payload_hash),
                 )
+                logger.info("ledger.begin command_id=%s status=RUNNING", command_id)
                 return True, "RUNNING", None
             if row[0] != payload_hash:
                 # 幂等键被不同消息体复用 → 冲突（调用方转 409）
+                logger.warning("ledger.conflict command_id=%s", command_id)
                 raise CommandConflictError("QQ_COMMAND_ID_REUSED")
             # 幂等命中：返回既有状态与结果，不执行
+            logger.info("ledger.idempotent command_id=%s status=%s", command_id, row[1])
             return False, row[1], _decode_result(row[2])
 
     def resolve(self, command_id: str, status: Literal["SUCCEEDED", "FAILED"], result: dict[str, Any]) -> None:
@@ -103,6 +112,7 @@ class CommandLedger:
                 "UPDATE qq_send_command SET status = ?, result_json = ? WHERE command_id = ?",
                 (status, json.dumps(result, ensure_ascii=False, separators=(",", ":")), command_id),
             )
+            logger.info("ledger.resolve command_id=%s status=%s", command_id, status)
 
     def get(self, command_id: str) -> tuple[CommandStatus, dict[str, Any] | None] | None:
         """查询命令当前状态与结果；不存在返回 None。"""

@@ -67,18 +67,25 @@ dist-exe\qq-desktop-service.exe
 
 ```powershell
 conda activate qq-desktop-service
-price-agent-qq-service --endpoint-file <endpoint.json> --state-dir <state-dir>
+python -m service --endpoint-file <endpoint.json> --state-dir <state-dir> --log-dir <log-dir>
 # 或 python -m service --endpoint-file ... --state-dir ...
 # 或 exe：dist-exe\qq-desktop-service.exe --endpoint-file ... --state-dir ...
 ```
 
-服务绑定 127.0.0.1 随机端口，把 endpoint+token 写入 endpoint 文件。
-**调试**：浏览器打开 `http://127.0.0.1:<port>/docs`（Swagger UI，Authorize 填 token 后可直接发请求）；OpenAPI 合同 `GET /openapi.json`。
+服务绑定 127.0.0.1 随机端口，把 endpoint、pid 和日志路径写入 endpoint 文件。
+
+日志默认位于 `<state-dir>/logs`：
+
+- `qq-desktop-service.log`：结构化应用日志。
+- `qq-desktop-service.console.log`：Uvicorn 和 `print()` 控制台捕获。
+- 5 MB 轮转，保留 5 份。
+- 可通过 `--log-dir` 或 endpoint 里的 `logDirectory` 定位。
+**调试**：浏览器打开 `http://127.0.0.1:<port>/docs`（Swagger UI，无需鉴权即可直接发请求）；OpenAPI 合同 `GET /openapi.json`。
 
 ## 产物验证（冒烟）
 
 ```powershell
-# --help 必须含 endpoint-file/state-dir；--smoke-start 时启动后 /v1/health == READY
+# --help 必须含 endpoint-file/state-dir/log-dir；--smoke-start 时启动后 /v1/health == READY
 python scripts\build_exe.py --project-dir E:\Project\agent\windows_desktop --smoke-start
 # 只校验现有 exe（不重新构建）
 python scripts\build_exe.py --project-dir E:\Project\agent\windows_desktop --skip-build

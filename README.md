@@ -98,6 +98,13 @@ conda run -n qq-desktop-service python -m service `
 
 endpoint 文件记录动态 loopback URL 与本次启动的进程 pid（无 token 字段——服务不做鉴权）。调用方读取 endpoint 后直接调用接口，无需任何鉴权头。
 
+日志默认写入 `<state-dir>\logs\`，也可用 `--log-dir` 指定目录：
+
+- `qq-desktop-service.log`：应用结构化日志，含时间、级别、模块、请求 ID、请求耗时、状态码和关键业务字段。
+- `qq-desktop-service.console.log`：完整捕获控制台输出，包括 Uvicorn 和 `print()` 输出。
+- 单个日志文件达到 5 MB 后轮转，保留 5 个历史文件。
+- endpoint 文件同时写入 `logDirectory`、`applicationLog`、`consoleLog`，调用方可直接定位。
+
 聊天记录以 `contactName` 为分区键；调用方应使用 `/v1/contacts:query` 返回的用户列表 key 原样传回。
 
 接口：

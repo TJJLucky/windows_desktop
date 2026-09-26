@@ -11,8 +11,12 @@
 # 延迟求值类型注解
 from __future__ import annotations
 
+import logging
+
 # Protocol：结构化类型协议（鸭子类型接口），无需继承即可满足
 from typing import Protocol
+
+logger = logging.getLogger("qq_service.facade")
 
 
 class QqAutomationError(RuntimeError):
@@ -117,5 +121,5 @@ class LegacyQqAutomationFacade:
             return {"ready": True, "windowTitle": getattr(win, "title", None)}
         except Exception as exc:
             # 重试耗尽仍未就绪：返回不可用 + 错误码（不抛出，保持探测语义）
-            print(f"[WARN] 截图可用性检测失败: {exc}")
+            logger.warning("capture.check.failed error=%s", exc)
             return {"ready": False, "error": "QQ_WINDOW_NOT_READY"}
