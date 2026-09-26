@@ -5,6 +5,7 @@
 - Message         → text / rect / is_self 三字段
 """
 
+# dataclass：自动生成 __init__/__repr__ 等样板代码的数据类
 from dataclasses import dataclass
 
 
@@ -21,7 +22,9 @@ class User:
     # 头像圆心 + 半径 (cx, cy, r)
     avatar: tuple[int, int, int] = (0, 0, 0)
 
+    # 是否为当前激活（点开的）会话
     active: bool = False
+    # 是否有未读消息红点
     new_msg: bool = False  # 是否有未读消息红点
 
     def setAvatar(self, avatar: tuple[int, int, int]) -> "User":
@@ -35,6 +38,7 @@ class User:
         return self
 
     def setActive(self, active: bool):
+        """设置是否激活会话，返回 self 支持链式调用。"""
         self.active = active
         return self
 
@@ -44,6 +48,7 @@ class User:
         return self
 
     def setNewMsg(self, new_msg: bool) -> "User":
+        """设置未读红点标记，返回 self 支持链式调用。"""
         self.new_msg = new_msg
         return self
 
@@ -51,7 +56,9 @@ class User:
         """返回 User 的可序列化完整信息（name/avatar/rect/active/new_msg）。"""
         return {
             "name": self.name,
+            # 头像：圆心坐标 + 半径（元组转列表便于 JSON 序列化）
             "avatar": list(self.avatar),  # (cx, cy, r)
+            # 行区域：四边坐标（元组转列表）
             "rect": list(self.rect),  # (left, top, right, bottom)
             "active": self.active,
             "new_msg": self.new_msg,

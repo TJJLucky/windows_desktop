@@ -1,25 +1,42 @@
-"""外部接口层合同测试；不操作真实 QQ。"""
+"""外部接口层合同测试；不操作真实 QQ。
 
+用 FakeAutomation 替身替换真实视觉 RPA，验证：
+- token 鉴权（无 token → 401）；
+- v1 合同映射（health / contacts / read 的结构正确）；
+- 发送幂等（同 commandId 只执行一次，可查询）；
+- 幂等键冲突（同 ID 不同消息体 → 409）。
+"""
+
+# 延迟求值类型注解
 from __future__ import annotations
 
+# httpx：异步 HTTP 客户端（ASGI transport 直连应用，不起真实服务器）
 import httpx
+# pytest：测试框架
 import pytest
 
+# create_app：被测应用工厂
 from service.app import create_app
 
 
 class FakeAutomation:
+    """自动化替身：不操作 QQ，记录发送调用并返回固定数据。"""
+
     def __init__(self) -> None:
+        # 记录所有发送调用（用于断言幂等：同消息应只发送一次）
         self.sent: list[tuple[str, str]] = []
 
     def list_contacts(self) -> dict[str, dict]:
+        # 固定返回一个联系人
         return {"华强电子": {"name": "华强电子", "active": True, "new_msg": False}}
 
     def send_message(self, contact_name: str, text: str) -> dict:
+        # 记录调用并返回成功结果
         self.sent.append((contact_name, text))
         return {"ok": True, "sent": True, "textLength": len(text), "error": None}
 
     def read_messages(self, contact_name: str) -> dict:
+        # 固定返回一条消息
         return {
             "ok": True,
             "messages": [{"text": "有货", "isSelf": False, "x": 1, "y": 2, "w": 3, "h": 4}],
@@ -30,11 +47,15 @@ class FakeAutomation:
 
 @pytest.fixture
 def service(tmp_path):
+    """构建 (替身, 应用) 元组：每个测试独立临时账本库。"""
+    # 创建替身
     automation = FakeAutomation()
+    # 用替身构造应用（token 固定测试值）
     return automation, create_app(automation, token="test-token", ledger_path=tmp_path / "ledger.sqlite3")
 
 
 def client(app):
+    """构造带默认 Bearer 头的异步测试客户端。"""
     return httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
         base_url="http://qq-service.test",
@@ -44,48 +65,70 @@ def client(app):
 
 @pytest.mark.asyncio
 async def test_api_requires_token(service) -> None:
+    """场景：不带 token 请求 → 应 401。"""
     _, app = service
+    # 不带 Authorization 头直接请求
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://qq-service.test") as caller:
         response = await caller.get("/v1/health")
+    # 断言：未授权
     assert response.status_code == 401
 
 
 @pytest.mark.asyncio
 async def test_api_projects_legacy_automation_as_v1_contract(service) -> None:
+    """场景：带 token 调用三个接口 → 结构符合 v1 合同。"""
     _, app = service
     async with client(app) as caller:
+        # 健康检查
         health = await caller.get("/v1/health")
+        # 联系人列表
         contacts = await caller.post("/v1/contacts:query")
+        # 读取消息
         messages = await caller.post("/v1/commands/read", json={"contactName": "华强电子"})
+    # 断言：健康状态固定值
     assert health.json() == {"apiVersion": "v1", "status": "READY"}
+    # 断言：1 个联系人
     assert contacts.json()["count"] == 1
+    # 断言：读到的消息文本正确
     assert messages.json()["messages"][0]["text"] == "有货"
 
 
 @pytest.mark.asyncio
 async def test_send_is_idempotent_and_queryable(service) -> None:
+    """场景：相同 commandId 发送两次 → 只执行一次，可查询且结果一致。"""
     automation, app = service
+    # 请求体（commandId 固定）
     payload = {"commandId": "effect-key-0000001", "contactName": "华强电子", "text": "请报价"}
     async with client(app) as caller:
+        # 第一次发送（应真正执行）
         first = await caller.post("/v1/commands/send", json=payload)
+        # 第二次同 ID 同消息（应幂等返回，不重发）
         duplicate = await caller.post("/v1/commands/send", json=payload)
+        # 按 ID 查询状态
         result = await caller.get("/v1/commands/effect-key-0000001")
+    # 断言：第一次成功
     assert first.json()["status"] == "SUCCEEDED"
+    # 断言：幂等重复结果 == 首次结果 == 查询结果
     assert duplicate.json() == first.json() == result.json()
+    # 断言：替身只收到一次发送（幂等生效）
     assert automation.sent == [("华强电子", "请报价")]
 
 
 @pytest.mark.asyncio
 async def test_same_command_id_cannot_change_message(service) -> None:
+    """场景：同 commandId 配不同消息体 → 409 冲突。"""
     _, app = service
     async with client(app) as caller:
+        # 第一次发送
         await caller.post(
             "/v1/commands/send",
             json={"commandId": "effect-key-0000002", "contactName": "华强电子", "text": "第一次"},
         )
+        # 同 ID 改消息体
         conflict = await caller.post(
             "/v1/commands/send",
             json={"commandId": "effect-key-0000002", "contactName": "华强电子", "text": "第二次"},
         )
+    # 断言：409 + 冲突错误码
     assert conflict.status_code == 409
     assert conflict.json() == {"detail": "QQ_COMMAND_ID_REUSED"}

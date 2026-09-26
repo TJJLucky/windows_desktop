@@ -1,16 +1,34 @@
-"""QQ 消息框模块：气泡检测、裁切、发送方判断。"""
+"""QQ 消息框模块：气泡检测、裁切、发送方判断。
 
+MessageList（单例）：
+1. 截取消息区域（裁剪掉左右头像带）；
+2. 颜色替换预处理：把难区分的浅色（背景/对方白泡/我方浅蓝泡）换成"黑/红/白"三色；
+3. 轮廓检测提取每个气泡的外包围盒（每行去重）；
+4. 按"气泡中心在左/右半区"判定发送方（我方靠右，对方靠左）；
+5. 逐气泡裁切 + OCR 识别文本，组装 Message 列表。
+"""
+
+# deque：行去重缓冲（本模块当前用列表实现，保留导入待用）
 from collections import deque
 
+# cv2：轮廓检测（findContours/boundingRect）
 import cv2
+# numpy：像素数组与颜色掩码运算
 import numpy as np
+# PIL.Image / ImageDraw：图像裁切与调试绘制
 from PIL import Image, ImageDraw
 
+# Message 数据模型（链式 setter）
 from .models import Message
+# 消息区区域识别
 from .regions import get_message_box_region_and_image
+# 窗口就绪保证 + 主窗口/截图
 from .window_ops import get_main_window, get_qq_window_image, ensure_qq_window_with_retry
+# OCR 引擎单例
 from ..vision.ocr import OCREngine
+# DPI 查询（头像边距自适应）
 from ..core.screenshot import getDPI
+# 计时装饰器
 from ..core.timing import timer
 
 
@@ -20,29 +38,39 @@ class MessageList:
     截取消息区域 → 按背景色反推气泡坐标 → 裁切 → 逐条 OCR / 判断发送方。
     """
 
+    # 类级单例实例
     _instance: "MessageList | None" = None
 
     def __new__(cls):
+        # 单例：只创建一次
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
 
     def __init__(self):
+        # 已初始化过则跳过
         if hasattr(self, "_initialized"):
             return
         self._initialized = True
+        # 消息列表（最新刷新结果）
         self.messages: list[Message] = []
+        # 消息区缓存图（已裁掉头像带）
         self.message_image: Image.Image | None = None
+        # 消息区屏幕坐标（点击用）
         self.message_screen_region: dict | None = None
+        # 消息区截图内坐标
         self.message_image_region: dict | None = None  # {x, y, w, h, left, top, right, bottom}
+        # 关联的 QQ 主窗口句柄
         self.hwnd: int = 0
 
     # ── 工具 ──────────────────────────────────────────────────
     @staticmethod
     def crop_avatar_area(img: Image.Image) -> Image.Image:
         """裁掉左右头像区域（DPI 自适应）。"""
+        # 边距 = 60px × DPI 缩放（高 DPI 屏头像更大，边距相应放大）
         margin = int(60 * getDPI())
         w = img.width
+        # 只保留中间"消息文本带"（左右各裁掉头像宽度）
         return img.crop((margin, 0, w - margin, img.height))
 
     # ── 气泡检测 ────────────────────────────────────────────────
@@ -201,6 +229,7 @@ class MessageList:
         :param a: (x, y, w, h, is_self)
         :param b: (x, y, w, h, is_self)
         """
+        # 两个框各自的竖直区间 [top, bottom]
         ay1, ay2 = a[1], a[1] + a[3]
         by1, by2 = b[1], b[1] + b[3]
         # 两框在竖直区间有交集 ⇒ 同一行
@@ -221,6 +250,7 @@ class MessageList:
 
         实现：按 top 顺序遍历，把竖直重叠的框归为一组，每组取最大框。
         """
+        # 按 top 升序排列
         ordered = sorted(boxes, key=lambda b: b[1])  # 按 top 升序
         merged: list[tuple[int, int, int, int, bool]] = []
         for b in ordered:
@@ -230,6 +260,7 @@ class MessageList:
                 if b[2] * b[3] > merged[-1][2] * merged[-1][3]:
                     merged[-1] = b
             else:
+                # 新的一行 → 直接加入
                 merged.append(b)
         # 重新按 从上到下、同行为从左到右 排序
         merged.sort(key=lambda b: (b[1], b[0]))
@@ -246,23 +277,32 @@ class MessageList:
         :param pad: 四周留白像素
         :return: 裁切好的气泡 PIL.Image
         """
+        # 解包气泡坐标
         x, y, w, h = box
+        # 消息区图尺寸（裁切边界钳制用）
         img_w = self.message_image.width
         img_h = self.message_image.height
+        # 四边外扩 pad 像素（不越界）
         x1 = max(0, x - pad)
         y1 = max(0, y - pad)
         x2 = min(img_w, x + w + pad)
         y2 = min(img_h, y + h + pad)
+        # 裁出气泡图
         return self.message_image.crop((x1, y1, x2, y2))
 
     # ── 刷新 ────────────────────────────────────────────────────
     def refresh_image(self):
         """截取消息区域并缓存（窗口不就绪时抛 QQWindowNotReadyError）。"""
+        # 确保窗口就绪并取主窗口
         main_window = ensure_qq_window_with_retry()
+        # 识别消息区（含截图与坐标）
         result = get_message_box_region_and_image(main_window)
+        # 缓存屏幕坐标 / 截图内坐标
         self.message_screen_region = result.screen_region
         self.message_image_region = result.image_region
+        # 缓存消息区图（裁掉左右头像带）
         self.message_image = MessageList.crop_avatar_area(result.image)
+        # 记录窗口句柄
         self.hwnd = main_window._hWnd
 
     @timer
@@ -288,6 +328,7 @@ class MessageList:
         # OCR 引擎（单例，复用避免重复加载模型）。
         ocr_engine = OCREngine()
 
+        # 遍历每个气泡
         for (x, y, w, h, is_self) in boxes:
             # 按气泡自身宽高裁剪（四边留白 6px）。
             bubble_img = self.crop_bubble((x, y, w, h))
@@ -309,10 +350,14 @@ class MessageList:
     @timer
     def refresh(self):
         """一次性刷新消息区并重建消息列表（内部自动 refresh_image + refresh_messageList）。"""
+        # 截取消息区
         self.refresh_image()
+        # 检测气泡 + OCR
         self.refresh_messageList()
 
     def read_messages(self) -> list[Message]:
         """供智能体读取消息的唯一入口：自动刷新后返回最新消息列表。"""
+        # 全量刷新（截图 + 气泡检测 + OCR）
         self.refresh()
+        # 返回最新消息列表
         return self.messages

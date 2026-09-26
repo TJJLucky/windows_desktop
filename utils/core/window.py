@@ -1,16 +1,28 @@
 """窗口管理原语：置顶/最小化/最大化/移动、贴边检测、无焦点截屏上下文。
 
 不依赖其他 utils 子包；QQ 专属的进程/托盘/唤起函数位于 qq/window_ops.py。
+
+关键点：
+- 所有操作"不抢焦点"：用 SWP_NOACTIVATE 系标志 + HWND_TOPMOST/NOTOPMOST 层级控制，
+  避免自动化过程中把用户正在使用的其他窗口焦点抢走；
+- WindowCaptureCtx 上下文管理器是"截图/点击"的标准姿势：短暂置顶露出画面 → 操作 → 自动压底。
 """
 
+# warnings：过滤第三方库的无关告警（见下方 filterwarnings）
 import warnings
+# time：等待系统渲染窗口画面的延迟
 import time
+# win32gui：窗口枚举/位置/可见性等 GUI 查询与操作（pywin32）
 import win32gui
+# win32con：Win32 常量（SWP_*/HWND_*/SW_* 等）
 import win32con
+# ctypes：直调 user32 的 SetWindowPos/GetWindowRect/GetSystemMetrics
 import ctypes
 
+# pywinauto.keyboard 模块在 Python 3.12 下有 SyntaxWarning，属第三方噪音，统一静音
 warnings.filterwarnings("ignore", category=SyntaxWarning, module="pywinauto.keyboard")
 
+# 计时装饰器：给窗口层级操作自动打耗时日志
 from .timing import timer
 
 
@@ -31,31 +43,43 @@ class WindowCaptureCtx:
     """
 
     def __init__(self, hwnd: int, render_delay: float = 0.06, maximize: bool = False):
+        # 目标窗口句柄
         self.hwnd = hwnd
+        # SetWindowPos 标志：不移动、不改尺寸（只改 Z 序层级）
         self.flag = win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
+        # 置顶后等待画面渲染的秒数（太短可能截到旧帧）
         self.delay = render_delay
+        # 标记是否真正进入了有效上下文（窗口无效时 __exit__ 不做清理动作）
         self.is_valid = False
+        # 是否在进入时最大化窗口
         self.maximize = maximize
 
     def __enter__(self):
+        # 进入上下文：只对"存在且可见"的窗口生效
         hw = self.hwnd
         if win32gui.IsWindow(hw) and win32gui.IsWindowVisible(hw):
+            # 窗口处于最小化状态时先恢复（SW_RESTORE），否则置顶后仍是缩略图
             if win32gui.IsIconic(hw):
                 win32gui.ShowWindow(hw, win32con.SW_RESTORE)
-            # 瞬时永久置顶，100% 露出画面，不受前台锁定限制
+            # 瞬时永久置顶（HWND_TOPMOST），100% 露出画面，不受前台锁定限制
             win32gui.SetWindowPos(hw, win32con.HWND_TOPMOST, 0, 0, 0, 0, self.flag)
             # 可选：最大化撑满工作区，保证含发送按钮在内的控件都在可点击范围内
             if self.maximize:
                 win32gui.ShowWindow(hw, win32con.SW_MAXIMIZE)
+            # 等系统渲染画面完成，再让调用方截图/点击
             time.sleep(self.delay)  # 等系统渲染画面完成
+            # 标记有效：__exit__ 时需要撤销置顶
             self.is_valid = True
+        # 返回自身（with ... as ctx 拿到的是本对象）
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # 退出上下文：撤销置顶，恢复普通层级
         hw = self.hwnd
         if self.is_valid and win32gui.IsWindow(hw):
-            # 取消置顶，恢复普通层级
+            # HWND_NOTOPMOST：取消置顶，让窗口回到普通 Z 序（不再挡在其他窗口前）
             win32gui.SetWindowPos(hw, win32con.HWND_NOTOPMOST, 0, 0, 0, 0, self.flag)
+        # 返回 False：不吞掉上下文内抛出的异常
         return False
 
 
@@ -67,18 +91,24 @@ def set_window_z_pos(hwnd: int, bring_front: bool = True) -> bool:
     :param bring_front: True=置顶, False=压至底层
     :return: 是否执行成功
     """
+    # 非法句柄直接失败
     if hwnd <= 0:
         return False
     try:
+        # 最小化的窗口先恢复，否则层级操作对缩略图无效
         if win32gui.IsIconic(hwnd):
             win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        # 标志：不改位置、不改尺寸，只动 Z 序
         flag = win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
         if bring_front:
+            # 提到最前（HWND_TOP，非永久置顶）
             win32gui.SetWindowPos(hwnd, win32con.HWND_TOP, 0, 0, 0, 0, flag)
         else:
+            # 压到最底（HWND_BOTTOM）
             win32gui.SetWindowPos(hwnd, win32con.HWND_BOTTOM, 0, 0, 0, 0, flag)
         return True
     except Exception as e:
+        # 操作失败打印原因并返回 False（调用方决定是否重试/兜底）
         print("窗口层级操作失败：", e)
         return False
 
@@ -95,30 +125,45 @@ def maximize_window(hwnd: int):
 
 def move_window(hwnd: int, x: int, y: int):
     """移动窗口到指定屏幕坐标"""
+    # SetWindowPos：0x0001(SWP_NOSIZE 不改变尺寸) | 0x0004(SWP_NOZORDER 不动层级)
     ctypes.windll.user32.SetWindowPos(hwnd, 0, x, y, 0, 0, 0x0001 | 0x0004)  # SWP_NOSIZE | SWP_NOZORDER
 
 
 def detach_from_edge(hwnd: int):
-    """检测窗口贴边后用 SetWindowPos 强制拉离边缘"""
+    """检测窗口贴边后用 SetWindowPos 强制拉离边缘。
+
+    场景：窗口部分移出屏幕时，屏幕坐标点击会点到桌面；先把它拉回屏内再操作。
+    """
+    # 取窗口当前矩形
     rect = ctypes.wintypes.RECT()
     ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+    # 屏幕宽高（GetSystemMetrics：0=宽, 1=高）
     sw = ctypes.windll.user32.GetSystemMetrics(0)
     sh = ctypes.windll.user32.GetSystemMetrics(1)
 
+    # 目标位置初始化：先假设不动
     x, y = rect.left, rect.top
+    # 靠左贴边 → 右移到 x=100
     if rect.left <= 0:
         x = 100  # 靠左 → 拉到 100
+    # 靠右贴边 → 左移，右侧留 100px 边距
     elif rect.right >= sw:
         x = sw - (rect.right - rect.left) - 100  # 靠右 → 留 100px 边距
+    # 靠上贴边 → 下移到 y=100
     if rect.top <= 0:
         y = 100
+    # 靠下贴边 → 上移，底部留 100px 边距
     elif rect.bottom >= sh:
         y = sh - (rect.bottom - rect.top) - 100
 
+    # 只有确实需要移动时才执行
     if x != rect.left or y != rect.top:
-        # 先强制恢复（防最小化），再移位置
+        # 先强制恢复（防最小化状态），再移位置
         win32gui.ShowWindow(hwnd, 9)  # SW_RESTORE
+        # 等恢复动画完成
         time.sleep(0.1)
+        # 移动到目标位置：不改变尺寸、不动层级
         ctypes.windll.user32.SetWindowPos(hwnd, 0, x, y, 0, 0,
                                           0x0001 | 0x0004)  # NOSIZE | NOZORDER
+        # 等窗口落位（移动后系统需要一点时间重绘）
         time.sleep(0.3)  # 等窗口落位

@@ -1,19 +1,41 @@
-"""QQ 用户列表模块：头像检测、用户行裁切、User 数据模型、列表解析。"""
+"""QQ 用户列表模块：头像检测、用户行裁切、User 数据模型、列表解析。
 
+核心流程（refresh）：
+1. 确保 QQ 主窗口就绪并截图，识别"好友列表区域"；
+2. 霍夫圆检测列表里的圆形头像 → 每个头像即一个用户行；
+3. 以头像为中心裁出行区域（排除头像，保留文字与红点区）；
+4. 图像预处理 + OCR 提取黑色昵称；顶部区域 OCR 判定当前激活会话；
+5. RGB 颜色检测未读红点；
+6. 组装 User 并整体替换 self.users（1s 缓存对外）。
+"""
+
+# Counter：统计高频像素颜色（背景色判定）
 from collections import Counter
+# time：1s 缓存时间戳
 import time
+# re：昵称规范化（只留中英文）与 OCR 文本清洗
 import re
 
+# cv2：红点检测（inRange/形态学/轮廓）、预处理
 import cv2
+# numpy：像素数组运算
 import numpy as np
+# PIL.Image：图像裁切/尺寸
 from PIL import Image
 
+# User 数据模型（链式 setter 组装）
 from .models import User
+# 列表区域识别（截图 + 锚点定位）
 from .regions import get_userList_region_and_image, RegionResult
+# 窗口就绪保证（重试）
 from .window_ops import ensure_qq_window_with_retry
+# 无焦点置顶上下文（激活用户时短暂置顶窗口）
 from ..core.window import WindowCaptureCtx
+# 计时装饰器
 from ..core.timing import timer
+# OCR 引擎单例
 from ..vision.ocr import OCREngine
+# 随机点击（激活会话时点用户行）
 from ..core.mouse import random_click
 
 
@@ -25,21 +47,28 @@ class UserList:
     刷新时更新图片并重解析坐标，差异比对追踪变化。
     """
 
+    # 类级单例实例
     _instance: "UserList | None" = None
 
     def __new__(cls):
+        # 单例：只创建一次
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
 
     def __init__(self):
+        # 已初始化过则跳过（单例 __init__ 会被重复调用）
         if hasattr(self, "_initialized"):
             return
         self._initialized = True
+        # 用户字典：name → User
         self.users: dict[str, User] = {}
+        # 列表区域识别结果（截图 + 区域坐标）
         self.userList_region: RegionResult | None = None
+        # 当前关联的 QQ 主窗口句柄
         self.hwnd: int = 0
 
+        # 1s 缓存：时间戳 + 缓存数据
         self.cache_ts: float = 0.0
         self.cache_data: dict = {}
 
@@ -52,14 +81,17 @@ class UserList:
         :param img: 裁切好的单行好友背景图（建议排除头像右侧区域）
         :return: True=激活, False=未激活
         """
+        # 转 numpy 数组
         arr = np.array(img)
-        # 剔除干扰像素
+        # 剔除干扰像素：
         dark_text = np.all(arr < 45, axis=-1)  # 黑色文字/图标
         gray_text = np.all((arr >= 123) & (arr <= 183), axis=-1)  # 灰色昵称/签名
         shadow = np.all(arr < 200, axis=-1)  # 头像边缘阴影
         noise_mask = dark_text | gray_text | shadow
+        # 剩余像素即"主体背景"
         bg_pixels = arr[~noise_mask]
 
+        # 有效背景像素太少（图太花/误判）→ 兜底按未激活处理
         if len(bg_pixels) < 150:  # 有效背景像素太少，兜底
             return False
 
@@ -67,7 +99,7 @@ class UserList:
         most_common_rgb = Counter(tuple(px) for px in bg_pixels).most_common(1)[0][0]
         r, g, b = most_common_rgb
 
-        # 区间容错判定
+        # 区间容错判定：222~230 灰 = 激活态背景（QQ 深一点）；241~249 = 未激活（白一点）
         if 222 <= r <= 230 and 222 <= g <= 230 and 222 <= b <= 230:
             return True  # 激活
         if 241 <= r <= 249 and 241 <= g <= 249 and 241 <= b <= 249:
@@ -81,12 +113,16 @@ class UserList:
         :param img_rgb: 已裁切掉头像的单行画面 numpy RGB
         :return: True=有未读消息
         """
+        # QQ 红点标准色
         target = np.array([247, 76, 48])  # QQ 红点标准色
+        # 颜色容差（遮盖/抗锯齿）
         tolerance = 18  # 颜色容差（遮盖/抗锯齿）
+        # 颜色上下界
         lower = np.clip(target - tolerance, 0, 255)
         upper = np.clip(target + tolerance, 0, 255)
+        # 二值掩膜：范围内像素置白，其余置黑
         mask = cv2.inRange(img_rgb, lower, upper)  # 二值掩膜
-        # 形态学开运算去噪
+        # 形态学开运算去噪（2x2 核：消除孤立噪点）
         kernel = np.ones((2, 2), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         # 调试：保存红点检测掩膜
@@ -94,6 +130,7 @@ class UserList:
         # 轮廓面积过滤（白色区域即命中，排除噪点和大块误检）
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for c in contours:
+            # 红点典型轮廓面积区间（下限 4px² 适配小分辨率）
             area = cv2.contourArea(c)
             if 200 <= area <= 400:  # 红点典型面积（下限 4px² 适配小分辨率）
                 return True
@@ -102,13 +139,19 @@ class UserList:
     @staticmethod
     def save_debug(img: Image.Image, name: str = ""):
         """独立保存调试图片到 debug/ 目录，不影响主流程。"""
+        # 路径/文件名工具延迟 import（只在调试时用）
         from pathlib import Path
         import uuid
+        # 调试目录 = 项目根/debug
         debug_dir = Path(__file__).parent.parent.parent / "debug"
+        # 目录不存在则创建
         debug_dir.mkdir(exist_ok=True)
+        # 文件名：可选前缀 + 随机短串（防覆盖）
         filename = f"{name}_{uuid.uuid4().hex[:6]}.png" if name else f"{uuid.uuid4().hex[:8]}.png"
+        # numpy 数组先转 PIL 图
         if isinstance(img, np.ndarray):
             img = Image.fromarray(img.astype(np.uint8))
+        # 保存
         img.save(str(debug_dir / filename))
 
     @staticmethod
@@ -118,30 +161,38 @@ class UserList:
         :param list_img: 列表区域截图
         :return: list[(cx, cy, r)]
         """
+        # 转 numpy
         img = np.array(list_img)
+        # 转灰度
         gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        # 5x5 高斯模糊：平滑噪点，提高圆检测稳定性
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
+        # 霍夫圆检测：参数针对 QQ 头像尺寸（18~35px 半径）
         circles = cv2.HoughCircles(
             gray,
             method=cv2.HOUGH_GRADIENT,
-            dp=1,
-            minDist=55,
-            param1=60,
-            param2=28,
-            minRadius=18,
-            maxRadius=35,
+            dp=1,          # 累加器分辨率 = 原图
+            minDist=55,     # 圆心最小间距（防止同一头像检测出多圆）
+            param1=60,      # Canny 高阈值
+            param2=28,      # 累加器阈值（越低越容易检出）
+            minRadius=18,   # 最小半径
+            maxRadius=35,   # 最大半径
         )
 
+        # 没检出任何圆
         if circles is None:
             return []
 
+        # 取整（float → uint16）
         circles = np.uint16(np.around(circles))
         circle_list = []
+        # 提取每个圆的 (cx, cy, r)
         for i in circles[0, :]:
             cx, cy, r = int(i[0]), int(i[1]), int(i[2])
             circle_list.append((cx, cy, r))
 
+        # 按 y（纵向位置）排序 → 与列表显示顺序一致
         circle_list.sort(key=lambda x: x[1])
         return circle_list
 
@@ -152,10 +203,13 @@ class UserList:
         :param list_img: 列表区域截图
         :return: [(left, top, right, bottom), ...] 按从上到下排序
         """
+        # 列表宽高
         w, h = list_img.size
+        # 检测全部头像圆
         circles = UserList.detect_avatar_circles(list_img)
 
         rects = []
+        # 每个头像生成一行区域：横向整宽（0~w），纵向以头像为中心 ±(r+5)
         for (cx, cy, r) in circles:
             top = max(0, cy - r - 5)
             bottom = min(h, cy + r + 5)
@@ -169,17 +223,22 @@ class UserList:
 
         140 精准分界：黑字 0~130 | 灰字 153 | 背景 226/245
         """
+        # 转 numpy
         arr = np.array(img)
+        # 转灰度
         gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        # 放大 1.25 倍（小字 OCR 更稳；INTER_CUBIC 平滑放大）
         h, w = gray.shape
         gray = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
-        # ≤140 保留为黑字，>140 置白
+        # ≤140 保留为黑字，>140 置白（阈值精准区分黑字与灰字/背景）
         out = np.full_like(gray, 255)
         out[gray <= 140] = 0
         # 反转：白底黑字 → 黑底白字（OCR 更佳）
         binary = cv2.bitwise_not(out)
+        # 1x1 闭运算：填补笔画断裂（极小核，不伤细节）
         kernel = np.ones((1, 1), np.uint8)
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)  # 填补笔画断裂
+        # 开运算：剔除零散噪点
         binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)  # 剔除零散噪点
         return binary
 
@@ -187,9 +246,12 @@ class UserList:
     @timer
     def ocr_recognize(img: Image.Image) -> str:
         """传入裁切好的文字区域图片，返回识别文本（只保留中文和英文字母）。"""
+        # 图像预处理（二值化放大）
         proc = UserList.ocr_preprocess(img)  # 图像预处理
+        # 调用 OCR 引擎
         result = OCREngine().ocr(proc)
         texts = []
+        # 提取每行文本
         for line in result:
             text = line[1].strip()
             if text:
@@ -204,26 +266,36 @@ class UserList:
         :param rect: 裁切区域 (left, top, right, bottom)
         :param avatar: 头像圆心+半径 (cx, cy, r)，传入时排除头像从头像右边缘开始裁
         """
+        # 必须先 refresh 过（有列表截图）
         if self.userList_region is None or self.userList_region.image is None:
             raise ValueError("userList_region is required (call refresh() first)")
+        # 传入头像时：从头像右边缘 +5px 开始裁（排除头像，只留文字+红点）
         if avatar is not None:
             cx, cy, r = avatar
             left, top, right, bottom = rect
             return self.userList_region.image.crop((cx + r + 5, top, right, bottom))
+        # 否则整区域裁
         return self.userList_region.image.crop(rect)
 
     @timer
     def active_user(self, user: User):
         """激活指定用户（若非当前激活）。
+
+        通过点击用户行区域切换到该会话；若已是激活态则跳过。
         """
+        # 已是激活会话 → 无需点击
         if user.active:
             return
+        # 未 refresh 过则无法点击
         if self.userList_region is None or self.hwnd == 0:
             raise RuntimeError("需要先执行refresh()")
+        # 置顶窗口（不抢焦点）确保窗口在屏内可点击
         with WindowCaptureCtx(self.hwnd):
+            # 屏幕坐标 = 列表区域屏幕原点 + 行内相对坐标
             offset_left = self.userList_region.screen_region["left"]
             offset_top = self.userList_region.screen_region["top"]
             rect_left, rect_top, rect_right, rect_bottom = user.rect
+            # 在用户行区域内随机取点点击（模拟人工点击）
             random_click(
                 offset_left + rect_left,
                 offset_top + rect_top,
@@ -236,13 +308,16 @@ class UserList:
 
         返回第一个匹配的用户，找不到返回 None。
         """
+        # 空名字直接失败
         if not contact_name:
             return None
         # 双方都只保留中英文再比较：OCR 名字已移除符号（如 D_Isaac → DIsaac），
         # 输入的名字可能带下划线等符号，需同样规范化后才能命中。
         norm_contact = re.sub(r"[^\u4e00-\u9fffA-Za-z]", "", contact_name)
+        # 规范化后为空（纯符号名）→ 无法匹配
         if not norm_contact:
             return None
+        # 遍历用户，双向包含匹配（任一方向命中即可）
         for name, user in self.users.items():
             norm_name = re.sub(r"[^\u4e00-\u9fffA-Za-z]", "", name)
             if norm_contact in norm_name or norm_name in norm_contact:
@@ -251,10 +326,14 @@ class UserList:
 
     @timer
     def active_user_by_name(self, contact_name: str):
+        """按名字激活会话：刷新列表 → 查找用户 → 点击激活。"""
+        # 先刷新（保证列表最新）
         self.refresh()
+        # 查找用户
         user = self.find_user(contact_name)
         if user is None:
             raise ValueError(f"用户列表中没有找到与「{contact_name}」匹配的联系人")
+        # 点击激活
         self.active_user(user)
 
     # ── 刷新 ────────────────────────────────────────────────────
@@ -262,26 +341,39 @@ class UserList:
     @timer
     def refresh_image(self):
         """图片和句柄的刷新（窗口不就绪时抛 QQWindowNotReadyError）。"""
+        # 确保窗口就绪（分级校验 + 重试）
         main_window = ensure_qq_window_with_retry()
+        # 识别好友列表区域（含截图）
         self.userList_region = get_userList_region_and_image(main_window)
+        # 记录窗口句柄（激活用户时用）
         self.hwnd = main_window._hWnd
 
     @timer
     def refresh(self):
         """全量重建用户列表，整体替换 self.users。"""
+        # 1) 刷新截图与区域
         self.refresh_image()
         new_users: dict[str, User] = {}
+        # 2) 顶部区域 OCR：拿到当前激活会话的用户名
         _, active_name = self.get_user_list_top_right_ocr()  # 顶部区域 OCR：active 用户的名字
 
+        # 3) 逐头像行处理
         for avatar, rect in self.crop_user_row_by_avatar(self.userList_region.image):
+            # 裁切：排除头像，保留文字+红点区域
             image = self.get_user_image(rect, avatar)  # 裁切：排除头像，保留文字+红点区域
+            # 阈值140 OCR 提取黑色昵称
             name = UserList.ocr_recognize(image)  # 阈值140 OCR 提取黑色昵称
+            # 包含匹配：列表名字较短，是顶部 OCR 结果的子串
             active = bool(name) and (name in active_name)  # 包含匹配：列表名字较短，是顶部 OCR 结果的子串
+            # RGB(247,76,48) 红点检测
             new_msg = UserList.check_new_msg(np.array(image))  # RGB(247,76,48) 红点检测
+            # 组装 User（链式 setter）
             new_users[name] = User().setName(name).setAvatar(avatar).setRect(rect).setActive(active).setNewMsg(
                 new_msg)
 
+        # 整体替换（旧列表直接丢弃）
         self.users = new_users
+        # 清缓存：列表变了，1s 缓存作废
         self.clear_user_list_cache()
 
     def to_dict(self) -> dict[str, dict]:
@@ -292,8 +384,12 @@ class UserList:
         }
 
     def get_user_list_top_right(self, width: int = 500, height: int = 60):
-        """以 userlist 图片右上角为区域左下角，向右 width、向上 height 截取外侧区域。"""
+        """以 userlist 图片右上角为区域左下角，向右 width、向上 height 截取外侧区域。
+
+        该区域显示当前激活会话的名字（在列表右侧的面板头部）。
+        """
         region = self.userList_region
+        # 需要完整窗口截图与区域坐标
         if region is None or region.full_image is None or region.image_region is None:
             raise ValueError("userList_region with full_image is required (call refresh() first)")
 
@@ -304,32 +400,40 @@ class UserList:
         right = left + width
         top = bottom - height
 
+        # 从完整窗口截图中裁该区域
         return region.full_image.crop((left, top, right, bottom))
 
     def get_user_list_top_right_ocr(self, width: int = 500, height: int = 60) -> tuple[bool, str]:
         """OCR userlist 右上角外侧区域，返回 (是否有数据, 识别文本)。"""
+        # 裁区域
         img = self.get_user_list_top_right(width, height)
 
+        # 复用：阈值140只保留黑色 → OCR
         text = UserList.ocr_recognize(img)  # 复用：阈值140只保留黑色 → OCR
         return (bool(text), text)
 
     # 清除缓存
     def clear_user_list_cache(self):
+        # 时间戳归零 → 下次 get_user_list 强制刷新
         self.cache_ts = 0.0
 
     # 1s缓存
     def get_user_list(self):
         now = time.time()
+        # 从未初始化 → 全量刷新并填充缓存
         if self.userList_region is None:
             self.refresh()
             self.cache_data = self.to_dict().copy()
             self.cache_ts = now
             return self.cache_data.copy()
 
+        # 1s 内命中缓存 → 直接返回（避免高频轮询频繁视觉识别）
         if now - self.cache_ts < 1.0:
             return self.cache_data
 
+        # 超过 1s → 刷新并更新缓存
         self.refresh()
         self.cache_data = self.to_dict().copy()
         self.cache_ts = now
+        # 返回副本：调用方修改不污染缓存
         return self.cache_data.copy()
