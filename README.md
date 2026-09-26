@@ -18,7 +18,7 @@ windows_desktop/
 ├── templates/*.png       # QQ 界面模板图（区域定位依赖）
 ├── service/              # 本机 HTTP API、命令账本、服务入口
 ├── debug/                # 调试输出图片
-├── packaging/qq-desktop-package/  # 打包 skill（exe 构建脚本 build_exe.py）
+├── .skills/qq-desktop-package/   # 打包 skill（exe 构建脚本 build_exe.py）
 └── utils/
     ├── __init__.py        # 顶层重导出 + 启动时 ensure_dpi_aware()
     ├── core/             # 平台原子原语：截图/鼠标/窗口
