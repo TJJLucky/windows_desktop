@@ -53,11 +53,14 @@ def compose_bubbles_to_one(bubbles: list[Image.Image]) -> tuple[Image.Image, lis
     return canvas, bounds
 
 
-def split_ocr_by_bubble(lines: list, bounds: list[tuple[int, int]]) -> list[str]:
+def split_ocr_by_bubble(lines: list, bounds: list[tuple[int, int]], scale: float = 1.0) -> list[str]:
     """把一次 OCR 的识别行按 y 中心归属到各气泡，返回每个气泡的文本。
 
     :param lines: OCR 结果 [[bbox, text, confidence], ...]；bbox 为四点坐标 [[x,y],...]
     :param bounds: compose_bubbles_to_one 返回的各气泡 y 区间 [(top, bottom), ...]
+    :param scale: OCR 输入图相对 bounds 坐标系的缩放倍数。若 OCR 前对拼图做了放大
+        （如 ocr_preprocess 放大 1.25），识别行的 y 坐标也是放大后坐标，必须除以
+        scale 还原回 bounds 的原图坐标系，否则行归属会整体错位（名字错绑到下一行）。
     :return: 与 bounds 等长的文本列表（每个气泡一行文本，多行直接拼接，无分隔符）
     """
     # 结果数组：长度与气泡数一致，初始为空串
@@ -69,7 +72,8 @@ def split_ocr_by_bubble(lines: list, bounds: list[tuple[int, int]]) -> list[str]
     rows: list[tuple[float, str]] = []
     for bbox, text, _conf in lines:
         ys = [pt[1] for pt in bbox]  # 四个角的 y 坐标
-        center_y = sum(ys) / len(ys)  # 行中心 y
+        # 行中心 y：除以 scale 还原到 bounds 的原图坐标系（放大过则必须还原）
+        center_y = sum(ys) / len(ys) / scale
         rows.append((center_y, text))
     # 按 y 中心把每行归入对应的气泡区间（与拼接顺序一致）
     for center_y, text in rows:

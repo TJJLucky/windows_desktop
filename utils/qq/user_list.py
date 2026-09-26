@@ -69,6 +69,8 @@ class UserList:
         self.userList_region: RegionResult | None = None
         # 当前关联的 QQ 主窗口句柄
         self.hwnd: int = 0
+        # 最近一次 refresh 顶部 OCR 识别的会话名（active_user 据此决定是否走行背景兜底）
+        self.last_active_name: str = ""
 
         # 1s 缓存：时间戳 + 缓存数据
         self.cache_ts: float = 0.0
@@ -297,9 +299,10 @@ class UserList:
         # ① refresh 已判定为当前会话 → 无需点击
         if user.active:
             return
-        # ② 行背景色为激活态 → 列表行本身高亮，即使顶部 OCR 漏判也无需点击。
-        #    裁该行（从头像右边缘开始，排除头像只留背景+文字），再做高频背景色判定。
-        if user.avatar is not None:
+        # ② 行背景色兜底：仅当顶部 OCR 没有识别到任何会话名时，才用"行背景灰=已激活"
+        #    跳过点击（顶部 OCR 漏判场景）。顶部有明确会话名（如右侧面板是 QQ 游戏中心）时
+        #    不走此兜底——此时列表行高亮可能与右侧面板不一致，跳过点击会导致面板切不过去。
+        if user.avatar is not None and not self.last_active_name:
             row_img = self.get_user_image(user.rect, user.avatar)  # 排除头像，只留行背景+文字
             if UserList.is_active_bg(row_img):
                 return
@@ -353,9 +356,33 @@ class UserList:
                 return user
         return None
 
+    def _panel_switched_to(self, contact_name: str) -> bool:
+        """点击后验证：顶部区域 OCR 的当前会话名是否命中目标联系人（规范化包含匹配）。
+
+        可靠点击闭环的验证器：面板切换后顶部应显示目标会话名；
+        若仍显示旧面板（如 QQ 游戏中心）说明点击未生效/点偏，需重试。
+        """
+        # 顶部区域 OCR：当前会话名（无数据时为空串）
+        _, active_name = self.get_user_list_top_right_ocr()
+        if not active_name:
+            # 顶部无任何文字（漏判）→ 无法确认切换成功，视为未切换
+            return False
+        # 双方都只保留中英文再比较（与 find_user 同款规范化）
+        norm_contact = re.sub(r"[^\u4e00-\u9fffA-Za-z]", "", contact_name)
+        norm_active = re.sub(r"[^\u4e00-\u9fffA-Za-z]", "", active_name)
+        # 空名字无法匹配
+        if not norm_contact:
+            return False
+        # 双向包含匹配（OCR 可能截断/多符号）
+        return norm_contact in norm_active or norm_active in norm_contact
+
     @timer
     def active_user_by_name(self, contact_name: str):
-        """按名字激活会话：刷新列表 → 查找用户 → 点击激活。"""
+        """按名字激活会话：刷新列表 → 点击激活 → 验证切换，未成功则重试。
+
+        可靠点击闭环：点击后验证右侧面板是否已切到目标会话（顶部 OCR），
+        未切换则重新刷新坐标再点（最多 2 轮），防御列表滚动等偶发坐标漂移。
+        """
         # 先刷新（保证列表最新）
         self.refresh()
         # 查找用户
@@ -364,6 +391,18 @@ class UserList:
             raise ValueError(f"用户列表中没有找到与「{contact_name}」匹配的联系人")
         # 点击激活
         self.active_user(user)
+        # 可靠点击闭环：等待面板切换，未切换则重新刷新坐标再点（最多 2 轮）
+        for _ in range(2):
+            # 等 QQ 响应点击（面板切换/列表滚动就位需要时间）
+            time.sleep(0.5)
+            # 顶部 OCR 验证是否已切到目标会话
+            if self._panel_switched_to(contact_name):
+                return
+            # 未切换：重新刷新（此时列表已稳定，拿最新坐标）再点一次
+            self.refresh()
+            user = self.find_user(contact_name)
+            if user is not None:
+                self.active_user(user)
 
     # ── 刷新 ────────────────────────────────────────────────────
     # 刷新前要调用
@@ -389,6 +428,8 @@ class UserList:
         new_users: dict[str, User] = {}
         # 2) 顶部区域 OCR：拿到当前激活会话的用户名
         _, active_name = self.get_user_list_top_right_ocr()  # 顶部区域 OCR：active 用户的名字
+        # 记录最近一次顶部 OCR 的会话名（active_user：顶部有名字时不做行背景兜底）
+        self.last_active_name = active_name
 
         # 3) 逐头像行处理：先收集全部行（不立即 OCR）
         rows: list[tuple[tuple[int, int, int], tuple[int, int, int, int], Image.Image]] = []
@@ -405,7 +446,7 @@ class UserList:
         # 一次 OCR 识别全部昵称（单例引擎复用）
         lines = OCREngine().ocr(proc) or []
         # 按 y 边界把识别行切分回每个用户行（顺序与 rows 一致）
-        raw_names = split_ocr_by_bubble(lines, bounds)
+        raw_names = split_ocr_by_bubble(lines, bounds, scale=1.25)
 
         # 逐行组装 User（名字已从拼图 OCR 获得）
         for (avatar, rect, image), name in zip(rows, raw_names, strict=True):
