@@ -8,16 +8,25 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 
+from .chat_history import ChatHistoryStore
 from .command_ledger import CommandConflictError, CommandLedger
 from .contracts import API_VERSION, CommandResponse, ListContactsResponse, ReadMessagesRequest, ReadMessagesResponse, SendMessageRequest, ServiceHealthResponse
 from .facade import LegacyQqAutomationFacade, QqAutomationError, QqAutomationPort
 
 
-def create_app(automation: QqAutomationPort | None = None, *, token: str, ledger_path: Path) -> FastAPI:
+def create_app(
+    automation: QqAutomationPort | None = None,
+    *,
+    token: str,
+    ledger_path: Path,
+    chat_history_path: Path | None = None,
+) -> FastAPI:
     """创建受每次启动 token 保护的 v1 API。"""
 
     if not token:
         raise ValueError("QQ Service token must not be empty")
+    chat_history_path = chat_history_path or (ledger_path.parent / "qq-chat-history.sqlite3")
+    chat_history = ChatHistoryStore(chat_history_path)
     facade = automation or LegacyQqAutomationFacade()
     ledger = CommandLedger(ledger_path)
     app = FastAPI(title="PriceAgent QQ Desktop Service", version=API_VERSION, docs_url=None, redoc_url=None)
@@ -44,6 +53,8 @@ def create_app(automation: QqAutomationPort | None = None, *, token: str, ledger
             payload = await asyncio.to_thread(facade.read_messages, request.contact_name)
         except QqAutomationError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+        for item in payload["messages"]:
+            _try_record(chat_history, request.contact_name, "out" if item["isSelf"] else "in", item["text"])
         return ReadMessagesResponse.model_validate(payload)
 
     @app.post("/v1/commands/send", response_model=CommandResponse)
@@ -63,6 +74,7 @@ def create_app(automation: QqAutomationPort | None = None, *, token: str, ledger
             await asyncio.to_thread(ledger.resolve, request.command_id, "FAILED", result)
             return CommandResponse(commandId=request.command_id, status="FAILED", result=result)
         await asyncio.to_thread(ledger.resolve, request.command_id, "SUCCEEDED", result)
+        _try_record(chat_history, request.contact_name, "out", request.text, request.command_id)
         return CommandResponse(commandId=request.command_id, status="SUCCEEDED", result=result)
 
     @app.get("/v1/commands/{command_id}", response_model=CommandResponse)
@@ -74,3 +86,17 @@ def create_app(automation: QqAutomationPort | None = None, *, token: str, ledger
         return CommandResponse(commandId=command_id, status=current_status, result=result)
 
     return app
+
+
+def _try_record(
+    chat_history: ChatHistoryStore,
+    contact_name: str,
+    direction: str,
+    text: str,
+    command_id: str | None = None,
+) -> None:
+    """聊天记录写入失败仅告警，不阻断主流程。"""
+    try:
+        chat_history.append(contact_name, direction, text, command_id)
+    except Exception as exc:
+        print(f"[WARN] 聊天记录写入失败: {exc}")
