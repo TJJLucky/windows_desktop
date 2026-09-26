@@ -2,7 +2,8 @@
 
 本模块定义服务暴露给调用方（UniApp 前端 / 调试工具）的全部 HTTP 接口：
 - 本机 loopback 服务不做 token 鉴权：所有接口均可直接访问（安全由"仅监听 127.0.0.1"保证）；
-- 阻塞型 QQ 操作（视觉识别 + 模拟点击）通过 asyncio.to_thread 放进线程池执行，避免阻塞事件循环；
+- 阻塞型 QQ 操作（视觉识别 + 模拟点击）由 FastAPI 对同步端点自动放入线程池执行，避免阻塞事件循环；
+  （执行仍由内部 Dispatcher 单消费者队列串行，HTTP 线程只负责"入队 + 等待结果"）
 - 发送命令走"命令账本"（command_ledger）保证幂等：相同 commandId 只执行一次；
 - 聊天记录的读取与发送都会自动落库（chat_history），供后续查询。
 """
@@ -10,8 +11,6 @@
 # 延迟求值类型注解：允许前向引用，加快 import 速度
 from __future__ import annotations
 
-# asyncio：提供 to_thread —— 把阻塞的 QQ 桌面操作丢到线程池，不卡住 HTTP 事件循环
-import asyncio
 # Path：数据库文件路径的类型标注
 from pathlib import Path
 
@@ -55,15 +54,15 @@ def create_app(
 
     # —— 健康检查接口 ——
     @app.get("/v1/health", response_model=ServiceHealthResponse)
-    async def health() -> ServiceHealthResponse:
+    def health() -> ServiceHealthResponse:
         # 返回固定状态 READY + API 版本；调用方用它探测服务是否存活
         return ServiceHealthResponse(apiVersion=API_VERSION, status="READY")
 
     # —— 截图可用性检查接口（探测） ——
     @app.post("/v1/capture:check", response_model=CaptureCheckResponse)
-    async def check_capture() -> CaptureCheckResponse:
-        # 窗口就绪检测同样是阻塞操作（进程/窗口枚举 + 可能唤起 + WGC 试截），丢线程池执行
-        result = await asyncio.to_thread(facade.check_capture_ready)
+    def check_capture() -> CaptureCheckResponse:
+        # 同步端点：FastAPI 自动放入线程池执行窗口就绪检测（进程/窗口枚举 + 可能唤起 + WGC 试截）
+        result = facade.check_capture_ready()
         # 组装响应：ready 透传；windowTitle 就绪时才有；error 不可用时才有
         # 注意：窗口不可用返回 200 + ready=false（探测语义），不投影为 503
         return CaptureCheckResponse(
@@ -75,10 +74,10 @@ def create_app(
 
     # —— 读取联系人列表接口 ——
     @app.post("/v1/contacts:query", response_model=ListContactsResponse)
-    async def list_contacts() -> ListContactsResponse:
+    def list_contacts() -> ListContactsResponse:
         try:
-            # QQ 视觉识别是阻塞操作：丢进线程池执行，防止整个事件循环被卡住
-            contacts = await asyncio.to_thread(facade.list_contacts)
+            # 同步端点：FastAPI 自动在（线程池）执行 QQ 视觉识别，事件循环不被阻塞
+            contacts = facade.list_contacts()
         except QqAutomationError as exc:
             # QQ 操作失败（窗口不可用、识别失败等）统一返回 503，并把内部原因带给调用方
             raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -87,10 +86,10 @@ def create_app(
 
     # —— 读取指定联系人的可见消息接口 ——
     @app.post("/v1/commands/read", response_model=ReadMessagesResponse)
-    async def read_messages(request: ReadMessagesRequest) -> ReadMessagesResponse:
+    def read_messages(request: ReadMessagesRequest) -> ReadMessagesResponse:
         try:
-            # 同样丢进线程池执行：视觉读取消息区 + OCR 识别文本
-            payload = await asyncio.to_thread(facade.read_messages, request.contact_name)
+            # 同步端点：FastAPI 自动在（线程池）执行视觉读取消息区 + OCR 识别文本
+            payload = facade.read_messages(request.contact_name)
         except QqAutomationError as exc:
             # QQ 操作失败 → 503（不会把读取结果落库，因为根本没读到）
             raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -101,12 +100,12 @@ def create_app(
 
     # —— 发送消息接口（幂等） ——
     @app.post("/v1/commands/send", response_model=CommandResponse)
-    async def send_message(request: SendMessageRequest) -> CommandResponse:
+    def send_message(request: SendMessageRequest) -> CommandResponse:
         try:
             # 先向账本申请执行：begin 返回 (是否真正执行, 当前状态, 已有结果)。
             # 相同 commandId 相同消息体 → 幂等返回已有结果不重发；相同 ID 不同消息体 → 抛 409
-            execute, current_status, result = await asyncio.to_thread(
-                ledger.begin, request.command_id, request.contact_name, request.text
+            execute, current_status, result = ledger.begin(
+                request.command_id, request.contact_name, request.text
             )
         except CommandConflictError as exc:
             # 冲突（同一 commandId 配不同消息体）→ 409，明确告知调用方
@@ -115,16 +114,16 @@ def create_app(
             # 账本判定无需再次执行（已在跑或已完成）：直接把当前状态与结果原样返回
             return CommandResponse(commandId=request.command_id, status=current_status, result=result)
         try:
-            # 真正执行发送：线程池里跑视觉定位输入框 + 粘贴 + 点击发送
-            result = await asyncio.to_thread(facade.send_message, request.contact_name, request.text)
+            # 真正执行发送：FastAPI 线程池里跑视觉定位输入框 + 粘贴 + 快捷键发送
+            result = facade.send_message(request.contact_name, request.text)
         except QqAutomationError as exc:
             # 发送失败：构造失败结果并让账本落 FAILED 终态（不会留下悬空的 RUNNING）
             result = {"ok": False, "sent": False, "textLength": len(request.text), "error": str(exc)}
-            await asyncio.to_thread(ledger.resolve, request.command_id, "FAILED", result)
+            ledger.resolve(request.command_id, "FAILED", result)
             # 返回 FAILED 状态给调用方
             return CommandResponse(commandId=request.command_id, status="FAILED", result=result)
         # 发送成功：账本落 SUCCEEDED 终态
-        await asyncio.to_thread(ledger.resolve, request.command_id, "SUCCEEDED", result)
+        ledger.resolve(request.command_id, "SUCCEEDED", result)
         # 发出的消息自动落库为 out（我方发出），关联 commandId 便于追溯；失败仅告警
         _try_record(chat_history, request.contact_name, "out", request.text, request.command_id)
         # 返回 SUCCEEDED 状态 + 实际执行结果
@@ -132,9 +131,9 @@ def create_app(
 
     # —— 查询发送命令状态接口 ——
     @app.get("/v1/commands/{command_id}", response_model=CommandResponse)
-    async def command_status(command_id: str) -> CommandResponse:
-        # 从账本按 commandId 查状态与结果
-        record = await asyncio.to_thread(ledger.get, command_id)
+    def command_status(command_id: str) -> CommandResponse:
+        # 从账本按 commandId 查状态与结果（SQLite 毫秒级，同步直调）
+        record = ledger.get(command_id)
         if record is None:
             # 账本中不存在该 commandId → 404，防止调用方把未知 ID 当成功
             raise HTTPException(status_code=404, detail="QQ_COMMAND_NOT_FOUND")
@@ -144,10 +143,10 @@ def create_app(
 
     # —— 查询聊天记录接口（查询前自动视觉更新一次） ——
     @app.post("/v1/chat/history", response_model=ChatHistoryResponse)
-    async def query_chat_history(request: ChatHistoryRequest) -> ChatHistoryResponse:
+    def query_chat_history(request: ChatHistoryRequest) -> ChatHistoryResponse:
         # 需求约定：每次查询先做一次视觉读取（拉到最新消息），再返回历史，保证数据新鲜
         try:
-            payload = await asyncio.to_thread(facade.read_messages, request.contact_name)
+            payload = facade.read_messages(request.contact_name)
         except QqAutomationError:
             # 视觉读取失败（如窗口不可用）：不阻断历史查询，只把更新标记为 failed 告知调用方
             update = "failed"  # 自动更新失败不阻断历史查询
