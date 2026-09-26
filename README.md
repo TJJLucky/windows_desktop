@@ -151,7 +151,7 @@ Content-Type: application/json
 | --- | --- |
 | `matcher.py` | `find_template`（TM_CCOEFF_NORMED） / `draw_box` / `crop_image` / `crop_region` |
 | `ocr.py` | `OCREngine` 单例（RapidOCR + ONNX Runtime）；模型路径三级：`RAPIDOCR_MODEL_PATH` → `<install>/ocr-models` → 包内 models |
-| `compose.py` | 视觉编排占位（气泡拼图 OCR、列表归一化等性能优化后续实现） |
+| `compose.py` | 视觉编排：`compose_bubbles_to_one`（气泡垂直拼图 + 分隔线）、`split_ocr_by_bubble`（按 y 边界切分 OCR 行）——N 次气泡 OCR 合并为 1 次 |
 
 ### `utils/qq`
 
@@ -162,7 +162,7 @@ Content-Type: application/json
 | `models.py` | 数据模型：`User`（`to_dict`）与 `Message`（text/rect/is_self） |
 | `user_list.py` | `UserList`（单例）：`find_user`（包含匹配 + 中英文规范化）、`active_user_by_name`、`get_user_list`（1s 缓存） |
 | `input.py` | `InputBox`（单例）：`send_text(contact_name, text)` 内部自动激活会话→聚焦→剪贴板粘贴→Ctrl+V→按 Enter 快捷键发送 |
-| `message.py` | `Message` + `MessageList`（单例）：`read_messages(contact_name)` 内部自动激活会话→气泡检测→OCR→判断发送方 `is_self` |
+| `message.py` | `Message` + `MessageList`（单例）：`read_messages(contact_name)` 内部自动激活会话→气泡检测→**拼图一次 OCR**→按 y 边界切分文本→判断发送方 `is_self` |
 | `hotkeys.py` | QQ 全局快捷键配置表（Ctrl+Alt+X 打开/隐藏所有窗口、Enter 发送）与 `send_hotkey` 发送原语 |
 | `dispatcher.py` | `Dispatcher` 单消费者任务队列（唯一入口）：`get_contact_list` / `send_message` / `read_message_list`（发送/读取内部自动激活用户） |
 

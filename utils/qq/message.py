@@ -26,6 +26,8 @@ from .regions import get_message_box_region_and_image
 from .window_ops import get_main_window, get_qq_window_image, ensure_qq_window_with_retry
 # OCR 引擎单例
 from ..vision.ocr import OCREngine
+# 拼图 OCR：气泡拼接一次识别 + 按 y 边界切分文本（性能优化）
+from ..vision.compose import compose_bubbles_to_one, split_ocr_by_bubble
 # DPI 查询（头像边距自适应）
 from ..core.screenshot import getDPI
 # 计时装饰器
@@ -309,14 +311,12 @@ class MessageList:
 
     @timer
     def refresh_messageList(self):
-        """解析消息区域：检测气泡 → 构造 Message 对象存入 self.messages。
+        """解析消息区域：拼图一次 OCR 识别全部气泡，构造 Message 对象存入 self.messages。
 
-        流程：
-          1. 从缓存的 self.message_image 检测所有气泡坐标 boxes。
-          2. detect_bubbles 内部已完成"每行去重"和"按左右位置判定发送方"。
-          3. 遍历每个气泡，用链式 setter 构造 Message 并整体替换 self.messages。
+        性能优化：所有气泡垂直拼成一张图 → 一次 OCR → 按 y 边界切分文本，
+        取代"每气泡单独 OCR"（N 次模型推理 → 1 次推理，显著降低总耗时）。
         """
-        # 必须先 refresh_image() 拿到缓存图，否则没有数据可检测。
+        # 必须先 refresh_image() 拿到缓存图，否则没有数据可检测
         if self.message_image is None:
             print("[WARN] 请先调用 refresh_image()")
             return
@@ -326,23 +326,24 @@ class MessageList:
 
         # 每次刷新重建消息列表（避免上次结果残留）。
         new_messages: list[Message] = []
+        # 无气泡（空会话/无消息）→ 直接置空返回
+        if not boxes:
+            self.messages = new_messages
+            return
 
-        # OCR 引擎（单例，复用避免重复加载模型）。
+        # 收集全部气泡小图（按检测顺序，与 boxes 一一对应）。
+        bubble_images = [self.crop_bubble((x, y, w, h)) for (x, y, w, h, _) in boxes]
+        # 拼图：统一宽度垂直拼接，返回 (大图, 各气泡 y 区间)。
+        composed, bounds = compose_bubbles_to_one(bubble_images)
+        # 一次 OCR 整张拼图（单例引擎复用，避免重复加载模型）。
         ocr_engine = OCREngine()
+        lines = ocr_engine.ocr(np.array(composed)) or []
+        # 按 y 边界把识别行切分回各气泡，得到每个气泡的文本（与 boxes 顺序一致）。
+        texts = split_ocr_by_bubble(lines, bounds)
 
-        # 遍历每个气泡
-        for (x, y, w, h, is_self) in boxes:
-            # 按气泡自身宽高裁剪（四边留白 6px）。
-            bubble_img = self.crop_bubble((x, y, w, h))
-            # 对裁剪出的气泡图做 OCR 识别文字，并组装识别结果。
-            bubble_arr = np.array(bubble_img)
-            result = ocr_engine.ocr(bubble_arr) or []
-            print(result)
-            # 每项为 [bbox, text, confidence]，拼接各行文字。
-            text = "".join([item[1] for item in result])
-            print(f"[OCR] {text}")
-
-            # 用链式 setter 构造 Message 对象，缓存坐标、发送方与识别文字。
+        # 遍历每个气泡：组装 Message（缓存坐标、发送方与识别文字）。
+        for (x, y, w, h, is_self), text in zip(boxes, texts, strict=True):
+            # 用链式 setter 构造 Message 对象
             msg = Message().setRect((x, y, w, h)).setIsSelf(is_self).setText(text)
             new_messages.append(msg)
 
