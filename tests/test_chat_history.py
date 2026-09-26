@@ -99,6 +99,10 @@ class _RecordingAutomation:
             "error": None,
         }
 
+    def check_capture_ready(self) -> dict:
+        # 窗口就绪（与 FakeAutomation 同契约）
+        return {"ready": True, "windowTitle": "QQ"}
+
 
 class _ReadFailAutomation(_RecordingAutomation):
     """视觉读取失败的替身：自动更新降级场景。"""

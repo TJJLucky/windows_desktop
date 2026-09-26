@@ -25,6 +25,8 @@ class FakeAutomation:
     def __init__(self) -> None:
         # 记录所有发送调用（用于断言幂等：同消息应只发送一次）
         self.sent: list[tuple[str, str]] = []
+        # 截图可用性开关（测试可翻转为 False 模拟窗口不可用）
+        self.capture_ready: bool = True
 
     def list_contacts(self) -> dict[str, dict]:
         # 固定返回一个联系人
@@ -43,6 +45,12 @@ class FakeAutomation:
             "count": 1,
             "error": None,
         }
+
+    def check_capture_ready(self) -> dict:
+        # 按开关返回就绪/不可用两种结果
+        if not self.capture_ready:
+            return {"ready": False, "error": "QQ_WINDOW_NOT_READY"}
+        return {"ready": True, "windowTitle": "QQ"}
 
 
 @pytest.fixture
@@ -132,3 +140,38 @@ async def test_same_command_id_cannot_change_message(service) -> None:
     # 断言：409 + 冲突错误码
     assert conflict.status_code == 409
     assert conflict.json() == {"detail": "QQ_COMMAND_ID_REUSED"}
+
+
+@pytest.mark.asyncio
+async def test_capture_check_ready(service) -> None:
+    """场景：窗口就绪 → 截图可用，返回 ready=true + 窗口标题。"""
+    _, app = service
+    async with client(app) as caller:
+        # 调用截图可用性检查
+        response = await caller.post("/v1/capture:check")
+    # 断言：200（探测接口）
+    assert response.status_code == 200
+    body = response.json()
+    # 就绪 + 检测方法固定 + 窗口标题 + 无错误
+    assert body["ready"] is True
+    assert body["method"] == "ensure_qq_window_with_retry"
+    assert body["windowTitle"] == "QQ"
+    assert body["error"] is None
+
+
+@pytest.mark.asyncio
+async def test_capture_check_not_ready_is_200(service) -> None:
+    """场景：窗口不可用 → 仍 200 + ready=false（探测语义，不 503）。"""
+    automation, app = service
+    # 翻转替身开关：模拟 QQ 窗口未就绪
+    automation.capture_ready = False
+    async with client(app) as caller:
+        # 调用截图可用性检查
+        response = await caller.post("/v1/capture:check")
+    # 断言：不可用也是有效检测结果，200 而非 503
+    assert response.status_code == 200
+    body = response.json()
+    # 未就绪 + 无窗口标题 + 错误码带出
+    assert body["ready"] is False
+    assert body["windowTitle"] is None
+    assert body["error"] == "QQ_WINDOW_NOT_READY"

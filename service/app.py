@@ -25,7 +25,7 @@ from .chat_history import ChatHistoryStore
 # CommandConflictError：相同 commandId 配不同消息体的冲突异常；CommandLedger：命令幂等账本
 from .command_ledger import CommandConflictError, CommandLedger
 # 全部 Pydantic 请求/响应契约模型（API 的输入输出 schema）
-from .contracts import API_VERSION, ChatHistoryRequest, ChatHistoryResponse, CommandResponse, ListContactsResponse, ReadMessagesRequest, ReadMessagesResponse, SendMessageRequest, ServiceHealthResponse
+from .contracts import API_VERSION, CaptureCheckResponse, ChatHistoryRequest, ChatHistoryResponse, CommandResponse, ListContactsResponse, ReadMessagesRequest, ReadMessagesResponse, SendMessageRequest, ServiceHealthResponse
 # QqAutomationPort：自动化端口抽象（测试时可注入替身）；LegacyQqAutomationFacade：真实实现（视觉 RPA）；QqAutomationError：QQ 操作失败统一异常
 from .facade import LegacyQqAutomationFacade, QqAutomationError, QqAutomationPort
 
@@ -71,6 +71,20 @@ def create_app(
     async def health(_: None = Depends(require_token)) -> ServiceHealthResponse:
         # 返回固定状态 READY + API 版本；调用方用它探测服务是否存活
         return ServiceHealthResponse(apiVersion=API_VERSION, status="READY")
+
+    # —— 截图可用性检查接口（探测） ——
+    @app.post("/v1/capture:check", response_model=CaptureCheckResponse)
+    async def check_capture(_: None = Depends(require_token)) -> CaptureCheckResponse:
+        # 窗口就绪检测同样是阻塞操作（进程/窗口枚举 + 可能唤起 + WGC 试截），丢线程池执行
+        result = await asyncio.to_thread(facade.check_capture_ready)
+        # 组装响应：ready 透传；windowTitle 就绪时才有；error 不可用时才有
+        # 注意：窗口不可用返回 200 + ready=false（探测语义），不投影为 503
+        return CaptureCheckResponse(
+            ready=result["ready"],
+            method="ensure_qq_window_with_retry",
+            windowTitle=result.get("windowTitle"),
+            error=result.get("error"),
+        )
 
     # —— 读取联系人列表接口 ——
     @app.post("/v1/contacts:query", response_model=ListContactsResponse)

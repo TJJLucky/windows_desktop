@@ -41,6 +41,13 @@ class QqAutomationPort(Protocol):
         """读取指定联系人的可见消息，返回含 messages 列表的 dict。"""
         ...
 
+    def check_capture_ready(self) -> dict:
+        """检查 QQ 截图能力（窗口就绪），返回 {ready, windowTitle?, error?}。
+
+        探测语义：窗口不可用是有效检测结果（ready=False + error），不抛异常。
+        """
+        ...
+
 
 class LegacyQqAutomationFacade:
     """复用既有 Dispatcher FIFO，不改变 WGC、OCR 或输入实现。"""
@@ -93,3 +100,22 @@ class LegacyQqAutomationFacade:
             for item in messages
         ]
         return {"ok": True, "messages": payload, "count": len(payload), "error": None}
+
+    def check_capture_ready(self) -> dict:
+        """检查 QQ 截图是否可用：调用 ensure_qq_window_with_retry 做窗口就绪检测。
+
+        与业务操作（读/发）不同，这是探测接口：窗口不可用返回 ready=False，
+        不抛 QqAutomationError（HTTP 层 200 + ready=false，而非 503）。
+        """
+        # 延迟 import：避免在非 Windows/无桌面环境加载窗口检测重依赖
+        from utils.qq.window_ops import ensure_qq_window_with_retry
+
+        try:
+            # 分级校验 + 重试：窗口存在 → 用户未动时快照复用 → 仅变化时置顶/最大化/试截
+            win = ensure_qq_window_with_retry()
+            # 就绪：报告窗口标题（辅助确认窗口身份）
+            return {"ready": True, "windowTitle": getattr(win, "title", None)}
+        except Exception as exc:
+            # 重试耗尽仍未就绪：返回不可用 + 错误码（不抛出，保持探测语义）
+            print(f"[WARN] 截图可用性检测失败: {exc}")
+            return {"ready": False, "error": "QQ_WINDOW_NOT_READY"}

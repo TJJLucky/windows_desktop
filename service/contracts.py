@@ -80,6 +80,18 @@ class CommandResponse(StrictModel):
     result: dict[str, Any] | None = None
 
 
+class CaptureCheckResponse(StrictModel):
+    """截图可用性检查响应：QQ 窗口就绪检测结果。"""
+    # 截图是否可用（窗口就绪 = True；不可用 = False，属于有效检测结果而非错误）
+    ready: bool
+    # 本次检测使用的方法（固定为 ensure_qq_window_with_retry，便于调用方排查）
+    method: Literal["ensure_qq_window_with_retry"]
+    # 就绪时的 QQ 主窗口标题（辅助确认窗口身份；不可用时为 null）
+    window_title: str | None = Field(alias="windowTitle", default=None)
+    # 不可用时的错误码（如 QQ_WINDOW_NOT_READY；就绪时为 null）
+    error: str | None = None
+
+
 class ChatHistoryItem(StrictModel):
     """单条聊天记录（历史查询返回元素）。"""
     # 数据库自增主键
