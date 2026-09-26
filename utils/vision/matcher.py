@@ -1,13 +1,7 @@
 """图像匹配原语：模板匹配、裁剪。仅依赖 core 子包。
 
-QQ 专用匹配函数（match_overflow_qq_icon、match_switch_to_*）已迁至 qq/composites.py。
+QQ 专用匹配函数（match_overflow_qq_icon、match_switch_to_*）已迁至 qq/window_ops.py。
 """
-
-import sys
-from pathlib import Path
-
-if __name__ == "__main__":
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # 深一层子包
 
 import cv2
 import numpy as np
@@ -206,38 +200,3 @@ def crop_region(image: Image.Image, region: dict) -> Image.Image:
     """根据 find_template 返回的 {left,top,right,bottom} 字典裁剪"""
     return image.crop((region["left"], region["top"],
                        region["right"], region["bottom"]))
-
-
-if __name__ == "__main__":
-    # matcher.py 位于 ``windows_desktop/utils/vision``，向上三级即可得到
-    # ``windows_desktop`` 目录。调试图片和模板都以此目录为基准，避免
-    # 从不同工作目录启动脚本时出现相对路径失效的问题。
-    windows_desktop_dir = Path(__file__).resolve().parents[2]
-    big_image_path = windows_desktop_dir / "utils" / "debug" / "big_image.png"
-    template_path = windows_desktop_dir / "templates" / "search_bar_left.png"
-
-    # 在打开图片前先检查路径，错误信息会直接指出缺失的资源文件。
-    for image_path in (big_image_path, template_path):
-        if not image_path.is_file():
-            raise FileNotFoundError(f"调试图片不存在: {image_path}")
-
-    # 使用 with 确保文件句柄及时关闭；convert 会生成独立的 RGB 图像，
-    # 与 WGC 截图返回的 RGB 模式保持一致。
-    with Image.open(big_image_path) as big_image_file, Image.open(template_path) as template_file:
-        big_image = big_image_file.convert("RGB")
-        template = template_file.convert("RGB")
-
-    region = find_template(big_image, template, threshold=0.9)
-    if region is None:
-        print(f"未匹配到模板: {template_path.name}")
-    else:
-        print(f"模板匹配成功: {template_path.name} -> {region}")
-        # 仅用于人工调试：在内存中的截图副本上绘制匹配框并直接展示，
-        # 不会修改原始 big_image.png，也不会生成额外的调试文件。
-        draw_box(
-            big_image,
-            region["x"],
-            region["y"],
-            region["right"] - region["left"],
-            region["bottom"] - region["top"],
-        ).show()

@@ -1,10 +1,5 @@
 """鼠标操作原语：点击、拖拽、随机取点。不依赖其他 utils 子包。"""
 
-import sys
-from pathlib import Path
-if __name__ == "__main__":
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # 深一层子包
-
 import random
 import ctypes
 from ctypes import wintypes
@@ -59,18 +54,3 @@ def drag(from_x, from_y, to_x, to_y, steps=10, duration=0.3):
         time.sleep(duration / steps)
     time.sleep(0.05)
     _user32.mouse_event(4, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
-
-
-if __name__ == "__main__":
-    try:
-        from ..qq.composites import match_overflow_qq_icon
-    except ImportError:
-        from utils.qq.composites import match_overflow_qq_icon
-
-    region = match_overflow_qq_icon()
-    print(region)
-    random_click(
-        region["left"], region["top"],
-        region["right"] - region["left"],
-        region["bottom"] - region["top"],
-    )

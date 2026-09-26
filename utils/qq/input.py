@@ -6,30 +6,20 @@
   - 文本输入：方案 2 —— Windows 原生 win32api 写剪贴板 + Ctrl+V 粘贴，最稳定
   - 发送：复用 regions.get_input_buttom_region 定位发送按钮并点击中心
 
-依赖 core + vision + qq/regions + qq/composites。
+依赖 core + vision + qq/regions + qq/window_ops。
 """
 
-import sys
 import time
-from pathlib import Path
-
-if __name__ == "__main__":
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import win32clipboard
 import win32api
 import win32con
 
-try:
-    from .regions import get_inputbox_region_and_image, get_input_buttom_region, RegionResult
-    from .composites import ensure_qq_window_with_retry
-    from ..core.windows import WindowCaptureCtx, timer
-    from ..core.mouse import random_click, click_at
-except ImportError:
-    from utils.qq.regions import get_inputbox_region_and_image, get_input_buttom_region, RegionResult
-    from utils.qq.composites import ensure_qq_window_with_retry
-    from utils.core.windows import WindowCaptureCtx, timer
-    from utils.core.mouse import random_click, click_at
+from .regions import get_inputbox_region_and_image, get_input_buttom_region, RegionResult
+from .window_ops import ensure_qq_window_with_retry
+from ..core.window import WindowCaptureCtx
+from ..core.timing import timer
+from ..core.mouse import random_click, click_at
 
 
 class InputBox:
@@ -166,30 +156,3 @@ class InputBox:
         self.refresh()
         self.paste_text(text)
         self.click_send()
-
-
-if __name__ == "__main__":
-    try:
-        from .userList import UserList  # 局部导入避免顶部循环依赖
-    except ImportError:
-        from utils.qq.userList import UserList  # 局部导入避免顶部循环依赖
-
-    userList = UserList()
-    userList.refresh_image()
-    userList.refresh()
-    # 激活用户名包含"盒"的用户
-    activated = False
-    for name, user in userList.users.items():
-        if "盒" in name:
-            userList.active_user(user)
-            print(f"已激活用户: {name}")
-            activated = True
-            break
-    if not activated:
-        print("未找到用户名包含「盒」的用户")
-
-    inputBox = InputBox()
-    inputBox.refresh()
-    inputBox.send_text("你好你好测试测试")
-    # ib.paste_text("测试消息内容")
-    # ib.click_send()

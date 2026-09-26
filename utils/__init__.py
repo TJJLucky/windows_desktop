@@ -10,20 +10,24 @@
 
 from .core import screenshot
 from .core import mouse
-from .core import windows
+from .core import window
+from .core import timing
 from .vision import matcher
-from .qq import composites
+from .qq import window_ops
 from .qq import regions
-from .qq import userList
+from .qq import user_list
+from .qq import dispatcher
 
 screenshot.ensure_dpi_aware()  # 启动时固定 DPI-aware，统一物理像素坐标
 
 __all__ = [
     "screenshot",
     "mouse",
-    "windows",
+    "window",
+    "timing",
     "matcher",
-    "composites",
+    "window_ops",
     "regions",
-    "userList",
+    "user_list",
+    "dispatcher",
 ]

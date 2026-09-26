@@ -1,60 +1,17 @@
 """QQ 消息框模块：气泡检测、裁切、发送方判断。"""
 
-import sys
-from pathlib import Path
-
-if __name__ == "__main__":
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-from dataclasses import dataclass
-
 from collections import deque
 
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw
 
-try:
-    from .regions import get_message_box_region_and_image
-    from ..vision.ocr import OCREngine
-    from .composites import get_main_window, get_qq_window_image, ensure_qq_window_with_retry
-    from ..core.screenshot import getDPI
-    from ..core.windows import timer
-except ImportError:
-    from utils.qq.regions import get_message_box_region_and_image
-    from utils.vision.ocr import OCREngine
-    from utils.qq.composites import get_main_window, get_qq_window_image, ensure_qq_window_with_retry
-    from utils.core.screenshot import getDPI
-    from utils.core.windows import timer
-
-
-@dataclass
-class Message:
-    """单条消息数据模型，含 OCR 文本、截图像素坐标与发送方判断。
-
-    参考 QQUser 的链式 setter 风格：每个字段有对应 setXxx() 方法，
-    返回 self 以便链式构造，例如:
-        Message().setText("你好").setRect((0, 0, 10, 10)).setIsSelf(True)
-    """
-
-    text: str = ""  # OCR 识别文本
-    rect: tuple[int, int, int, int] = (0, 0, 0, 0)  # 气泡在消息区内的坐标 (x, y, w, h)
-    is_self: bool = False  # True=自己发的, False=对方
-
-    def setText(self, text: str) -> "Message":
-        """设置消息文本，返回 self 支持链式调用。"""
-        self.text = text
-        return self
-
-    def setRect(self, rect: tuple[int, int, int, int]) -> "Message":
-        """设置气泡在消息区内的坐标，返回 self 支持链式调用。"""
-        self.rect = rect
-        return self
-
-    def setIsSelf(self, is_self: bool) -> "Message":
-        """设置是否为自己发送，返回 self 支持链式调用。"""
-        self.is_self = is_self
-        return self
+from .models import Message
+from .regions import get_message_box_region_and_image
+from .window_ops import get_main_window, get_qq_window_image, ensure_qq_window_with_retry
+from ..vision.ocr import OCREngine
+from ..core.screenshot import getDPI
+from ..core.timing import timer
 
 
 class MessageList:
@@ -362,9 +319,3 @@ class MessageList:
         """供智能体读取消息的唯一入口：自动刷新后返回最新消息列表。"""
         self.refresh()
         return self.messages
-
-
-if __name__ == "__main__":
-    msgList = MessageList()
-    print(msgList.read_messages())
-    pass

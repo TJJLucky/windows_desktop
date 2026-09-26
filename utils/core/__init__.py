@@ -2,10 +2,12 @@
 
 from . import screenshot
 from . import mouse
-from . import windows
+from . import window
+from . import timing
 
 __all__ = [
     "screenshot",
     "mouse",
-    "windows",
+    "window",
+    "timing",
 ]

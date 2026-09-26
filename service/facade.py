@@ -18,12 +18,12 @@ class QqAutomationPort(Protocol):
 
 
 class LegacyQqAutomationFacade:
-    """复用既有 QQAtomicOperator FIFO，不改变 WGC、OCR 或输入实现。"""
+    """复用既有 Dispatcher FIFO，不改变 WGC、OCR 或输入实现。"""
 
     def _operator(self):
-        from utils.qq.QQAtomicOperator import QQAtomicOperator
+        from utils.qq.dispatcher import Dispatcher
 
-        return QQAtomicOperator()
+        return Dispatcher()
 
     def list_contacts(self) -> dict[str, dict]:
         contacts, error = self._operator().get_contact_list(timeout=60.0)

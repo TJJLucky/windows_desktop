@@ -3,22 +3,14 @@
 窗口像素只允许来自 ``wgc`` 对明确 HWND 的原生后台捕获。
 """
 
-import sys
-from pathlib import Path
-
-if __name__ == "__main__":
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # 深一层子包
-
 import ctypes
 from ctypes import wintypes
 import numpy as np
 from PIL import Image
-import pygetwindow as gw
 import os
 import win32gui
 import win32con
 import win32print
-import time
 
 
 # ── DPI ────────────────────────────────────────────────────────────
@@ -162,52 +154,3 @@ class WGCCapture:
         img = Image.fromarray(arr[:, :, [2, 1, 0]])  # BGRA→RGB
         del arr
         return img.convert("RGB")  # 确保返回 RGB 模式
-
-
-if __name__ == "__main__":
-    def main():
-        cap = WGCCapture()
-        qq_hwnd = None
-
-        def refresh_qq_hwnd():
-            nonlocal qq_hwnd
-            if qq_hwnd and win32gui.IsWindow(qq_hwnd) and win32gui.IsWindowVisible(qq_hwnd):
-                return qq_hwnd
-
-            qq_list = gw.getAllWindows()
-            target = None
-            for win in qq_list:
-                if win.title.strip() == "QQ" and win.visible:
-                    target = win
-                    break
-            if not target:
-                qq_hwnd = None
-                return None
-            qq_hwnd = target._hWnd
-            return qq_hwnd
-
-        def capture_qq_window():
-            nonlocal cap
-            hwnd = refresh_qq_hwnd()
-            if not hwnd:
-                return None
-            img = cap.capture(hwnd)
-            # 捕获失败重建实例容错
-            if img is None and WGCCapture._instance is None:
-                cap = WGCCapture()
-                img = cap.capture(hwnd)
-            return img
-
-        # 循环截图
-        for i in range(15):
-            print(f"正在截图：第{i + 1}次")
-            frame = capture_qq_window()
-            time.sleep(0.2)
-            if frame:
-                frame.save(f"qq_frame_{i}.png")
-                print(f"保存成功 qq_frame_{i}.png")
-
-        WGCCapture.release()
-        print("全部截图完成，资源已释放")
-
-    main()

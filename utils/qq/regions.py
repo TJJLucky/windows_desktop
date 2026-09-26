@@ -1,26 +1,17 @@
 """QQ 窗口区域识别：好友列表、输入框、消息框的位置与截图。
 
-依赖 core + vision + qq/composites。
+依赖 core + vision + qq/window_ops。
 """
 
-import sys
 import os
 from pathlib import Path
-
-if __name__ == "__main__":
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from PIL import Image
 from dataclasses import dataclass
 
-try:
-    from ..vision.matcher import find_template, crop_region, draw_box
-    from ..core.windows import get_qq_windows, timer
-    from .composites import ensure_qq_window_with_retry, get_qq_window_image
-except ImportError:
-    from utils.vision.matcher import find_template, crop_region, draw_box
-    from utils.core.windows import get_qq_windows, timer
-    from utils.qq.composites import ensure_qq_window_with_retry, get_qq_window_image
+from ..vision.matcher import find_template, crop_region, draw_box
+from ..core.timing import timer
+from .window_ops import ensure_qq_window_with_retry, get_qq_window_image, get_qq_windows
 
 
 @dataclass
@@ -169,19 +160,3 @@ def get_message_box_region_and_image(window, QQ_window_image=None):
         image=crop_region(QQ_window_image, region),
         full_image=QQ_window_image,
     )
-
-
-if __name__ == "__main__":
-    window = ensure_qq_window_with_retry()
-    if window is None:
-        raise RuntimeError("QQ 窗口未就绪")
-    QQ_window_image, _ = get_qq_window_image(window)
-    if QQ_window_image is None:
-        raise RuntimeError("QQ 窗口截图失败")
-    print(get_input_buttom_region(window, QQ_window_image))
-    userlist_result = get_userList_region_and_image(window, QQ_window_image)
-    userlist_result.image.show()
-    # inputbox_result = get_inputbox_region_and_image(window, QQ_window_image)
-    # inputbox_result.image.show()
-    # msg_result = get_message_box_region_and_image(window, QQ_window_image)
-    # msg_result.image.show()

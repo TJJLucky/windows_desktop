@@ -2,8 +2,10 @@
 
 from . import matcher
 from . import ocr
+from . import compose
 
 __all__ = [
     "matcher",
     "ocr",
+    "compose",
 ]
