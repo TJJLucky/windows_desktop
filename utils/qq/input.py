@@ -191,7 +191,7 @@ class InputBox:
             print("[WARN] 尚未刷新输入框区域，先调用 refresh()")
             return
         # 焦点在输入框，按 Enter 发送（QQ 全局快捷键，当前焦点窗口即输入框）
-        send_hotkey(*SEND_MESSAGE)
+        send_hotkey(SEND_MESSAGE)
         # 等发送完成（消息上屏渲染，避免紧接着截图到旧画面）
         time.sleep(0.3)
 

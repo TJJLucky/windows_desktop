@@ -172,7 +172,7 @@ def activate_qq(retry: int = 2) -> bool:
         return False
 
     # 无任何可见窗口（缩托盘/主面板已关闭）→ 按 Ctrl+Alt+X 打开所有窗口
-    send_hotkey(*TOGGLE_QQ_WINDOWS)
+    send_hotkey(TOGGLE_QQ_WINDOWS)
     # 等窗口弹出
     time.sleep(0.8)
 
