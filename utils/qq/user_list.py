@@ -281,11 +281,20 @@ class UserList:
     def active_user(self, user: User):
         """激活指定用户（若非当前激活）。
 
-        通过点击用户行区域切换到该会话；若已是激活态则跳过。
+        跳过点击的条件（任一命中即无需点击）：
+          1. refresh 已判定 user.active：顶部面板 OCR 的当前会话名包含该用户昵称；
+          2. 行背景色为激活态（is_active_bg = 226 灰）：直接看用户列表行自身的高亮，
+             顶部 OCR 漏判/名字截断时的可靠兜底——"根据用户列表已激活的用户不用激活"。
         """
-        # 已是激活会话 → 无需点击
+        # ① refresh 已判定为当前会话 → 无需点击
         if user.active:
             return
+        # ② 行背景色为激活态 → 列表行本身高亮，即使顶部 OCR 漏判也无需点击。
+        #    裁该行（从头像右边缘开始，排除头像只留背景+文字），再做高频背景色判定。
+        if user.avatar is not None:
+            row_img = self.get_user_image(user.rect, user.avatar)  # 排除头像，只留行背景+文字
+            if UserList.is_active_bg(row_img):
+                return
         # 未 refresh 过则无法点击
         if self.userList_region is None or self.hwnd == 0:
             raise RuntimeError("需要先执行refresh()")
