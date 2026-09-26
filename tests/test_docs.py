@@ -43,3 +43,12 @@ def test_openapi_lists_v1_apis(client):
     # 断言：六个 v1 业务接口全部登记在案（任何一个被误删/改名都会在此暴露）
     for path in ("/v1/health", "/v1/capture:check", "/v1/contacts:query", "/v1/commands/read", "/v1/commands/send", "/v1/chat/history"):
         assert path in paths
+
+
+def test_openapi_uses_chinese_descriptions(client):
+    body = client.get("/openapi.json").json()
+    assert body["info"]["title"] == "QQ 桌面自动化服务"
+    assert body["paths"]["/v1/commands/send"]["post"]["summary"] == "发送消息"
+    send_schema = body["components"]["schemas"]["SendMessageRequest"]
+    assert send_schema["properties"]["commandId"]["title"] == "命令 ID"
+    assert "幂等键" in send_schema["properties"]["commandId"]["description"]

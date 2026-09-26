@@ -18,8 +18,8 @@ import uuid
 # Path：数据库文件路径的类型标注
 from pathlib import Path
 
-# FastAPI 框架组件：FastAPI(应用对象) / HTTPException(标准错误响应)
-from fastapi import FastAPI, HTTPException
+# FastAPI 框架组件：FastAPI(应用对象) / HTTPException(标准错误响应) / ApiPath(路径参数文档)
+from fastapi import FastAPI, HTTPException, Path as ApiPath
 
 # ChatHistoryStore：聊天记录 SQLite 存储（追加消息、按联系人查历史）
 from .chat_history import ChatHistoryStore
@@ -31,6 +31,15 @@ from .contracts import API_VERSION, CaptureCheckResponse, ChatHistoryRequest, Ch
 from .facade import LegacyQqAutomationFacade, QqAutomationError, QqAutomationPort
 
 logger = logging.getLogger("qq_service.api")
+
+API_DESCRIPTION = """QQ 桌面自动化服务。\n\n所有操作只监听本机 127.0.0.1，不提供公网访问；发送接口使用 commandId 保证幂等。\n"""
+
+OPENAPI_TAGS = [
+    {"name": "系统", "description": "服务状态与截图可用性检查。"},
+    {"name": "联系人", "description": "读取 QQ 用户列表。"},
+    {"name": "消息", "description": "读取和发送 QQ 消息。"},
+    {"name": "聊天记录", "description": "本地聊天记录查询。"},
+]
 
 
 def create_app(
@@ -56,7 +65,12 @@ def create_app(
     # 初始化命令账本（打开 SQLite、建表），用于发送命令的幂等控制
     ledger = CommandLedger(ledger_path)
     # 创建 FastAPI 应用：开启默认 /docs(Swagger) 与 /openapi.json，版本号取契约常量
-    app = FastAPI(title="PriceAgent QQ Desktop Service", version=API_VERSION)
+    app = FastAPI(
+        title="QQ 桌面自动化服务",
+        version=API_VERSION,
+        description=API_DESCRIPTION,
+        openapi_tags=OPENAPI_TAGS,
+    )
     logger.info(
         "application.create ledger_path=%s chat_history_path=%s automation=%s",
         ledger_path,
@@ -102,13 +116,27 @@ def create_app(
         return response
 
     # —— 健康检查接口 ——
-    @app.get("/v1/health", response_model=ServiceHealthResponse)
+    @app.get(
+        "/v1/health",
+        response_model=ServiceHealthResponse,
+        summary="健康检查",
+        description="检查服务是否已启动，用于客户端探测生命周期。",
+        tags=["系统"],
+        response_description="服务健康状态",
+    )
     def health() -> ServiceHealthResponse:
         # 返回固定状态 READY + API 版本；调用方用它探测服务是否存活
         return ServiceHealthResponse(apiVersion=API_VERSION, status="READY")
 
     # —— 截图可用性检查接口（探测） ——
-    @app.post("/v1/capture:check", response_model=CaptureCheckResponse)
+    @app.post(
+        "/v1/capture:check",
+        response_model=CaptureCheckResponse,
+        summary="检查 QQ 截图可用性",
+        description="检查 QQ 主窗口和 WGC 截图能力。窗口不可用是有效的 ready=false 检测结果，不返回 503。",
+        tags=["系统"],
+        response_description="截图可用性检测结果",
+    )
     def check_capture() -> CaptureCheckResponse:
         # 同步端点：FastAPI 自动放入线程池执行窗口就绪检测（进程/窗口枚举 + 可能唤起 + WGC 试截）
         result = facade.check_capture_ready()
@@ -128,7 +156,14 @@ def create_app(
         )
 
     # —— 读取联系人列表接口 ——
-    @app.post("/v1/contacts:query", response_model=ListContactsResponse)
+    @app.post(
+        "/v1/contacts:query",
+        response_model=ListContactsResponse,
+        summary="查询 QQ 联系人列表",
+        description="读取当前 QQ 用户列表。返回的 contacts key 可原样用于消息读取、发送和聊天记录查询。",
+        tags=["联系人"],
+        response_description="联系人列表和数量",
+    )
     def list_contacts() -> ListContactsResponse:
         try:
             # 同步端点：FastAPI 自动在（线程池）执行 QQ 视觉识别，事件循环不被阻塞
@@ -142,7 +177,14 @@ def create_app(
         return ListContactsResponse(contacts=contacts, count=len(contacts))
 
     # —— 读取指定联系人的可见消息接口 ——
-    @app.post("/v1/commands/read", response_model=ReadMessagesResponse)
+    @app.post(
+        "/v1/commands/read",
+        response_model=ReadMessagesResponse,
+        summary="读取指定联系人的可见消息",
+        description="激活联系人并读取当前可见消息窗口，成功后自动写入本地聊天记录。",
+        tags=["消息"],
+        response_description="当前可见消息列表",
+    )
     def read_messages(request: ReadMessagesRequest) -> ReadMessagesResponse:
         try:
             # 同步端点：FastAPI 自动在（线程池）执行视觉读取消息区 + OCR 识别文本
@@ -162,7 +204,15 @@ def create_app(
         return ReadMessagesResponse.model_validate(payload)
 
     # —— 发送消息接口（幂等） ——
-    @app.post("/v1/commands/send", response_model=CommandResponse)
+    @app.post(
+        "/v1/commands/send",
+        response_model=CommandResponse,
+        summary="发送消息",
+        description="向指定联系人发送消息。相同 commandId 和相同消息体只执行一次，相同 ID 不同消息体返回 409。",
+        tags=["消息"],
+        responses={409: {"description": "commandId 被不同消息体重复使用"}},
+        response_description="发送命令状态",
+    )
     def send_message(request: SendMessageRequest) -> CommandResponse:
         logger.info(
             "message.send.begin command_id=%s contact=%s text_length=%d",
@@ -207,8 +257,18 @@ def create_app(
         return CommandResponse(commandId=request.command_id, status="SUCCEEDED", result=result)
 
     # —— 查询发送命令状态接口 ——
-    @app.get("/v1/commands/{command_id}", response_model=CommandResponse)
-    def command_status(command_id: str) -> CommandResponse:
+    @app.get(
+        "/v1/commands/{command_id}",
+        response_model=CommandResponse,
+        summary="查询命令状态",
+        description="根据 commandId 查询发送命令的执行状态和结果。",
+        tags=["消息"],
+        responses={404: {"description": "commandId 不存在"}},
+        response_description="命令当前状态",
+    )
+    def command_status(
+        command_id: str = ApiPath(description="发送接口使用的 commandId。", examples=["effect-key-0000001"]),
+    ) -> CommandResponse:
         # 从账本按 commandId 查状态与结果（SQLite 毫秒级，同步直调）
         record = ledger.get(command_id)
         if record is None:
@@ -221,7 +281,14 @@ def create_app(
         return CommandResponse(commandId=command_id, status=current_status, result=result)
 
     # —— 查询聊天记录接口（查询前自动视觉更新一次） ——
-    @app.post("/v1/chat/history", response_model=ChatHistoryResponse)
+    @app.post(
+        "/v1/chat/history",
+        response_model=ChatHistoryResponse,
+        summary="查询聊天记录",
+        description="查询本地聊天记录。查询前会先做一次视觉更新；更新失败时返回旧数据并标记 update=failed。",
+        tags=["聊天记录"],
+        response_description="联系人聊天记录",
+    )
     def query_chat_history(request: ChatHistoryRequest) -> ChatHistoryResponse:
         # 需求约定：每次查询先做一次视觉读取（拉到最新消息），再返回历史，保证数据新鲜
         try:

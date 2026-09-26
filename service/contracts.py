@@ -2,125 +2,199 @@
 
 定义全部请求/响应模型（Pydantic）：
 - 字段使用 JSON 别名（如 contactName），与调用方（UniApp 前端）的命名约定一致；
-- 全部模型继承 StrictModel：未知字段直接报错（extra="forbid"），保证前后端契约严格一致，防止前端拼错字段名被静默忽略；
-- 枚举用 Literal 约束，非法取值在序列化/校验阶段就失败。
+- 全部模型继承 StrictModel：未知字段直接报错（extra="forbid"），保证前后端契约严格一致；
+- 字段提供中文 title/description/examples，作为 FastAPI OpenAPI 文档。
 """
 
-# 延迟求值类型注解：允许前向引用、加快 import
 from __future__ import annotations
 
-# Any：宽松类型（嵌套结构用 dict 承载）；Literal：把字段取值限定为字面量集合
 from typing import Any, Literal
 
-# Pydantic v2：BaseModel(模型基类) / ConfigDict(模型配置) / Field(字段级约束与别名)
 from pydantic import BaseModel, ConfigDict, Field
 
 
-# 服务 API 版本号：与 endpoint 文件里的 apiVersion 一致
 API_VERSION = "v1"
 
 
 class StrictModel(BaseModel):
     """所有契约模型的基类：拒绝未知字段，前后端字段必须严格对齐。"""
-    # extra="forbid"：请求/响应中出现未声明字段时直接校验失败（而非默默丢弃）
+
     model_config = ConfigDict(extra="forbid")
 
 
 class ServiceHealthResponse(StrictModel):
-    """健康检查响应：API 版本 + 固定 READY 状态。"""
-    # 别名 apiVersion：对外 JSON 键是 apiVersion，内部字段名用蛇形 api_version
-    api_version: Literal["v1"] = Field(alias="apiVersion")
-    # 状态只允许 READY（Literal 限定）
-    status: Literal["READY"]
+    """健康检查响应。"""
+
+    api_version: Literal["v1"] = Field(
+        alias="apiVersion",
+        title="API 版本",
+        description="当前 API 版本，固定为 v1。",
+        examples=["v1"],
+    )
+    status: Literal["READY"] = Field(
+        title="服务状态",
+        description="服务状态，固定为 READY。",
+        examples=["READY"],
+    )
 
 
 class ListContactsResponse(StrictModel):
-    """联系人列表响应：联系人名 → 联系人信息 dict 的映射。"""
-    # 字典结构：键为联系人名，值为任意属性（头像/备注等），保持灵活
-    contacts: dict[str, dict[str, Any]]
-    # 联系人总数（不允许负数）
-    count: int = Field(ge=0)
+    """联系人列表响应。"""
+
+    contacts: dict[str, dict[str, Any]] = Field(
+        title="联系人列表",
+        description="联系人名到联系人信息的映射，key 来自 QQ 用户列表。",
+    )
+    count: int = Field(
+        ge=0,
+        title="联系人数量",
+        description="本次返回的联系人数量。",
+    )
 
 
 class ReadMessagesRequest(StrictModel):
-    """读取消息请求：指定联系人名。"""
-    # 联系人名：非空（min_length=1）、最长 256；别名 contactName
-    contact_name: str = Field(alias="contactName", min_length=1, max_length=256)
+    """读取指定联系人可见消息的请求。"""
+
+    contact_name: str = Field(
+        alias="contactName",
+        min_length=1,
+        max_length=256,
+        title="联系人名",
+        description="QQ 用户列表中的联系人名，必须使用 /v1/contacts:query 返回的 key。",
+        examples=["华强电子"],
+    )
 
 
 class ReadMessagesResponse(StrictModel):
-    """读取消息响应：成功标志 + 消息数组 + 条数 + 可选错误信息。"""
-    # 视觉读取是否成功
-    ok: bool
-    # 消息数组：每条含文本/坐标/方向等（与 Message 模型序列化一致）
-    messages: list[dict[str, Any]]
-    # 消息条数（不允许负数）
-    count: int = Field(ge=0)
-    # 失败时的错误信息（成功时为 null）
-    error: str | None = None
+    """读取可见消息的响应。"""
+
+    ok: bool = Field(title="读取是否成功", description="视觉读取是否成功。")
+    messages: list[dict[str, Any]] = Field(
+        title="消息列表",
+        description="当前可见消息列表，包含 text、isSelf 和坐标字段。",
+    )
+    count: int = Field(ge=0, title="消息数量", description="本次返回的消息数量。")
+    error: str | None = Field(
+        default=None,
+        title="错误信息",
+        description="失败时的错误信息，成功时为 null。",
+    )
 
 
 class SendMessageRequest(StrictModel):
-    """发送消息请求：幂等键 + 目标联系人 + 消息文本。"""
-    # 调用方生成的稳定幂等键：至少 16 字符、最长 128；账本据此去重与防冲突
-    command_id: str = Field(alias="commandId", min_length=16, max_length=128)
-    # 目标联系人名：非空、最长 256
-    contact_name: str = Field(alias="contactName", min_length=1, max_length=256)
-    # 消息文本：非空、最长 5000 字符
-    text: str = Field(min_length=1, max_length=5000)
+    """发送消息请求。"""
 
+    command_id: str = Field(
+        alias="commandId",
+        min_length=16,
+        max_length=128,
+        title="命令 ID",
+        description="调用方生成的稳定幂等键，同一 ID 不得用于不同消息体。",
+        examples=["effect-key-0000001"],
+    )
+    contact_name: str = Field(
+        alias="contactName",
+        min_length=1,
+        max_length=256,
+        title="联系人名",
+        description="QQ 用户列表中的联系人名，必须使用 /v1/contacts:query 返回的 key。",
+        examples=["华强电子"],
+    )
+    text: str = Field(
+        min_length=1,
+        max_length=5000,
+        title="消息文本",
+        description="要发送的消息文本，最长 5000 个字符。",
+        examples=["STM32F103C8T6，数量 100，请报价。"],
+    )
 
 class CommandResponse(StrictModel):
-    """命令响应：幂等键 + 执行状态 + 结果。"""
-    # 幂等键（与请求一致）
-    command_id: str = Field(alias="commandId")
-    # 状态机取值：RUNNING(执行中) / SUCCEEDED(成功) / FAILED(失败) / EFFECT_UNKNOWN(重启后结果不确定)
-    status: Literal["RUNNING", "SUCCEEDED", "FAILED", "EFFECT_UNKNOWN"]
-    # 执行结果细节（发送成功时含 sent/textLength；失败时含 error）
-    result: dict[str, Any] | None = None
+    """发送命令状态响应。"""
+
+    command_id: str = Field(
+        alias="commandId",
+        title="命令 ID",
+        description="发送请求的幂等键。",
+    )
+    status: Literal["RUNNING", "SUCCEEDED", "FAILED", "EFFECT_UNKNOWN"] = Field(
+        title="命令状态",
+        description="RUNNING：执行中；SUCCEEDED：成功；FAILED：失败；EFFECT_UNKNOWN：结果未知，禁止自动重发。",
+    )
+    result: dict[str, Any] | None = Field(
+        default=None,
+        title="执行结果",
+        description="发送成功时包含 sent/textLength，失败时包含 error。",
+    )
 
 
 class CaptureCheckResponse(StrictModel):
-    """截图可用性检查响应：QQ 窗口就绪检测结果。"""
-    # 截图是否可用（窗口就绪 = True；不可用 = False，属于有效检测结果而非错误）
-    ready: bool
-    # 本次检测使用的方法（固定为 ensure_qq_window_with_retry，便于调用方排查）
-    method: Literal["ensure_qq_window_with_retry"]
-    # 就绪时的 QQ 主窗口标题（辅助确认窗口身份；不可用时为 null）
-    window_title: str | None = Field(alias="windowTitle", default=None)
-    # 不可用时的错误码（如 QQ_WINDOW_NOT_READY；就绪时为 null）
-    error: str | None = None
+    """截图可用性检查响应。"""
+
+    ready: bool = Field(title="截图是否就绪", description="QQ 窗口和 WGC 截图是否可用。")
+    method: Literal["ensure_qq_window_with_retry"] = Field(
+        title="检测方法",
+        description="本次截图可用性检测使用的方法。",
+    )
+    window_title: str | None = Field(
+        alias="windowTitle",
+        default=None,
+        title="窗口标题",
+        description="就绪时的 QQ 主窗口标题，不可用时为 null。",
+    )
+    error: str | None = Field(
+        default=None,
+        title="错误码",
+        description="不可用时的错误码，就绪时为 null。",
+        examples=["QQ_WINDOW_NOT_READY"],
+    )
 
 
 class ChatHistoryItem(StrictModel):
-    """单条聊天记录（历史查询返回元素）。"""
-    # 数据库自增主键
-    id: int
-    # 消息方向：in(对方发来) / out(我方发出)
-    direction: Literal["in", "out"]
-    # 消息文本
-    text: str
-    # 该联系人维度下的消息序号（按 seq 排序即时间顺序）
-    seq: int
-    # 若是我方经命令发送的消息，关联其 commandId（便于追溯）
-    command_id: str | None = Field(alias="commandId", default=None)
-    # 入库时间（ISO 时间戳）
-    created_at: str = Field(alias="createdAt")
+    """单条聊天记录。"""
+
+    id: int = Field(title="记录 ID", description="聊天记录数据库中的自增主键。")
+    direction: Literal["in", "out"] = Field(
+        title="消息方向",
+        description="in：对方发来；out：我方发出。",
+    )
+    text: str = Field(title="消息文本", description="消息的 OCR 文本内容。")
+    seq: int = Field(title="消息序号", description="同一联系人维度下按时间顺序递增。")
+    command_id: str | None = Field(
+        alias="commandId",
+        default=None,
+        title="命令 ID",
+        description="若为我方发送，关联对应的 commandId。",
+    )
+    created_at: str = Field(alias="createdAt", title="记录时间", description="消息入库时间。")
 
 
 class ChatHistoryRequest(StrictModel):
-    """查询聊天记录请求：指定联系人。"""
-    # 联系人名：非空、最长 256
-    contact_name: str = Field(alias="contactName", min_length=1, max_length=256)
+    """查询聊天记录的请求。"""
+
+    contact_name: str = Field(
+        alias="contactName",
+        min_length=1,
+        max_length=256,
+        title="联系人名",
+        description="QQ 用户列表中的联系人名，必须使用 /v1/contacts:query 返回的 key。",
+        examples=["华强电子"],
+    )
 
 
 class ChatHistoryResponse(StrictModel):
-    """查询聊天记录响应：联系人 + 条数 + 消息列表 + 本次自动更新结果。"""
-    # 联系人名
-    contact_name: str = Field(alias="contactName")
-    # 返回的消息条数（不允许负数）
-    count: int = Field(ge=0)
-    # 历史消息列表（按 seq 升序）
-    messages: list[ChatHistoryItem]
-    # 本次查询前的自动视觉更新是否成功（failed 表示读到旧数据）
-    update: Literal["ok", "failed"]  # 本次查询前自动更新的结果
+    """查询聊天记录的响应。"""
+
+    contact_name: str = Field(
+        alias="contactName",
+        title="联系人名",
+        description="聊天记录所属的 QQ 用户列表联系人名。",
+    )
+    count: int = Field(ge=0, title="消息数量", description="本次返回的历史消息数量。")
+    messages: list[ChatHistoryItem] = Field(
+        title="历史消息",
+        description="按 seq 升序排列的历史消息列表。",
+    )
+    update: Literal["ok", "failed"] = Field(
+        title="自动更新结果",
+        description="ok：查询前视觉更新成功；failed：更新失败，返回旧数据。",
+    )
