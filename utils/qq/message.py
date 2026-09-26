@@ -257,11 +257,8 @@ class MessageList:
 
     # ── 刷新 ────────────────────────────────────────────────────
     def refresh_image(self):
-        """截取消息区域并缓存。"""
+        """截取消息区域并缓存（窗口不就绪时抛 QQWindowNotReadyError）。"""
         main_window = ensure_qq_window_with_retry()
-        if main_window is None:
-            print("[WARN] 无法获取 QQ 主窗口，跳过刷新")
-            return
         result = get_message_box_region_and_image(main_window)
         self.message_screen_region = result.screen_region
         self.message_image_region = result.image_region

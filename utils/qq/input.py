@@ -91,11 +91,9 @@ class InputBox:
 
         等价于 UserList.refresh / MessageList.refresh_messageList 的对外刷新入口：
         refresh() 一次完成"定位 + 聚焦"，之后即可 paste_text / click_send。
+        窗口不就绪时抛 QQWindowNotReadyError，不静默返回 False。
         """
         main_window = ensure_qq_window_with_retry()
-        if main_window is None:
-            print("[WARN] 无法获取 QQ 主窗口，跳过刷新")
-            return False
         self.hwnd = main_window._hWnd
 
         # 直接存储整个定位结果（含输入框/发送按钮区域与截图）

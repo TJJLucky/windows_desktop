@@ -261,11 +261,8 @@ class UserList:
     # 刷新前要调用
     @timer
     def refresh_image(self):
-        """图片和句柄的刷新"""
+        """图片和句柄的刷新（窗口不就绪时抛 QQWindowNotReadyError）。"""
         main_window = ensure_qq_window_with_retry()
-        if main_window is None:
-            print("[WARN] 无法获取 QQ 主窗口，跳过刷新")
-            return
         self.userList_region = get_userList_region_and_image(main_window)
         self.hwnd = main_window._hWnd
 

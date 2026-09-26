@@ -254,22 +254,71 @@ def activate_qq(retry: int = 2) -> bool:
     return False
 
 
+class QQWindowNotReadyError(RuntimeError):
+    """QQ 主窗口在重试耗尽后仍未就绪（不静默降级）。"""
+
+
+class _WindowState:
+    """窗口就绪状态快照：跨调用复用，用户未动窗口时跳过昂贵校验。"""
+
+    def __init__(self):
+        self.hwnd: int = 0
+        self.rect: tuple[int, int, int, int] | None = None
+        self.maximized: bool = False
+        self.valid: bool = False
+
+
+_window_state = _WindowState()
+
+
+def _window_l2_changed(win) -> bool:
+    """L2 变更检测：窗口几何/最大化状态与快照不一致 = 用户动过窗口。"""
+    if not _window_state.valid or _window_state.hwnd != win._hWnd:
+        return True
+    rect = (win.left, win.top, win.right, win.bottom)
+    if rect != _window_state.rect:
+        return True
+    if bool(win.isMaximized) != _window_state.maximized:
+        return True
+    return False
+
+
+def _snapshot_and_verify(win) -> bool:
+    """L3 深度校验：置顶 + 最大化 + WGC 试截，成功后更新快照。"""
+    set_window_z_pos(win._hWnd)
+    maximize_window(win._hWnd)
+    time.sleep(0.2)
+    image, _ = get_qq_window_image(win)
+    if image is None:
+        return False
+    _window_state.hwnd = win._hWnd
+    _window_state.rect = (win.left, win.top, win.right, win.bottom)
+    _window_state.maximized = bool(win.isMaximized)
+    _window_state.valid = True
+    return True
+
+
 def ensure_qq_window():
     """对外统一入口：保证 QQ 主窗口处于前置、最大化、可截图状态。
 
-    内部细节：
-      - 已有主窗口 → 置顶 + 最大化后返回。
-      - 无主窗口  → 经 activate_qq() 唤起后再取一次窗口并判空。
+    分级校验（成本从低到高）：
+      L1（每次）   主窗口存在（get_main_window 枚举可见窗口）。
+      L2（快照比对）窗口几何/最大化与快照一致 → 用户未动 → 直接复用，
+                   跳过置顶/最大化/试截等昂贵动作。
+      L3（仅变化时）置顶 + 最大化 + WGC 试截确认可截图，成功后更新快照。
+                   窗口最小化等同状态变化，走 L3 恢复。
 
-    :return: 主窗口对象，失败返回 None
+    :return: 主窗口对象；失败返回 None（由 with_retry 决定重试/抛错）
     """
     main_win = get_main_window()
     if main_win is None and activate_qq():
         main_win = get_main_window()
-    if main_win is not None:
-        set_window_z_pos(main_win._hWnd)
-        maximize_window(main_win._hWnd)
-        time.sleep(0.2)
+    if main_win is None:
+        return None
+    # 最小化或几何变化（用户动过）→ L3 深度校验；否则 L2 命中直接复用
+    if win32gui.IsIconic(main_win._hWnd) or _window_l2_changed(main_win):
+        if not _snapshot_and_verify(main_win):
+            return None
     return main_win
 
 
@@ -279,13 +328,16 @@ def ensure_qq_window_with_retry(retry: int = 3):
     流程：
       1. 无 QQ 进程 —— 首次尝试调用 start_qq() 唤起登录，随后继续轮询，
          给 QQ 启动或用户登录留出时间；后续重试不重复启动。
-      2. 有 QQ 进程（已登录/运行中）—— 走 ensure_qq_window 唤起/保证窗口，
-         失败则继续重试。
+      2. 有 QQ 进程（已登录/运行中）—— 走 ensure_qq_window 分级校验
+         （用户未动窗口时直接复用快照，省去置顶/最大化/试截），失败重试。
+      3. 重试耗尽仍未就绪 —— 抛 QQWindowNotReadyError，保证每次操作
+         要么成功要么显式失败，不静默降级为空数据。
 
-    :return: 主窗口对象；重试耗尽仍未就绪时返回 None
+    :return: 主窗口对象；重试耗尽时抛 QQWindowNotReadyError
     """
     # start_qq 只触发一次；协议唤起是异步的，后续轮次负责重新探测进程。
     start_requested = False
+    last_err: Exception | None = None
     for i in range(retry):
         if not get_qq_pids():
             if not start_requested:
@@ -298,10 +350,14 @@ def ensure_qq_window_with_retry(retry: int = 3):
                 time.sleep(1)
             continue
 
-        win = ensure_qq_window()
+        try:
+            win = ensure_qq_window()
+        except Exception as e:  # L3 试截等异常同样转为重试
+            last_err = e
+            win = None
         if win is not None:
             return win
         print(f"第 {i + 1} 次唤起 QQ 窗口失败，重试...")
         if i < retry - 1:
             time.sleep(1)
-    return None
+    raise QQWindowNotReadyError("QQ 主窗口在多次重试后仍未就绪") from last_err

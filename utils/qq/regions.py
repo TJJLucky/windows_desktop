@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 from ..vision.matcher import find_template, crop_region, draw_box
 from ..core.timing import timer
-from .window_ops import ensure_qq_window_with_retry, get_qq_window_image, get_qq_windows
+from .window_ops import get_qq_window_image, get_qq_windows
 
 
 @dataclass
