@@ -1,0 +1,22 @@
+# QQ Desktop Service 依赖清单（运行环境）
+#
+# 生成说明：
+#   - 与 pyproject.toml [project.dependencies] 保持一致（单一来源，勿手改此处）
+#   - 安装方式：pip install -r requirements.txt
+#   - 推荐专用环境：conda create -n qq-desktop-service python=3.12
+#   - dev 依赖（pytest 等）见 pyproject.toml [project.optional-dependencies].dev，
+#     需要时执行：pip install -e ".[dev]"
+
+fastapi>=0.115,<1
+pydantic>=2.8,<3
+uvicorn>=0.30,<1
+httpx>=0.27,<1
+numpy>=1.24,<3
+opencv-python>=4.8,<6
+Pillow>=10,<12
+pyautogui>=0.9.54,<1
+psutil>=5.9,<8
+pyperclip>=1.8,<2
+pywin32>=306,<307 ; sys_platform == 'win32'
+pywinauto>=0.6.8,<1
+rapidocr-onnxruntime>=1.4.4,<2
