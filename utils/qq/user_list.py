@@ -306,32 +306,37 @@ class UserList:
         # 未 refresh 过则无法点击
         if self.userList_region is None or self.hwnd == 0:
             raise RuntimeError("需要先执行refresh()")
-        # 不置顶直接点击：WindowCaptureCtx 置顶（TOPMOST）会触发 QQ 重绘/列表滚动，
-        # 使截图坐标与点击时刻不一致（点偏导致激活失败）。窗口由外部保证在屏内可点击
-        # （layout 左半铺满工作区），直接以截图坐标点击最可靠。
-        # 屏幕坐标 = 列表区域屏幕原点 + 行内相对坐标
-        offset_left = self.userList_region.screen_region["left"]
-        offset_top = self.userList_region.screen_region["top"]
-        rect_left, rect_top, rect_right, rect_bottom = user.rect
-        # 行垂直中心（屏幕坐标）：y 锁定行中线，彻底避开上下相邻行的边界（点错人）
-        center_y = offset_top + (rect_top + rect_bottom) // 2
+        # 点击坐标来源：整窗截图（full_image，客户区=屏幕坐标）上的头像圆，
+        # 而非"区域图 screen_region offset 换算"。原因：列表滚动/窗口重排后，
+        # 区域图 offset 可能滞后于点击时刻（refresh 截图与点击间的窗口变化），
+        # 导致点击坐标偏移、面板切不过去；整窗图与列表同帧截图，圆坐标即屏幕坐标，最可靠。
+        full = self.userList_region.full_image
+        if full is None:
+            raise RuntimeError("缺少整窗截图（full_image）")
+        circles = UserList.detect_avatar_circles(full)
+        # 过滤右侧面板的头像圆：会话列表固定在窗口左侧（搜索栏锚点右缘 <311px），
+        # 只保留列表区圆，顺序与列表显示一致（已按 cy 排序）
+        list_circles = [c for c in circles if c[0] < 311]
+        if not list_circles:
+            raise RuntimeError("整窗截图中未检测到列表头像圆")
+        # 行号：目标用户在区域图行序（crop_user_row_by_avatar 按头像 cy 排序）中的位置，
+        # 与整窗列表圆行序一一对应（同一列表、同一排序规则）
+        rows = UserList.crop_user_row_by_avatar(self.userList_region.image)
+        row_index = next((i for i, (a, r) in enumerate(rows) if r == user.rect), None)
+        if row_index is None:
+            raise RuntimeError(f"无法在列表行中找到用户: {user.name}")
+        if row_index >= len(list_circles):
+            raise RuntimeError(f"整窗列表圆不足（{len(list_circles)}），无法定位第 {row_index} 行")
+        # 目标行头像圆（屏幕坐标）
+        cx, cy, r = list_circles[row_index]
         # 昵称区典型宽度上限（物理像素）：QQ 会话列表昵称紧贴头像右侧，
         # 通常 120px 内已覆盖；限制点击宽度避免随机点落到行右侧的时间/红点/滚动条等"行外"区域
         nickname_band = 120
-        # 头像信息有效时：点击区收窄到"头像右边缘 +5px"起的昵称区，
-        # 同时宽度不超过昵称带（120px），避开头像本身与行右侧的无响应区
-        avatar_cx, _, avatar_r = user.avatar
-        if avatar_r > 0:
-            # 昵称区左缘（屏幕坐标）
-            click_left = offset_left + avatar_cx + avatar_r + 5
-            # 昵称区宽度 = min(整行剩余宽, 昵称带上限)，至少 20px（太窄则退化）
-            click_width = max(20, min(rect_right - (avatar_cx + avatar_r + 5) - 2, nickname_band))
-        else:
-            # 头像信息缺失（防御）→ 退化为整行点击（旧行为）
-            click_left = offset_left + rect_left
-            click_width = rect_right - rect_left
+        # 点击区收窄到"头像右边缘 +5px"起的昵称区，宽度取昵称带上限（120px）
+        click_left = cx + r + 5
+        click_width = nickname_band
         # 窄带随机点击：x 在文字带内随机（模拟人工），y 只在中线 ±3px 内随机（绝不越行）
-        random_click(click_left, center_y - 3, click_width, 6)
+        random_click(click_left, cy - 3, click_width, 6)
 
     def find_user(self, contact_name: str) -> "User | None":
         """按名字查找用户：直接使用包含匹配（OCR 名字可能截断/多符号），精确匹配天然被包含覆盖。
@@ -376,10 +381,14 @@ class UserList:
 
     @timer
     def active_user_by_name(self, contact_name: str):
-        """按名字激活会话：刷新列表 → 点击激活 → 验证切换，未成功则重试。
+        """按名字激活会话：刷新列表 → 点击激活 → 等待切换完成。
 
-        可靠点击闭环：点击后验证右侧面板是否已切到目标会话（顶部 OCR），
-        未切换则重新刷新坐标再点（最多 2 轮），防御列表滚动等偶发坐标漂移。
+        实测结论（决定此实现）：
+          - QQ 面板切换渲染延迟约 2~3s；点击后 1.5s 内做顶部 OCR 验证会误判
+            "未切换"→ 触发重新刷新/再点击，反而破坏列表状态（面板最终切不过去）。
+          - 点击本身是可靠的（sleep 3s 后消息区定位 3/3 成功），验证交给上层
+            消息区定位兜底：面板切对则消息区定位成功；未切则上层重试一次。
+          - 因此这里不做 OCR 验证，只在点击后等待足够时间让 QQ 完成切换。
         """
         # 先刷新（保证列表最新）
         self.refresh()
@@ -387,20 +396,10 @@ class UserList:
         user = self.find_user(contact_name)
         if user is None:
             raise ValueError(f"用户列表中没有找到与「{contact_name}」匹配的联系人")
-        # 点击激活
+        # 点击激活（refresh 已判定当前会话时内部跳过点击）
         self.active_user(user)
-        # 可靠点击闭环：等待面板切换，未切换则重新刷新坐标再点（最多 2 轮）
-        for _ in range(2):
-            # 等 QQ 响应点击（面板切换/列表滚动就位需要时间）
-            time.sleep(0.5)
-            # 顶部 OCR 验证是否已切到目标会话
-            if self._panel_switched_to(contact_name):
-                return
-            # 未切换：重新刷新（此时列表已稳定，拿最新坐标）再点一次
-            self.refresh()
-            user = self.find_user(contact_name)
-            if user is not None:
-                self.active_user(user)
+        # 等 QQ 面板切换渲染完成（实测 2~3s；已激活跳过点击时该等待无副作用）
+        time.sleep(3.0)
 
     # ── 刷新 ────────────────────────────────────────────────────
     # 刷新前要调用
@@ -409,6 +408,11 @@ class UserList:
         """图片和句柄的刷新（窗口不就绪时抛 QQWindowNotReadyError）。"""
         # 确保窗口就绪（分级校验 + 重试）
         main_window = ensure_qq_window_with_retry()
+        # 等 QQ 列表滚动稳定后再截图：ensure 的 L3 整理窗口（layout 左半）会触发
+        # QQ 异步滚动会话列表，滚动在截图后 ~1s 内才完成；若不等稳定直接截图，
+        # 拿到的坐标是"滚动前"的，点击时列表已滚动导致点偏（激活错误会话）。
+        # 窗口已稳定（L2 快照命中）时该等待无副作用，仅增加 ~1s 延迟。
+        time.sleep(1.2)
         # 识别好友列表区域（含截图）
         self.userList_region = get_userList_region_and_image(main_window)
         # 记录窗口句柄（激活用户时用）
