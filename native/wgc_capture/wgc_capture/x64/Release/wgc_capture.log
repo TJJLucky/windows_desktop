@@ -1,9 +1,0 @@
-﻿  pch.cpp
-  dllmain.cpp
-  wgc.cpp
-    正在创建库 E:\Project\agent\chip-price-consult\client-runtime\python-runtime\src\agent_runtime\native\wgc_capture\x64\Release\wgc_capture.lib 和对象 E:\Project\agent\chip-price-consult\client-runtime\python-runtime\src\agent_runtime\native\wgc_capture\x64\Release\wgc_capture.exp
-  正在生成代码
-  Previous IPDB not found, fall back to full compilation.
-  All 473 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
-  已完成代码的生成
-  wgc_capture.vcxproj -> E:\Project\agent\chip-price-consult\client-runtime\python-runtime\src\agent_runtime\native\wgc_capture\x64\Release\wgc_capture.dll

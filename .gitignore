@@ -15,3 +15,14 @@ build/
 
 # 运行时状态文件
 *.sqlite3
+
+# VS 原生工程中间产物（源码已跟踪，产物可重建）
+native/wgc_capture/.vs/
+native/wgc_capture/packages/
+native/wgc_capture/x64/
+native/wgc_capture/**/x64/
+native/*.zip
+
+# 调试输出与历史残留目录
+debug/
+composed/
