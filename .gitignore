@@ -3,7 +3,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
-# 打包构建产物（wheel / exe）
+# 打包构建产物（仅支持 exe 发行）
 dist/
 dist-exe/
 build-exe/

@@ -6,8 +6,8 @@
 解法：本文件位于包外（项目根），先 `import service`（确立包上下文），再取 `service.__main__.main`，
 这样 `service.__main__` 在真正的包命名空间里执行，相对导入全部有效。
 
-仅用于 exe 构建（见 qq-desktop-package skill 的 build_exe.py）；源码开发/安装模式仍走
-console script `price-agent-qq-service`（入口 service.__main__:main），无需本文件。
+仅用于 exe 构建（见 qq-desktop-package skill 的 build_exe.py）；项目不提供 wheel 或
+console script，源码调试可直接执行 `python -m service`。
 """
 
 # 从 service 包导入 main 函数：

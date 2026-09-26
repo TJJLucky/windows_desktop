@@ -3,7 +3,7 @@
 - 使用 rapidocr_onnxruntime（基于 ONNX Runtime，无需 PaddlePaddle），完全离线；
 - 单例模式：OCR 引擎初始化较重（加载三个模型），全进程只建一次；
 - 模型目录三级解析：环境变量 RAPIDOCR_MODEL_PATH → 安装目录 ocr-models → 包内 models 兜底，
-  覆盖"源码开发 / wheel 安装 / exe 打包"三种部署形态。
+  覆盖"源码开发 / exe 打包"两种运行形态。
 """
 
 # os：读取环境变量、拼接模型路径

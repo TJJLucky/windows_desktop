@@ -4,6 +4,8 @@
 
 `utils/` 是实现层；`service/` 是对外接口层。所有 QQ 操作统一经由 `Dispatcher` 单消费者队列执行，保证全局不并发。
 
+发行形态仅支持 PyInstaller 生成的 exe；不提供 wheel、pip console script 或其他 Python 安装形态。源码运行仅用于开发和测试。
+
 ---
 
 ## 目录结构
@@ -11,7 +13,7 @@
 ```text
 windows_desktop/
 ├── __init__.py          # 包入口说明
-├── pyproject.toml        # 独立发布与服务命令入口
+├── pyproject.toml        # 开发依赖、测试配置与 exe 构建元数据
 ├── libs/wgc_capture.dll  # WGC 原生截获库
 ├── templates/*.png       # QQ 界面模板图（区域定位依赖）
 ├── service/              # 本机 HTTP API、命令账本、服务入口
@@ -74,16 +76,16 @@ HTTP Client -> service/ -> Dispatcher -> utils/qq -> utils/vision + utils/core
 
 服务运行于当前 Windows 登录用户的交互桌面会话，不注册为 Windows Service，也不开放公网端口。它只监听由系统分配的 `127.0.0.1:0` 动态端口，启动后将 endpoint（loopback URL + pid）原子写入 endpoint 文件。服务**不做 token 鉴权**：安全边界是"仅监听本机 loopback"，调用方直接请求即可。
 
-**默认模式（最终用户，双击即用）**：不带任何参数运行（exe 双击 / `python -m service`），数据目录自动落到 `%LOCALAPPDATA%\price-agent-qq-service\`：
+**默认模式（最终用户，双击即用）**：发行版只提供 exe；不带任何参数双击运行，数据目录自动落到 `%LOCALAPPDATA%\price-agent-qq-service\`：
 
 ```powershell
-# exe
+# 发行版（唯一支持的交付方式）
 qq-desktop-service.exe
-# 源码/环境
-python -m service
 ```
 
-**显式模式（开发者/集成方）**：指定 endpoint 文件与状态目录：
+源码调试可在项目根执行 `python -m service`，该方式不属于交付/安装承诺。
+
+**显式模式（源码调试/集成排查）**：指定 endpoint 文件与状态目录：
 
 ```powershell
 conda run -n qq-desktop-service python -m service `
@@ -94,6 +96,8 @@ conda run -n qq-desktop-service python -m service `
 默认模式下若服务已在运行（endpoint 文件存在且进程存活），再次启动会提示并退出，防止双击重复拉起。启动日志会打印 endpoint 文件路径与调试页面地址。
 
 endpoint 文件记录动态 loopback URL 与本次启动的进程 pid（无 token 字段——服务不做鉴权）。调用方读取 endpoint 后直接调用接口，无需任何鉴权头。
+
+聊天记录以 `contactName` 为分区键；调用方应使用 `/v1/contacts:query` 返回的用户列表 key 原样传回。
 
 接口：
 
@@ -160,7 +164,7 @@ Content-Type: application/json
 | `window_ops.py` | QQ 进程/窗口枚举、快捷键唤起（Ctrl+Alt+X 打开/隐藏所有窗口，有进程无窗口时唤醒）、`get_main_window` / `ensure_qq_window_with_retry` |
 | `regions.py` | `RegionResult`；`get_userList_region_and_image` / `get_inputbox_region_and_image` / `get_message_box_region_and_image` / `get_input_buttom_region`；模板在 `templates/` |
 | `models.py` | 数据模型：`User`（`to_dict`）与 `Message`（text/rect/is_self） |
-| `user_list.py` | `UserList`（单例）：`find_user`（包含匹配 + 中英文规范化）、`active_user_by_name`、`get_user_list`（1s 缓存） |
+| `user_list.py` | `UserList`（单例）：霍夫圆定位用户行 → **拼图一次 OCR 识别全部昵称** → 红点检测；`find_user`（包含匹配 + 中英文规范化）、`active_user_by_name`、`get_user_list`（1s 缓存） |
 | `input.py` | `InputBox`（单例）：`send_text(contact_name, text)` 内部自动激活会话→聚焦→剪贴板粘贴→Ctrl+V→按 Enter 快捷键发送 |
 | `message.py` | `Message` + `MessageList`（单例）：`read_messages(contact_name)` 内部自动激活会话→气泡检测→**拼图一次 OCR**→按 y 边界切分文本→判断发送方 `is_self` |
 | `hotkeys.py` | QQ 全局快捷键配置表（Ctrl+Alt+X 打开/隐藏所有窗口、Enter 发送）与 `send_hotkey` 发送原语 |
@@ -198,8 +202,8 @@ messages, exc = op.read_message_list("华强电子", timeout=120.0)
 
 ## 注意事项
 
-- **非 Windows 平台**：包可以 import 成功，但实际调用会失败。
+- **非 Windows 平台**：不支持；exe 依赖 Windows 交互桌面会话。
 - **templates/**：QQ 界面区域定位的模板图，不可删除；QQ 界面改版后需更新。
-- **OCR 模型**：打包后模型放 `<install>/ocr-models`（3 个 onnx），或设置 `RAPIDOCR_MODEL_PATH` 环境变量；包内 models 打包时会被清空。
+- **OCR 模型**：exe 打包后模型放 `<install>/ocr-models`（3 个 onnx），或设置 `RAPIDOCR_MODEL_PATH` 环境变量；包内 models 打包时会被清空。
 - **单例直调**：`UserList`/`InputBox`/`MessageList` 可在本地调试时直接使用，但正式流程必须经 `Dispatcher`，避免并发操作 QQ。
 - **补充资源**：`libs/wgc_capture.dll` 原生截获库；`debug/` 调试图片可随时清理。

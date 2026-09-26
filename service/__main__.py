@@ -207,7 +207,7 @@ def _delete_owned_endpoint(path: Path) -> None:
         path.unlink(missing_ok=True)
 
 
-# 模块被直接执行（python -m service / exe 入口）时调用 main()；
+# 模块被直接执行（源码调试 python -m service / 发行版 exe 入口）时调用 main()；
 # 被其他模块 import 时（如 entry.py）不会触发，避免副作用
 if __name__ == "__main__":
     main()
