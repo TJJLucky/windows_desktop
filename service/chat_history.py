@@ -1,118 +1,240 @@
-"""聊天记录持久化：把读到的（in）与发出的（out）消息写入本地 SQLite。
+"""聊天记录持久化：按用户列表名字保存，并基于可见窗口差异追加消息。
 
-与 command_ledger 同约定：标准库 sqlite3、短连接、threading.Lock 串行化。
-默认文件位于 <state-dir>/qq-chat-history.sqlite3（独立文件，避免账本锁竞争）。
-
-设计要点：
-- 单表 messages，冗余存储 contact_name（不建联系人外键表）：OCR 识别出的名字可能漂移/改名，
-  冗余字段保证记录不因"联系人改名"而断链；
-- 近窗查重：60 秒内同联系人、同方向、同文本的重复消息跳过（视觉重复读取会产生完全相同的条目）；
-- seq 按联系人递增：同一联系人的消息有稳定顺序，查询按 seq 升序即时间顺序；
-- fingerprint：联系人|方向|文本 的 sha256，作为重复判定的稳定指纹。
+设计约束：
+- contact_name 使用用户列表中的原始名字（UserList.users 的 key / User.name），不做归一化。
+- QQ 只能读取当前可见消息窗口；每次读取按“上一次可见窗口”和“本次可见窗口”的差异追加，
+  不再使用“同联系人同方向同文本 + 60 秒”的内容去重。
+- 发送成功的消息先写入 pending_outbound；下次视觉读取看到它时，再关联 command_id 并写入
+  messages，保证最终消息顺序按 QQ 可见顺序排列。
 """
 
-# 延迟求值类型注解
 from __future__ import annotations
 
-# hashlib：计算消息指纹（sha256）
 import hashlib
-# sqlite3：标准库 SQLite 驱动（短连接模式）
+import json
 import sqlite3
-# threading：进程内互斥锁，串行化并发写入
 import threading
-# closing：with 块结束自动关闭连接
 from contextlib import closing
-# Path：数据库文件路径
 from pathlib import Path
+from typing import Any
 
-# 去重窗口：60 秒内同联系人同方向同文本视为重复（视觉轮询会产生重复读取）
-_DEDUP_WINDOW_SECONDS = 60
 
-# 建表 SQL：messages 单表 + 两个查询索引
+_PENDING_OUTBOUND_TTL_SECONDS = 24 * 60 * 60
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,          -- 自增主键
-    contact_name TEXT    NOT NULL,                            -- 联系人名（冗余存储，见模块 docstring）
-    direction    TEXT    NOT NULL CHECK (direction IN ('in', 'out')),  -- 消息方向：in 对方发来 / out 我方发出
-    text         TEXT    NOT NULL,                            -- 消息文本
-    seq          INTEGER NOT NULL,                            -- 该联系人维度下的递增序号
-    fingerprint  TEXT    NOT NULL,                            -- 去重指纹：sha256(联系人|方向|文本)
-    command_id   TEXT,                                        -- 我方经命令发送时关联的幂等键（可空）
-    created_at   TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),  -- 入库时间（本地时间）
-    CONSTRAINT uq_contact_seq UNIQUE (contact_name, seq)      -- 联系人 + 序号唯一，防重复插入
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    contact_name TEXT    NOT NULL,
+    direction    TEXT    NOT NULL CHECK (direction IN ('in', 'out')),
+    text         TEXT    NOT NULL,
+    seq          INTEGER NOT NULL,
+    fingerprint  TEXT    NOT NULL,
+    command_id   TEXT,
+    created_at   TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+    CONSTRAINT uq_contact_seq UNIQUE (contact_name, seq)
 );
--- 按联系人+时间查询（会话列表）的索引
+
 CREATE INDEX IF NOT EXISTS idx_messages_contact_time
     ON messages (contact_name, created_at);
--- 按联系人+方向+文本+时间查询（查重）的索引
-CREATE INDEX IF NOT EXISTS idx_messages_contact_text_time
-    ON messages (contact_name, direction, text, created_at);
+
+CREATE TABLE IF NOT EXISTS contact_snapshot (
+    contact_name TEXT PRIMARY KEY,
+    messages_json TEXT NOT NULL,
+    updated_at   TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS pending_outbound (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    command_id   TEXT    NOT NULL UNIQUE,
+    contact_name TEXT    NOT NULL,
+    text         TEXT    NOT NULL,
+    created_at   TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_outbound_contact
+    ON pending_outbound (contact_name, text);
 """
 
 
 def _fingerprint(contact_name: str, direction: str, text: str) -> str:
-    """计算消息指纹：联系人|方向|文本 拼接后 sha256 十六进制。"""
+    """保存稳定指纹，保留给调试和后续迁移使用；当前不用于内容去重。"""
     return hashlib.sha256(f"{contact_name}|{direction}|{text}".encode("utf-8")).hexdigest()
 
 
-class ChatHistoryStore:
-    """QQ 聊天记录存储（单文件 SQLite，短连接 + 锁串行化）。"""
+def _normalise_visible(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """把 service/facade 的可见消息转换成快照片段。"""
+    result: list[dict[str, str]] = []
+    for item in messages:
+        direction = "out" if item.get("isSelf") else "in"
+        text = str(item.get("text") or "")
+        result.append({"direction": direction, "text": text})
+    return result
 
-    def __init__(self, path: Path, dedup_window: int = _DEDUP_WINDOW_SECONDS) -> None:
-        """打开（必要时创建）聊天记录库，并建表。"""
-        # 数据库文件路径
+def _message_key(message: dict[str, str]) -> tuple[str, str]:
+    """窗口对齐使用的轻量身份：方向和文本。"""
+    return message["direction"], message["text"].strip()
+
+
+def _suffix_prefix_overlap(previous: list[dict[str, str]], current: list[dict[str, str]]) -> int:
+    """返回 previous 尾部与 current 头部的最长连续重叠长度。"""
+    limit = min(len(previous), len(current))
+    for size in range(limit, 0, -1):
+        if previous[len(previous) - size:] == current[:size]:
+            return size
+    return 0
+
+
+def _longest_common_subsequence_overlap(previous: list[dict[str, str]], current: list[dict[str, str]]) -> int:
+    """返回 current 中最后一个已见过消息的下一个下标。"""
+    if not previous or not current:
+        return 0
+    overlap = _suffix_prefix_overlap(previous, current)
+    if overlap:
+        return overlap
+    dp = [[0] * (len(current) + 1) for _ in range(len(previous) + 1)]
+    for i in range(1, len(previous) + 1):
+        prev_key = _message_key(previous[i - 1])
+        for j in range(1, len(current) + 1):
+            if prev_key == _message_key(current[j - 1]):
+                dp[i][j] = dp[i - 1][j - 1] + 1
+            else:
+                dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
+    i, j = len(previous), len(current)
+    last_current_match = -1
+    while i > 0 and j > 0:
+        if _message_key(previous[i - 1]) == _message_key(current[j - 1]):
+            last_current_match = max(last_current_match, j - 1)
+            i -= 1
+            j -= 1
+        elif dp[i - 1][j] >= dp[i][j - 1]:
+            i -= 1
+        else:
+            j -= 1
+    return last_current_match + 1
+
+
+def _decode_snapshot(value: str | None) -> list[dict[str, str]]:
+    """解析快照 JSON；损坏数据按空快照处理。"""
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    result: list[dict[str, str]] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        direction = item.get("direction")
+        if direction not in ("in", "out"):
+            continue
+        result.append({"direction": direction, "text": str(item.get("text") or "")})
+    return result
+
+class ChatHistoryStore:
+    """QQ 聊天记录存储，按联系人名字维护顺序和可见窗口状态。"""
+
+    def __init__(self, path: Path) -> None:
         self._path = path
-        # 去重窗口秒数（测试可注入更短窗口验证去重）
-        self._dedup_window = dedup_window
-        # 进程内互斥锁：sqlite 短连接不防跨线程竞争，必须应用层串行化
         self._lock = threading.Lock()
-        # 确保目录存在（首次运行建目录）
         path.parent.mkdir(parents=True, exist_ok=True)
-        # 建表 + 启用 WAL（写不阻塞读，读不阻塞写，适合"高频追加 + 偶发查询"）
         with closing(self._connect()) as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(_SCHEMA)
 
-    def append(self, contact_name: str, direction: str, text: str, command_id: str | None = None) -> bool:
-        """写一条消息：近窗查重 → seq 递增 → 插入。
-
-        :return: True=已写入；False=去重窗口内同联系人同方向同文本（重复读取）已跳过
-        """
-        # 方向校验：只允许 in/out，拒绝脏数据入库
-        if direction not in ("in", "out"):
-            raise ValueError(f"direction must be 'in' or 'out', got {direction!r}")
-        # 文本归一化：None 当空串处理（防御 OCR 空结果）
+    def mark_outbound(self, contact_name: str, text: str, command_id: str) -> None:
+        """记录一条已发送但尚未在可见窗口确认的消息。"""
+        contact_name = str(contact_name or "")
+        if not contact_name:
+            raise ValueError("contact_name must not be empty")
         text = str(text or "")
+        command_id = str(command_id or "").strip()
+        if not command_id:
+            raise ValueError("command_id must not be empty")
+
         with self._lock, closing(self._connect()) as connection, connection:
-            # 近窗查重：同联系人、同方向、同文本，且入库时间在窗口内 → 视为重复读取
-            duplicate = connection.execute(
-                "SELECT id FROM messages"
-                " WHERE contact_name = ? AND direction = ? AND text = ?"
-                " AND created_at > datetime('now', 'localtime', ?)"
-                " ORDER BY id DESC LIMIT 1",
-                (contact_name, direction, text, f"-{self._dedup_window} seconds"),
+            connection.execute(
+                "DELETE FROM pending_outbound"
+                " WHERE created_at <= datetime('now', 'localtime', ?)",
+                (f"-{_PENDING_OUTBOUND_TTL_SECONDS} seconds",),
+            )
+            connection.execute(
+                "INSERT INTO pending_outbound(command_id, contact_name, text)"
+                " VALUES (?, ?, ?)"
+                " ON CONFLICT(command_id) DO UPDATE SET"
+                " contact_name = excluded.contact_name,"
+                " text = excluded.text,"
+                " created_at = datetime('now', 'localtime')",
+                (command_id, contact_name, text),
+            )
+
+    def append_visible(self, contact_name: str, messages: list[dict[str, Any]]) -> int:
+        """用本次可见消息窗口追加聊天记录，返回实际新增条数。"""
+        contact_name = str(contact_name or "")
+        if not contact_name:
+            raise ValueError("contact_name must not be empty")
+
+        current = _normalise_visible(messages)
+        if not current:
+            # 空 OCR 不覆盖已有快照，避免短暂识别失败后把历史重新写一遍。
+            return 0
+
+        with self._lock, closing(self._connect()) as connection, connection:
+            row = connection.execute(
+                "SELECT messages_json FROM contact_snapshot WHERE contact_name = ?",
+                (contact_name,),
             ).fetchone()
-            if duplicate is not None:
-                # 命中重复：不写入，返回 False 告知调用方被去重
-                return False
-            # 计算该联系人下一个序号：当前最大 seq + 1（联系人维度连续递增）
-            seq = connection.execute(
+            previous = _decode_snapshot(row[0]) if row else self._tail_history(connection, contact_name)
+            history_tail = self._tail_history(connection, contact_name)
+
+            # 可见窗口可能被用户滚动到历史位置；同时与“上次窗口”和“历史尾部”对齐，
+            # 避免把已经存在的旧消息重新追加到历史末尾。
+            overlap = max(
+                _longest_common_subsequence_overlap(previous, current),
+                _longest_common_subsequence_overlap(history_tail, current),
+            )
+            new_messages = current[overlap:]
+
+            next_seq = connection.execute(
                 "SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE contact_name = ?",
                 (contact_name,),
             ).fetchone()[0]
-            # 插入记录（指纹由调用方上下文计算）
-            connection.execute(
-                "INSERT INTO messages(contact_name, direction, text, seq, fingerprint, command_id)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                (contact_name, direction, text, seq,
-                 _fingerprint(contact_name, direction, text), command_id),
-            )
-        return True
 
+            for item in new_messages:
+                direction = item["direction"]
+                text = item["text"]
+                command_id = None
+                if direction == "out":
+                    command_id = self._consume_pending(connection, contact_name, text)
+                connection.execute(
+                    "INSERT INTO messages(contact_name, direction, text, seq, fingerprint, command_id)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        contact_name,
+                        direction,
+                        text,
+                        next_seq,
+                        _fingerprint(contact_name, direction, text),
+                        command_id,
+                    ),
+                )
+                next_seq += 1
+
+            snapshot_json = json.dumps(current, ensure_ascii=False, separators=(",", ":"))
+            connection.execute(
+                "INSERT INTO contact_snapshot(contact_name, messages_json)"
+                " VALUES (?, ?)"
+                " ON CONFLICT(contact_name) DO UPDATE SET"
+                " messages_json = excluded.messages_json,"
+                " updated_at = datetime('now', 'localtime')",
+                (contact_name, snapshot_json),
+            )
+            return len(new_messages)
     def list_conversations(self, limit: int = 50) -> list[dict]:
         """会话列表：每个联系人最后一条时间、总条数、最后一条文本（按最后时间倒序）。"""
         with self._lock, closing(self._connect()) as connection:
-            # 子查询取每个联系人的最后一条文本；GROUP BY 按联系人聚合
             rows = connection.execute(
                 "SELECT m1.contact_name,"
                 "       MAX(m1.created_at) AS last_time,"
@@ -126,29 +248,62 @@ class ChatHistoryStore:
                 " LIMIT ?",
                 (limit,),
             ).fetchall()
-        # 行 → 字典（蛇形转 JSON 键名）
         return [
-            {"contactName": r[0], "lastTime": r[1], "total": r[2], "lastText": r[3]}
-            for r in rows
+            {"contactName": row[0], "lastTime": row[1], "total": row[2], "lastText": row[3]}
+            for row in rows
         ]
 
     def get_history(self, contact_name: str, limit: int = 100, offset: int = 0) -> list[dict]:
-        """单联系人历史消息（按会话序号升序分页）。"""
+        """返回该联系人最近的一页历史，再按 seq 升序输出。"""
         with self._lock, closing(self._connect()) as connection:
-            # 按 seq 升序取一页（seq 即该联系人的时间顺序）
             rows = connection.execute(
                 "SELECT id, direction, text, seq, command_id, created_at"
                 " FROM messages WHERE contact_name = ?"
-                " ORDER BY seq ASC LIMIT ? OFFSET ?",
+                " ORDER BY seq DESC LIMIT ? OFFSET ?",
                 (contact_name, limit, offset),
             ).fetchall()
-        # 行 → 契约字典（commandId / createdAt 为对外键名）
+            rows = list(reversed(rows))
         return [
-            {"id": r[0], "direction": r[1], "text": r[2], "seq": r[3],
-             "commandId": r[4], "createdAt": r[5]}
-            for r in rows
+            {
+                "id": row[0],
+                "direction": row[1],
+                "text": row[2],
+                "seq": row[3],
+                "commandId": row[4],
+                "createdAt": row[5],
+            }
+            for row in rows
         ]
 
+    def _tail_history(
+        self,
+        connection: sqlite3.Connection,
+        contact_name: str,
+        limit: int = 100,
+    ) -> list[dict[str, str]]:
+        """首次使用快照时，从已有历史尾部恢复上一次可见窗口，兼容旧数据库。"""
+        rows = connection.execute(
+            "SELECT direction, text FROM messages"
+            " WHERE contact_name = ? ORDER BY seq DESC LIMIT ?",
+            (contact_name, limit),
+        ).fetchall()
+        return [{"direction": row[0], "text": row[1]} for row in reversed(rows)]
+
+    @staticmethod
+    def _consume_pending(connection: sqlite3.Connection, contact_name: str, text: str) -> str | None:
+        """把一条可见的出站消息关联到最早的待确认发送命令。"""
+        row = connection.execute(
+            "SELECT command_id FROM pending_outbound"
+            " WHERE contact_name = ? AND text = ? ORDER BY id ASC LIMIT 1",
+            (contact_name, text),
+        ).fetchone()
+        if row is None:
+            return None
+        command_id = row[0]
+        connection.execute("DELETE FROM pending_outbound WHERE command_id = ?", (command_id,))
+        return command_id
+
     def _connect(self) -> sqlite3.Connection:
-        """短连接工厂：每次操作新建连接，用完即关。"""
-        return sqlite3.connect(self._path)
+        connection = sqlite3.connect(self._path, timeout=5.0)
+        connection.execute("PRAGMA busy_timeout = 5000")
+        return connection

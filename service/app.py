@@ -125,7 +125,7 @@ def create_app(
         # 发送成功：账本落 SUCCEEDED 终态
         ledger.resolve(request.command_id, "SUCCEEDED", result)
         # 发出的消息自动落库为 out（我方发出），关联 commandId 便于追溯；失败仅告警
-        _try_record(chat_history, request.contact_name, "out", request.text, request.command_id)
+        _try_mark_outbound(chat_history, request.contact_name, request.text, request.command_id)
         # 返回 SUCCEEDED 状态 + 实际执行结果
         return CommandResponse(commandId=request.command_id, status="SUCCEEDED", result=result)
 
@@ -166,24 +166,21 @@ def create_app(
 
 
 def _record_payload(chat_history: ChatHistoryStore, contact_name: str, payload: dict) -> None:
-    """把一次视觉读取结果（可见消息列表）逐条写入聊天记录存储。"""
-    # 遍历读取到的每一条消息
-    for item in payload["messages"]:
-        # 方向判定：isSelf=True 表示我方发出(out)，否则是对方发来(in)；逐条落库
-        _try_record(chat_history, contact_name, "out" if item["isSelf"] else "in", item["text"])
+    """把一次视觉读取结果作为可见窗口差异写入聊天记录存储。"""
+    try:
+        chat_history.append_visible(contact_name, payload["messages"])
+    except Exception as exc:
+        print(f"[WARN] 聊天记录写入失败: {exc}")
 
 
-def _try_record(
+def _try_mark_outbound(
     chat_history: ChatHistoryStore,
     contact_name: str,
-    direction: str,
     text: str,
-    command_id: str | None = None,
+    command_id: str,
 ) -> None:
-    """写入一条聊天记录；写入失败仅打印告警，绝不阻断主流程（存储是增强能力，不是核心链路）。"""
+    """登记已发送消息；写入失败仅打印告警，不阻断主流程。"""
     try:
-        # 调用存储追加一条消息（内部含 60s 窗口去重、seq 递增、指纹等逻辑）
-        chat_history.append(contact_name, direction, text, command_id)
+        chat_history.mark_outbound(contact_name, text, command_id)
     except Exception as exc:
-        # 任何存储异常（磁盘满、锁冲突等）都降级为告警，主流程（读取/发送）继续
         print(f"[WARN] 聊天记录写入失败: {exc}")
