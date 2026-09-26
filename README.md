@@ -2,7 +2,7 @@
 
 对 Windows 桌面 GUI（以 QQ 为主）进行自动化操作的集成包：窗口管理、后台截图（WGC）、图像识别（模板匹配 + OCR）、鼠标键盘模拟，以及 QQ 用户列表/输入框/消息区的识别与操作。
 
-`utils/` 是实现层；`service/` 是对外接口层。所有 QQ 操作统一经由 `QQAtomicOperator` 单消费者队列执行，保证全局不并发。
+`utils/` 是实现层；`service/` 是对外接口层。所有 QQ 操作统一经由 `Dispatcher` 单消费者队列执行，保证全局不并发。
 
 ---
 
@@ -36,7 +36,7 @@ core  →  vision  →  qq
 外部调用路径固定为：
 
 ```text
-HTTP Client -> service/ -> QQAtomicOperator -> utils/qq -> utils/vision + utils/core
+HTTP Client -> service/ -> Dispatcher -> utils/qq -> utils/vision + utils/core
 ```
 
 调用方不得越过 `service/` 直接 import `utils/`。这样 WGC、OCR、模板与窗口操作可以继续演进，而接口契约保持稳定。
@@ -64,7 +64,7 @@ HTTP Client -> service/ -> QQAtomicOperator -> utils/qq -> utils/vision + utils/
 
 ### 单消费者
 
-- `QQAtomicOperator` 是全局唯一的 QQ 消费入口（单例 + daemon worker + 队列）。
+- `Dispatcher` 是全局唯一的 QQ 消费入口（单例 + daemon worker + 队列）。
 - skill 工具全部入队串行，确保同一时刻只有一个操作在控制 QQ。
 - 阻塞 API 统一返回 `(result, exc)`；超时仅表示未等到结果，不保证任务未执行。
 
@@ -130,7 +130,8 @@ Content-Type: application/json
 | --- | --- |
 | `screenshot.py` | `ensure_dpi_aware()` / `getDPI()` / `calc_buf_size()` / `WGCCapture`（后台截图单例） |
 | `mouse.py` | `random_point` / `random_click` / `click_at` / `drag`（`SetCursorPos` + `mouse_event`） |
-| `windows.py` | 窗口枚举、`timer` 计时器、`WindowCaptureCtx`（无焦点置顶上浮）、`set_window_z_pos`、托盘操作、窗口移动/最大化 |
+| `window.py` | `WindowCaptureCtx`（无焦点置顶上浮）、`set_window_z_pos`、窗口移动/最大化/贴边检测 |
+| `timing.py` | `timer` 装饰器（函数耗时输出） |
 
 ### `utils/vision`
 
@@ -138,28 +139,30 @@ Content-Type: application/json
 | --- | --- |
 | `matcher.py` | `find_template`（TM_CCOEFF_NORMED） / `draw_box` / `crop_image` / `crop_region` |
 | `ocr.py` | `OCREngine` 单例（RapidOCR + ONNX Runtime）；模型路径三级：`RAPIDOCR_MODEL_PATH` → `<install>/ocr-models` → 包内 models |
+| `compose.py` | 视觉编排占位（气泡拼图 OCR、列表归一化等性能优化后续实现） |
 
 ### `utils/qq`
 
 | 文件 | 内容 |
 | --- | --- |
-| `composites.py` | QQ 窗口唤起（托盘图标优先、视觉模板兜底）、`get_main_window` / `ensure_qq_window_with_retry` |
+| `window_ops.py` | QQ 进程/窗口枚举、托盘唤起（非视觉优先 + 视觉兜底）、`get_main_window` / `ensure_qq_window_with_retry` |
 | `regions.py` | `RegionResult`；`get_userList_region_and_image` / `get_inputbox_region_and_image` / `get_message_box_region_and_image` / `get_input_buttom_region`；模板在 `templates/` |
-| `userList.py` | `QQUser`（`to_dict`） + `UserList`（单例）：`find_user`（包含匹配 + 中英文规范化）、`active_user_by_name`、`get_user_list`（1s 缓存） |
+| `models.py` | 数据模型：`User`（`to_dict`）与 `Message`（text/rect/is_self） |
+| `user_list.py` | `UserList`（单例）：`find_user`（包含匹配 + 中英文规范化）、`active_user_by_name`、`get_user_list`（1s 缓存） |
 | `input.py` | `InputBox`（单例）：聚焦→剪贴板粘贴→Ctrl+V→点击发送按钮中心 |
 | `message.py` | `Message` + `MessageList`（单例）：气泡检测→OCR→判断发送方 `is_self` |
-| `QQAtomicOperator.py` | 单消费者任务队列（唯一入口）：`get_contact_list` / `send_message` / `read_message_list` |
+| `dispatcher.py` | `Dispatcher` 单消费者任务队列（唯一入口）：`get_contact_list` / `send_message` / `read_message_list` |
 
 ---
 
 ## 使用示例
 
-正式流程统一通过 `QQAtomicOperator` 入队（QQ 需已登录，窗口会自动置前）：
+正式流程统一通过 `Dispatcher` 入队（QQ 需已登录，窗口会自动置前）：
 
 ```python
-from agent_runtime.integrations.windows_desktop.utils.qq.QQAtomicOperator import QQAtomicOperator
+from utils.qq.dispatcher import Dispatcher
 
-op = QQAtomicOperator()
+op = Dispatcher()
 
 contacts, exc = op.get_contact_list(timeout=60.0)
 if exc is not None:
@@ -185,5 +188,5 @@ messages, exc = op.read_message_list("华强电子", timeout=120.0)
 - **非 Windows 平台**：包可以 import 成功，但实际调用会失败。
 - **templates/**：QQ 界面区域定位的模板图，不可删除；QQ 界面改版后需更新。
 - **OCR 模型**：打包后模型放 `<install>/ocr-models`（3 个 onnx），或设置 `RAPIDOCR_MODEL_PATH` 环境变量；包内 models 打包时会被清空。
-- **单例直调**：`UserList`/`InputBox`/`MessageList` 可在本地调试时直接使用，但正式流程必须经 `QQAtomicOperator`，避免并发操作 QQ。
+- **单例直调**：`UserList`/`InputBox`/`MessageList` 可在本地调试时直接使用，但正式流程必须经 `Dispatcher`，避免并发操作 QQ。
 - **补充资源**：`libs/wgc_capture.dll` 原生截获库；`debug/` 调试图片可随时清理。
