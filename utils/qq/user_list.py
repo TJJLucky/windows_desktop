@@ -299,41 +299,39 @@ class UserList:
         # ① refresh 已判定为当前会话 → 无需点击
         if user.active:
             return
-        # ② 行背景色兜底：仅当顶部 OCR 没有识别到任何会话名时，才用"行背景灰=已激活"
-        #    跳过点击（顶部 OCR 漏判场景）。顶部有明确会话名（如右侧面板是 QQ 游戏中心）时
-        #    不走此兜底——此时列表行高亮可能与右侧面板不一致，跳过点击会导致面板切不过去。
-        if user.avatar is not None and not self.last_active_name:
-            row_img = self.get_user_image(user.rect, user.avatar)  # 排除头像，只留行背景+文字
-            if UserList.is_active_bg(row_img):
-                return
+        # ② 不再用"行背景灰=已激活"兜底跳过点击：该判定在空白态/面板为游戏中心时
+        #    会误判（列表行渲染成灰但右侧面板并非该会话），误跳过会导致面板切不过去。
+        #    是否已激活一律以顶部 OCR（user.active）为准；宁可重复点击已激活行（无害），
+        #    也不可跳过未激活行的点击（激活失败）。
         # 未 refresh 过则无法点击
         if self.userList_region is None or self.hwnd == 0:
             raise RuntimeError("需要先执行refresh()")
-        # 置顶窗口（不抢焦点）确保窗口在屏内可点击
-        with WindowCaptureCtx(self.hwnd):
-            # 屏幕坐标 = 列表区域屏幕原点 + 行内相对坐标
-            offset_left = self.userList_region.screen_region["left"]
-            offset_top = self.userList_region.screen_region["top"]
-            rect_left, rect_top, rect_right, rect_bottom = user.rect
-            # 行垂直中心（屏幕坐标）：y 锁定行中线，彻底避开上下相邻行的边界（点错人）
-            center_y = offset_top + (rect_top + rect_bottom) // 2
-            # 昵称区典型宽度上限（物理像素）：QQ 会话列表昵称紧贴头像右侧，
-            # 通常 120px 内已覆盖；限制点击宽度避免随机点落到行右侧的时间/红点/滚动条等"行外"区域
-            nickname_band = 120
-            # 头像信息有效时：点击区收窄到"头像右边缘 +5px"起的昵称区，
-            # 同时宽度不超过昵称带（120px），避开头像本身与行右侧的无响应区
-            avatar_cx, _, avatar_r = user.avatar
-            if avatar_r > 0:
-                # 昵称区左缘（屏幕坐标）
-                click_left = offset_left + avatar_cx + avatar_r + 5
-                # 昵称区宽度 = min(整行剩余宽, 昵称带上限)，至少 20px（太窄则退化）
-                click_width = max(20, min(rect_right - (avatar_cx + avatar_r + 5) - 2, nickname_band))
-            else:
-                # 头像信息缺失（防御）→ 退化为整行点击（旧行为）
-                click_left = offset_left + rect_left
-                click_width = rect_right - rect_left
-            # 窄带随机点击：x 在文字带内随机（模拟人工），y 只在中线 ±3px 内随机（绝不越行）
-            random_click(click_left, center_y - 3, click_width, 6)
+        # 不置顶直接点击：WindowCaptureCtx 置顶（TOPMOST）会触发 QQ 重绘/列表滚动，
+        # 使截图坐标与点击时刻不一致（点偏导致激活失败）。窗口由外部保证在屏内可点击
+        # （layout 左半铺满工作区），直接以截图坐标点击最可靠。
+        # 屏幕坐标 = 列表区域屏幕原点 + 行内相对坐标
+        offset_left = self.userList_region.screen_region["left"]
+        offset_top = self.userList_region.screen_region["top"]
+        rect_left, rect_top, rect_right, rect_bottom = user.rect
+        # 行垂直中心（屏幕坐标）：y 锁定行中线，彻底避开上下相邻行的边界（点错人）
+        center_y = offset_top + (rect_top + rect_bottom) // 2
+        # 昵称区典型宽度上限（物理像素）：QQ 会话列表昵称紧贴头像右侧，
+        # 通常 120px 内已覆盖；限制点击宽度避免随机点落到行右侧的时间/红点/滚动条等"行外"区域
+        nickname_band = 120
+        # 头像信息有效时：点击区收窄到"头像右边缘 +5px"起的昵称区，
+        # 同时宽度不超过昵称带（120px），避开头像本身与行右侧的无响应区
+        avatar_cx, _, avatar_r = user.avatar
+        if avatar_r > 0:
+            # 昵称区左缘（屏幕坐标）
+            click_left = offset_left + avatar_cx + avatar_r + 5
+            # 昵称区宽度 = min(整行剩余宽, 昵称带上限)，至少 20px（太窄则退化）
+            click_width = max(20, min(rect_right - (avatar_cx + avatar_r + 5) - 2, nickname_band))
+        else:
+            # 头像信息缺失（防御）→ 退化为整行点击（旧行为）
+            click_left = offset_left + rect_left
+            click_width = rect_right - rect_left
+        # 窄带随机点击：x 在文字带内随机（模拟人工），y 只在中线 ±3px 内随机（绝不越行）
+        random_click(click_left, center_y - 3, click_width, 6)
 
     def find_user(self, contact_name: str) -> "User | None":
         """按名字查找用户：直接使用包含匹配（OCR 名字可能截断/多符号），精确匹配天然被包含覆盖。
