@@ -1,10 +1,11 @@
-"""QQ 业务组合函数：窗口截图、激活、托盘图标匹配、QQ 进程/窗口枚举。
+"""QQ 业务组合函数：窗口截图、快捷键唤起、QQ 进程/窗口枚举。
 
 依赖 core + vision 子包，处于依赖链顶端，全部 import 均为单向向下。
 
 职责分层：
 - 进程/窗口枚举：找到 QQ 的所有进程与可见窗口；
-- 托盘唤起：QQ 缩到托盘时，先展开托盘溢出区，再点 QQ 图标唤起（非视觉优先 + 视觉兜底）；
+- 快捷键唤起：有进程但无窗口时，按 Ctrl+Alt+X（打开/隐藏 QQ 所有窗口）唤起主面板，
+  取代旧的托盘图标点击方案（已移除）；
 - 窗口就绪分级校验（L1/L2/L3）：保证"每次操作前窗口可用"，且用户未动窗口时跳过昂贵校验。
 """
 
@@ -23,19 +24,17 @@ import pygetwindow as gw
 import win32gui
 # win32process：取窗口所属进程 PID
 import win32process
-# pywinauto Desktop：UIA 树访问（托盘/任务栏控件操作）
-from pywinauto import Desktop
-# PIL.Image / ImageGrab：托盘溢出窗口用前台截图（受保护窗口 WGC 捕获不到）
-from PIL import Image, ImageGrab
+# PIL.Image：模式切换按钮模板加载
+from PIL import Image
 
 # WGC 截图单例 / DPI 查询
 from ..core.screenshot import WGCCapture, getDPI
 # 窗口形态整理（高度铺满 + 宽 50% + 靠左）/ 层级控制
 from ..core.window import layout_window_left_half, set_window_z_pos
-# 随机点击（视觉兜底点托盘图标）
-from ..core.mouse import random_click
-# 模板匹配（托盘图标/模式切换按钮）
+# 模板匹配（模式切换按钮）
 from ..vision.matcher import find_template
+# 快捷键发送与配置表（唤醒/打开最新未读）
+from .hotkeys import send_hotkey, TOGGLE_QQ_WINDOWS, OPEN_LATEST_UNREAD_WINDOW
 
 # 模板目录：本文件在 utils/qq/，上溯三级到项目根再进 templates/
 _TEMPLATE_DIR = os.path.join(Path(__file__).parent.parent.parent, "templates")
@@ -84,112 +83,6 @@ def get_qq_windows():
     return qq_windows
 
 
-def close_all_qq_windows():
-    """关闭所有 QQ 可见窗口（唤起前清场用）"""
-    windows = get_qq_windows()  # 获取所有 QQ 窗口
-    if not windows:
-        # 无窗口可关
-        print("[INFO] 没有 QQ 窗口需要关闭")
-        return
-
-    # 逐个发送 WM_CLOSE 关闭
-    for win in windows:
-        title = win.title.strip()  # 窗口标题
-        try:
-            # WM_CLOSE(0x0010)：向窗口发送关闭消息
-            win32gui.PostMessage(win._hWnd, 0x0010, 0, 0)  # WM_CLOSE 关闭窗口
-            print(f"[OK] 已关闭: 「{title}」")
-        except:
-            # 个别窗口拒绝关闭/句柄失效，不致命
-            print(f"[WARN] 关闭失败: 「{title}」")
-
-
-def clickExpandBtn():
-    """点击任务栏托盘溢出区的展开按钮（把隐藏的图标展开出来）"""
-    # UIA 访问桌面
-    desktop_uia = Desktop(backend="uia")
-    # 任务栏的顶层窗口
-    shell_tray = desktop_uia.window(class_name="Shell_TrayWnd")
-    # 右下角托盘容器
-    tray_notify = shell_tray.child_window(class_name="TrayNotifyWnd")  # 右下角托盘容器
-
-    # 展开按钮在不同语言/版本下的文本
-    EXPAND_BTN_TEXTS = {"通知 V 形", "显示隐藏的图标", "Show hidden icons"}
-    # 遍历托盘内所有按钮
-    for ctrl in tray_notify.descendants(control_type="Button"):
-        txt = ctrl.window_text().strip()  # 按钮文本
-        cls = ctrl.class_name()
-        # 类名是 Button 且文本命中展开按钮 → 点击
-        if cls == "Button" and txt in EXPAND_BTN_TEXTS:  # 匹配展开按钮
-            ctrl.click_input()  # 点击
-            print(f"[OK] 已点击托盘展开按钮")
-            # 等溢出窗口弹出动画
-            time.sleep(0.3)
-            return True
-    print("[WARN] 未找到托盘展开按钮")
-    return False
-
-
-def click_qq_tray_icon(qq_number=""):
-    """在托盘溢出窗口中查找 QQ 图标并点击唤起；可选按 QQ 号筛选（多开场景）。"""
-    # UIA 桌面根
-    desktop_uia = Desktop(backend="uia")  # UIA 桌面
-    # 托盘溢出窗口
-    overflow = desktop_uia.window(class_name="NotifyIconOverflowWindow")  # 溢出窗口
-    # 溢出窗口还没出现 → 先点展开按钮
-    if not overflow.exists():
-        clickExpandBtn()
-    # 图标工具栏
-    toolbar = overflow.child_window(class_name="ToolbarWindow32")  # 图标工具栏
-    # 遍历每个托盘图标
-    for btn in toolbar.children():
-        btn_text = btn.window_text().strip()  # 图标提示文本
-
-        # 匹配 QQ 且排除 QQ音乐：文本含 QQ、含指定号码（若给）、不含"音乐"
-        if "QQ" in btn_text and qq_number in btn_text and "音乐" not in btn_text:  # 匹配 QQ，排除 QQ音乐
-            btn.click_input()  # 点击唤醒
-            print(f"[OK] 已点击 QQ 托盘图标: 「{btn_text}」")
-            # 等 QQ 窗口弹出
-            time.sleep(0.5)
-            return True
-    print('-' * 20)
-    print("[FAIL] 未在托盘溢出区找到 QQ 图标")
-    return False
-
-
-def get_main_qq_windows():
-    """通过关闭QQ窗口,再通过后台的图标打开,从而获得QQ唯一窗口"""
-    close_all_qq_windows()
-    click_qq_tray_icon()
-    return get_qq_windows()[0]
-
-
-def get_overflow():
-    """截取任务栏托盘溢出窗口的屏幕截图 → PIL.Image
-
-    用 ImageGrab 而非 WGC —— 系统托盘窗口受保护，WGC 无法捕获。
-    """
-    # 等弹出动画完成
-    time.sleep(0.3)  # 等弹出动画完成
-
-    # UIA 桌面根
-    desktop_uia = Desktop(backend="uia")  # UIA 桌面根
-    # 溢出窗口
-    overflow = desktop_uia.window(
-        class_name="NotifyIconOverflowWindow")  # 溢出窗口类名
-    # 没展开成功 → 无法截图
-    if not overflow.exists():  # 没展开成功
-        return None
-
-    # 取窗口屏幕矩形
-    rect = overflow.rectangle()  # pywinauto 矩形对象
-    # 转为 (左, 上, 右, 下) 边界
-    bbox = (rect.left, rect.top,  # 屏幕像素坐标
-            rect.right, rect.bottom)
-    # 前台截图该区域并连同 bbox 返回
-    return ImageGrab.grab(bbox=bbox), bbox  # PIL.Image (RGB) # 屏幕像素坐标
-
-
 def get_qq_window_image(window=None):
     """捕获 QQ 主窗口的 WGC 后台截图，返回 (PIL.Image(RGB), window)"""
     # WGC 截图单例
@@ -202,27 +95,6 @@ def get_qq_window_image(window=None):
     if image is None:
         print("[WGC]截图失败")
     return image, window
-
-
-def match_overflow_qq_icon():
-    """匹配溢出区域的QQ图标，返回 {x,y,left,top,right,bottom} 或 None"""
-    # 截取溢出窗口
-    result = get_overflow()
-    if not result:
-        print("未找到溢出窗口")
-        return None
-    image, bbox = result
-    # 加载 QQ 托盘图标模板
-    template_path = os.path.join(_TEMPLATE_DIR, 'QQ_NotifyIconOverflowWindow.png')
-    small_image = Image.open(template_path)
-    # 模板匹配（阈值 0.4 + alpha 掩码：图标可能部分透明/多分辨率）
-    region = find_template(image, small_image, 0.4, True)
-    if not region:
-        return None
-    # 截图内坐标 + 溢出窗口屏幕原点 = 屏幕绝对坐标
-    return {"x": bbox[0] + region["x"], "y": bbox[1] + region["y"],
-            "left": bbox[0] + region["left"], "top": bbox[1] + region["top"],
-            "right": bbox[0] + region["right"], "bottom": bbox[1] + region["bottom"]}
 
 
 def match_switch_to_big():
@@ -279,42 +151,28 @@ def get_main_window():
 
 
 def activate_qq(retry: int = 2) -> bool:
-    """唤起 QQ 主窗口，返回是否成功。
+    """用快捷键唤起 QQ 主窗口（Ctrl+Alt+X：打开/隐藏 QQ 所有窗口），返回是否成功。
 
     细节与健壮性：
-      - 开头判断：若已存在标题为 QQ 的主窗口 → 直接返回成功（不关闭不重建）。
-      - 仅当确实存在可见 QQ 窗口时才关闭（按需），避免破坏性空操作。
-      - 非视觉 click_qq_tray_icon 优先，失败再 match_overflow 视觉兜底。
-      - 成功后按 retry 轮询确认主窗口已出现，杜绝点击成功却无窗口的假阳性。
+      - 主窗口已在 → 直接成功，不按快捷键（避免 toggle 反而隐藏窗口）。
+      - 仅当完全无可见 QQ 窗口时才按快捷键（toggle 语义：有窗口时按=隐藏所有）。
+      - 按后轮询确认主窗口出现，杜绝"按键成功却无窗口"的假阳性。
+      - 唤起前提：QQ 进程已在运行（无进程时由 ensure_qq_window_with_retry 走 start_qq 登录唤起）。
 
-    :param retry: 点击托盘后等待/重取主窗口的次数
+    :param retry: 按快捷键后等待/重取主窗口的次数
     :return: 是否成功取得 QQ 主窗口
     """
-    # 方案甲：主窗口已在 → 直接成功，不必关闭重建
+    # 方案甲：主窗口已在 → 直接成功，不按快捷键
     if get_main_window() is not None:
         return True
 
-    # 仅在有可见 QQ 窗口时才关闭（缩托盘场景：关掉干净态再唤起）
+    # 有可见 QQ 窗口但无主窗口（异常态）：toggle 会隐藏所有窗口，放弃本次唤起
     if get_qq_windows():
-        close_all_qq_windows()
+        print("[WARN] 存在可见 QQ 窗口但无主窗口，快捷键 toggle 会隐藏窗口，放弃唤起")
+        return False
 
-    # 展开托盘溢出区（失败不致命，视觉兜底会自行点击）
-    clickExpandBtn()
-
-    # 非视觉唤起优先，失败则视觉匹配兜底
-    clicked = click_qq_tray_icon()
-    if not clicked:
-        print("非视觉唤起失败，改用图像匹配点击托盘 QQ 图标")
-        # 视觉兜底：模板匹配定位托盘 QQ 图标并随机点击
-        region = match_overflow_qq_icon()
-        if region is None:
-            print("未识别到托盘 QQ 图标，唤起失败")
-            return False
-        random_click(
-            region["left"], region["top"],
-            region["right"] - region["left"],
-            region["bottom"] - region["top"],
-        )
+    # 无任何可见窗口（缩托盘/主面板已关闭）→ 按 Ctrl+Alt+X 打开所有窗口
+    send_hotkey(*TOGGLE_QQ_WINDOWS)
     # 等窗口弹出
     time.sleep(0.8)
 
@@ -323,8 +181,19 @@ def activate_qq(retry: int = 2) -> bool:
         if get_main_window() is not None:
             return True
         time.sleep(0.5)
-    print("点击托盘后 QQ 主窗口未出现")
+    print("快捷键唤起后 QQ 主窗口未出现")
     return False
+
+
+def open_latest_unread_message_window() -> None:
+    """按 Ctrl+Alt+Z 打开最新未读消息窗口（QQ 全局快捷键，无需窗口在前台）。
+
+    场景：处理未读消息前，先切到最新的未读会话窗口再读取。
+    """
+    # 发送全局快捷键（QQ 在系统层注册，焦点不在 QQ 也能响应）
+    send_hotkey(*OPEN_LATEST_UNREAD_WINDOW)
+    # 等窗口切换动画完成
+    time.sleep(0.8)
 
 
 class QQWindowNotReadyError(RuntimeError):

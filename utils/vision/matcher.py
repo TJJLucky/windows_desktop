@@ -1,6 +1,6 @@
 """图像匹配原语：模板匹配、裁剪。仅依赖 core 子包。
 
-QQ 专用匹配函数（match_overflow_qq_icon、match_switch_to_*）已迁至 qq/window_ops.py。
+QQ 专用匹配函数（match_switch_to_*）已迁至 qq/window_ops.py。
 
 核心能力：
 - TemplateMatcher：带 alpha 透明掩码、候选 NMS 去重、多尺度匹配的模板匹配器；

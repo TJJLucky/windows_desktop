@@ -60,7 +60,7 @@ HTTP Client -> service/ -> Dispatcher -> utils/qq -> utils/vision + utils/core
 ### 截图：WGC
 
 - 窗口像素只允许来自 `wgc` 对明确 HWND 的原生后台截获（`core/screenshot.py`），不使用前台屏幕截图。
-- 受保护窗口（如托盘）使用 `ImageGrab` 辅助。
+- 唤起 QQ 窗口使用全局快捷键（Ctrl+Alt+X：打开/隐藏所有窗口），无托盘截图依赖。
 
 ### 单消费者
 
@@ -157,12 +157,13 @@ Content-Type: application/json
 
 | 文件 | 内容 |
 | --- | --- |
-| `window_ops.py` | QQ 进程/窗口枚举、托盘唤起（非视觉优先 + 视觉兜底）、`get_main_window` / `ensure_qq_window_with_retry` |
+| `window_ops.py` | QQ 进程/窗口枚举、快捷键唤起（Ctrl+Alt+X 打开/隐藏所有窗口，有进程无窗口时唤醒）、`get_main_window` / `ensure_qq_window_with_retry` / `open_latest_unread_message_window` |
 | `regions.py` | `RegionResult`；`get_userList_region_and_image` / `get_inputbox_region_and_image` / `get_message_box_region_and_image` / `get_input_buttom_region`；模板在 `templates/` |
 | `models.py` | 数据模型：`User`（`to_dict`）与 `Message`（text/rect/is_self） |
 | `user_list.py` | `UserList`（单例）：`find_user`（包含匹配 + 中英文规范化）、`active_user_by_name`、`get_user_list`（1s 缓存） |
-| `input.py` | `InputBox`（单例）：聚焦→剪贴板粘贴→Ctrl+V→点击发送按钮中心 |
+| `input.py` | `InputBox`（单例）：聚焦→剪贴板粘贴→Ctrl+V→按 Enter 快捷键发送 |
 | `message.py` | `Message` + `MessageList`（单例）：气泡检测→OCR→判断发送方 `is_self` |
+| `hotkeys.py` | QQ 全局快捷键配置表（Ctrl+Alt+X 打开/隐藏所有窗口、Ctrl+Alt+Z 打开最新未读、Enter 发送）与 `send_hotkey` 发送原语 |
 | `dispatcher.py` | `Dispatcher` 单消费者任务队列（唯一入口）：`get_contact_list` / `send_message` / `read_message_list` |
 
 ---

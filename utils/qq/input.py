@@ -1,10 +1,10 @@
-"""QQ 输入框模块：定位、聚焦、剪贴板粘贴、发送按钮点击。
+"""QQ 输入框模块：定位、聚焦、剪贴板粘贴、快捷键发送。
 
 输入框管理器（InputBox）统管：
   - 区域定位：复用 regions.get_inputbox_region_and_image 获取输入框截图与屏幕坐标
   - 聚焦点击：在输入框内随机点击，把输入焦点交给聊天输入控件
   - 文本输入：方案 2 —— Windows 原生 win32api 写剪贴板 + Ctrl+V 粘贴，最稳定
-  - 发送：复用 regions.get_input_buttom_region 定位发送按钮并点击中心
+  - 发送：按 Enter 快捷键发送（QQ 设置的"发送消息"快捷键），取代点击发送按钮
 
 依赖 core + vision + qq/regions + qq/window_ops。
 """
@@ -20,15 +20,17 @@ import win32api
 import win32con
 
 # 输入框区域识别（含发送按钮坐标）
-from .regions import get_inputbox_region_and_image, get_input_buttom_region, RegionResult
+from .regions import get_inputbox_region_and_image, RegionResult
 # 窗口就绪保证
 from .window_ops import ensure_qq_window_with_retry
 # 无焦点置顶上下文（点击前保证窗口完整在屏内）
 from ..core.window import WindowCaptureCtx
 # 计时装饰器
 from ..core.timing import timer
-# 随机点击 / 精确定点点击
-from ..core.mouse import random_click, click_at
+# 随机点击（聚焦输入框用）
+from ..core.mouse import random_click
+# 快捷键发送（Enter）与快捷键配置表
+from .hotkeys import send_hotkey, SEND_MESSAGE
 
 
 class InputBox:
@@ -38,9 +40,9 @@ class InputBox:
 
     用法:
         ib = InputBox()
-        ib.refresh()              # 定位输入框/发送按钮并聚焦输入框
+        ib.refresh()              # 定位输入框并聚焦输入框
         ib.paste_text("你好")     # 粘贴文本到输入框
-        ib.click_send()           # 点击发送
+        ib.send_message()         # 按 Enter 快捷键发送
     """
 
     # 类级单例实例
@@ -112,7 +114,7 @@ class InputBox:
         """定位输入框与发送按钮并获取截图，随后点击输入框把焦点交给它。
 
         等价于 UserList.refresh / MessageList.refresh_messageList 的对外刷新入口：
-        refresh() 一次完成"定位 + 聚焦"，之后即可 paste_text / click_send。
+        refresh() 一次完成"定位 + 聚焦"，之后即可 paste_text / send_message。
         窗口不就绪时抛 QQWindowNotReadyError，不静默返回 False。
         """
         # 确保 QQ 主窗口就绪（分级校验 + 重试）
@@ -120,7 +122,7 @@ class InputBox:
         # 记录句柄（点击输入框/发送按钮时置顶窗口用）
         self.hwnd = main_window._hWnd
 
-        # 直接存储整个定位结果（含输入框/发送按钮区域与截图）
+        # 定位输入框（截图 + 屏幕坐标），send_button_region 字段保留但发送已改快捷键
         self.input_region = get_inputbox_region_and_image(main_window)
 
         return True
@@ -174,23 +176,22 @@ class InputBox:
         self.send_ctrl_v(delay)
 
     @timer
-    def click_send(self):
-        """点击发送按钮（取中心点），把输入框当前内容发送出去。
+    def send_message(self):
+        """通过快捷键发送：在输入框有焦点时按 Enter（QQ 设置的"发送消息"快捷键）。
 
-        进入上下文时置顶并整理窗口形态（高度铺满 + 宽 50% + 靠左），
-        确保发送按钮不会因窗口部分出屏而点不到。
+        相比点击发送按钮：
+          - 省一次发送按钮模板匹配（少一次视觉识别）；
+          - 不受发送按钮"激活/未激活"两种图标差异影响（不用匹配按钮态）。
+        前置条件：焦点已在输入框（paste_text 已 click_inputbox），且输入框有内容。
         """
-        # 未定位到发送按钮则无法点击
-        if self.input_region is None or self.input_region.send_button_region is None:
-            print("[WARN] 尚未定位发送按钮，先调用 refresh()")
+        # 未 refresh 过则无法发送
+        if self.input_region is None:
+            print("[WARN] 尚未刷新输入框区域，先调用 refresh()")
             return
-        # 发送按钮屏幕区域
-        region = self.input_region.send_button_region
-        # 置顶 + 整理窗口形态，保证按钮在屏内
-        with WindowCaptureCtx(self.hwnd, layout=True):
-            # 精确点击按钮中心点（按钮较小，点中心最稳）
-            click_at(region["x"] + region["w"] // 2,
-                     region["y"] + region["h"] // 2)
+        # 焦点在输入框，按 Enter 发送（QQ 全局快捷键，当前焦点窗口即输入框）
+        send_hotkey(*SEND_MESSAGE)
+        # 等发送完成（消息上屏渲染，避免紧接着截图到旧画面）
+        time.sleep(0.3)
 
     def send_text(self, text: str):
         """便捷流程：聚焦 → 输入文本 → 发送。"""
@@ -198,5 +199,5 @@ class InputBox:
         self.refresh()
         # 粘贴文本
         self.paste_text(text)
-        # 点击发送
-        self.click_send()
+        # 通过快捷键发送
+        self.send_message()
