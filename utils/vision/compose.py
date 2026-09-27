@@ -63,6 +63,8 @@ def split_ocr_by_bubble(lines: list, bounds: list[tuple[int, int]], scale: float
         scale 还原回 bounds 的原图坐标系，否则行归属会整体错位（名字错绑到下一行）。
     :return: 与 bounds 等长的文本列表（每个气泡一行文本，多行直接拼接，无分隔符）
     """
+    if scale <= 0:
+        raise ValueError("scale must be positive")
     # 结果数组：长度与气泡数一致，初始为空串
     texts = [""] * len(bounds)
     # 空 OCR 结果 → 全部空串

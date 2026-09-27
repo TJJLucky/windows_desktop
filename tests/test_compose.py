@@ -78,3 +78,12 @@ def test_split_ocr_by_bubble_empty_lines():
     texts = split_ocr_by_bubble([], bounds)
     # 断言：两个空串
     assert texts == ["", ""]
+
+
+def test_split_ocr_by_bubble_restores_scaled_y():
+    """OCR 输入放大 1.25 倍后，y 坐标应还原到 bounds 原图坐标系。"""
+    bounds = [(0, 30), (34, 84)]
+    # 原图 y 中心 29，放大 1.25 后为 36.25；若不还原会被错分到第二个气泡。
+    lines = [([[0, 36.25], [100, 36.25], [100, 36.25], [0, 36.25]], "第一条", 0.9)]
+    texts = split_ocr_by_bubble(lines, bounds, scale=1.25)
+    assert texts == ["第一条", ""]
