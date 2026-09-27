@@ -12,6 +12,7 @@
 # Counter：统计高频像素颜色（背景色判定）
 from collections import Counter
 # time：1s 缓存时间戳
+import threading
 import time
 # re：昵称规范化（只留中英文）与 OCR 文本清洗
 import re
@@ -71,8 +72,11 @@ class UserList:
         self.hwnd: int = 0
         # 最近一次 refresh 顶部 OCR 识别的会话名（保留用于调试和状态比对）
         self.last_active_name: str = ""
-
-        # 1s 缓存：时间戳 + 缓存数据
+        # 用户列表短 TTL 缓存：并发请求共用一次正在执行的刷新。
+        self._cache_lock = threading.RLock()
+        self._cache_condition = threading.Condition(self._cache_lock)
+        self._refreshing = False
+        self._cache_generation = 0
         self.cache_ts: float = 0.0
         self.cache_data: dict = {}
 
@@ -386,34 +390,50 @@ class UserList:
         # 移除旧 key（包括 OCR 截断 key），再以完整名字建立唯一 key。
         for key in [key for key, value in self.users.items() if value is user]:
             self.users.pop(key, None)
-        user.name = full_name
-        self.users[full_name] = user
-        self.last_active_name = full_name
-        self.clear_user_list_cache()
+        with self._cache_lock:
+            user.name = full_name
+            self.users[full_name] = user
+            self.last_active_name = full_name
+            # key 更新不影响列表几何；同步缓存，后续并发请求可以继续复用。
+            self.cache_data = self.to_dict().copy()
+            self.cache_ts = time.time()
         return full_name
 
     @timer
     def active_user_by_name(self, contact_name: str) -> str:
         """按名字激活会话，并用右上角 OCR 更新 canonical key。"""
-        self.refresh()
+        # send/read 每次都必须重新读取用户列表；并发请求合并同一次正在执行的刷新。
+        self._ensure_user_list_fresh(force=True)
         user = self.find_user(contact_name)
         if user is None:
+            # 列表刚发生变化时再刷新一次。
+            self._ensure_user_list_fresh(force=True)
+            user = self.find_user(contact_name)
+        if user is None:
             raise ValueError(f"用户列表中没有找到与「{contact_name}」匹配的联系人")
+        clicked = False
         if not user.active:
-            self.active_user(user)
+            clicked = self.active_user(user)
         full_name = self._wait_panel_switched(contact_name)
         if full_name is not None:
-            return self._promote_user_name(contact_name, full_name)
+            canonical = self._promote_user_name(contact_name, full_name)
+            if clicked:
+                # 实际点击可能引起列表滚动，旧坐标不能继续复用。
+                self.clear_user_list_cache()
+            return canonical
 
         # 点击后顶部 OCR 未确认时重试一次，重新拿坐标后再次点击。
-        self.refresh()
+        self._ensure_user_list_fresh(force=True)
         user = self.find_user(contact_name)
         if user is None:
             raise ValueError(f"用户列表中没有找到与「{contact_name}」匹配的联系人")
-        self.active_user(user)
+        clicked = self.active_user(user)
         full_name = self._wait_panel_switched(contact_name)
         if full_name is not None:
-            return self._promote_user_name(contact_name, full_name)
+            canonical = self._promote_user_name(contact_name, full_name)
+            if clicked:
+                self.clear_user_list_cache()
+            return canonical
         raise RuntimeError(f"顶部 OCR 未确认已激活联系人: {contact_name}")
 
     # ── 刷新 ────────────────────────────────────────────────────
@@ -479,10 +499,10 @@ class UserList:
             new_users[key] = User().setName(key).setAvatar(avatar).setRect(rect).setActive(active).setNewMsg(
                 new_msg)
 
-        # 整体替换（旧列表直接丢弃）
+        # 整体替换（旧列表直接丢弃），并刷新短 TTL 快照。
         self.users = new_users
-        # 清缓存：列表变了，1s 缓存作废
-        self.clear_user_list_cache()
+        self.cache_data = self.to_dict().copy()
+        self.cache_ts = time.time()
 
     def to_dict(self) -> dict[str, dict]:
         """返回用户列表的完整可序列化信息 {name: User.to_dict()}。"""
@@ -520,28 +540,35 @@ class UserList:
         text = UserList.ocr_recognize(img)  # 复用：阈值140只保留黑色 → OCR
         return (bool(text), text)
 
-    # 清除缓存
     def clear_user_list_cache(self):
-        # 时间戳归零 → 下次 get_user_list 强制刷新
-        self.cache_ts = 0.0
+        """手动使短 TTL 缓存失效，下次普通查询会重新刷新。"""
+        with self._cache_condition:
+            self.cache_ts = 0.0
 
-    # 1s缓存
-    def get_user_list(self):
-        now = time.time()
-        # 从未初始化 → 全量刷新并填充缓存
-        if self.userList_region is None:
+    def _ensure_user_list_fresh(self, force: bool = False) -> None:
+        """刷新用户列表；并发调用等待并复用同一次进行中的刷新。"""
+        with self._cache_condition:
+            if not force and self.userList_region is not None and time.time() - self.cache_ts < 1.0:
+                return
+
+            start_generation = self._cache_generation
+            while self._refreshing:
+                self._cache_condition.wait()
+            # 等待期间已有刷新完成时，即使本次要求 force，也复用这次结果。
+            if self._cache_generation > start_generation:
+                return
+
+            self._refreshing = True
+
+        try:
             self.refresh()
-            self.cache_data = self.to_dict().copy()
-            self.cache_ts = now
-            return self.cache_data.copy()
+        finally:
+            with self._cache_condition:
+                self._cache_generation += 1
+                self._refreshing = False
+                self._cache_condition.notify_all()
 
-        # 1s 内命中缓存 → 直接返回（避免高频轮询频繁视觉识别）
-        if now - self.cache_ts < 1.0:
-            return self.cache_data
-
-        # 超过 1s → 刷新并更新缓存
-        self.refresh()
-        self.cache_data = self.to_dict().copy()
-        self.cache_ts = now
-        # 返回副本：调用方修改不污染缓存
+    def get_user_list(self):
+        """普通查询优先复用短 TTL 缓存；send/read 使用 force=True。"""
+        self._ensure_user_list_fresh(force=False)
         return self.cache_data.copy()
