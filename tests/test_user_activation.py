@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import threading
+import time
+
 from PIL import Image
 
 from utils.qq.models import User
@@ -58,3 +61,50 @@ def test_promote_user_name_replaces_truncated_key(monkeypatch):
     assert user_list._promote_user_name("华强电", "华强电子") == "华强电子"
     assert "华强电" not in user_list.users
     assert user_list.users["华强电子"].name == "华强电子"
+
+def test_active_user_by_name_forces_user_list_refresh(monkeypatch):
+    user_list = UserList()
+    calls: list[str] = []
+    user = User(name="华强电子", active=True)
+
+    monkeypatch.setattr(
+        user_list,
+        "_ensure_user_list_fresh",
+        lambda force=False: calls.append(f"force={force}"),
+    )
+    monkeypatch.setattr(user_list, "find_user", lambda name: user)
+    monkeypatch.setattr(user_list, "_wait_panel_switched", lambda name: "华强电子")
+    monkeypatch.setattr(user_list, "_promote_user_name", lambda old, full: full)
+
+    assert user_list.active_user_by_name("华强电子") == "华强电子"
+    assert calls == ["force=True"]
+
+def test_concurrent_force_refreshes_share_single_refresh(monkeypatch):
+    user_list = UserList()
+    calls: list[float] = []
+    barrier = threading.Barrier(6)
+
+    def fake_refresh():
+        calls.append(time.time())
+        time.sleep(0.05)
+        user_list.userList_region = object()
+        user_list.users = {"A": User(name="A")}
+        user_list.cache_data = {"A": {"name": "A"}}
+        user_list.cache_ts = time.time()
+
+    monkeypatch.setattr(user_list, "userList_region", None)
+    monkeypatch.setattr(user_list, "cache_ts", 0.0)
+    monkeypatch.setattr(user_list, "cache_data", {})
+    monkeypatch.setattr(user_list, "refresh", fake_refresh)
+
+    def read():
+        barrier.wait()
+        user_list._ensure_user_list_fresh(force=True)
+
+    threads = [threading.Thread(target=read) for _ in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(calls) == 1
