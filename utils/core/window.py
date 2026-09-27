@@ -8,7 +8,7 @@
 - 窗口形态统一为"工作区高度铺满 + 宽度 50% + 靠左"（layout_window_left_half），
   不再使用最大化：QQ 会话窗口无需全屏，左半工作区足以容纳列表/消息/输入框，
   且完整露出在屏内，坐标点击不会落空；
-- WindowCaptureCtx 上下文管理器是"截图/点击"的标准姿势：短暂置顶露出画面 → 操作 → 自动压底。
+- WindowCaptureCtx 上下文管理器是"截图/点击"的标准姿势：短暂无激活置顶露出画面 → 操作 → 恢复原层级。
 """
 
 # warnings：过滤第三方库的无关告警（见下方 filterwarnings）
@@ -54,7 +54,7 @@ class WindowCaptureCtx:
     - 可选：layout=True 时额外把窗口整理为"工作区高度铺满 + 宽 50% + 靠左"，
       保证含发送按钮在内的控件完整在屏内、坐标点击不会落空。
       （历史参数名 maximize 已弃用——不再最大化，见 layout_window_left_half）
-    - 退出时取消置顶并压底
+    - 退出时仅在本次确实改动了置顶状态时恢复普通层级
 
     用法:
         with WindowCaptureCtx(hwnd):
@@ -66,24 +66,33 @@ class WindowCaptureCtx:
     def __init__(self, hwnd: int, render_delay: float = 0.06, layout: bool = False):
         # 目标窗口句柄
         self.hwnd = hwnd
-        # SetWindowPos 标志：不移动、不改尺寸（只改 Z 序层级）
-        self.flag = win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
+        # SetWindowPos 标志：不移动、不改尺寸、不抢焦点（只改 Z 序层级）
+        self.flag = win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE
         # 置顶后等待画面渲染的秒数（太短可能截到旧帧）
         self.delay = render_delay
         # 标记是否真正进入了有效上下文（窗口无效时 __exit__ 不做清理动作）
         self.is_valid = False
         # 是否在进入时把窗口整理为"工作区左半"形态（取代历史的最大化）
         self.layout = layout
+        # 记录窗口原来的 TOPMOST 状态，避免退出时把本来就是置顶的窗口降级
+        self.was_topmost = False
+        self.topmost_changed = False
 
     def __enter__(self):
         # 进入上下文：只对"存在且可见"的窗口生效
         hw = self.hwnd
+        self.topmost_changed = False
         if win32gui.IsWindow(hw) and win32gui.IsWindowVisible(hw):
             # 窗口处于最小化状态时先恢复（SW_RESTORE），否则置顶后仍是缩略图
             if win32gui.IsIconic(hw):
                 win32gui.ShowWindow(hw, win32con.SW_RESTORE)
-            # 瞬时永久置顶（HWND_TOPMOST），100% 露出画面，不受前台锁定限制
-            win32gui.SetWindowPos(hw, win32con.HWND_TOPMOST, 0, 0, 0, 0, self.flag)
+            # 记录原 TOPMOST 状态：已置顶时不再重复调用，退出时也不错误取消
+            ex_style = win32gui.GetWindowLong(hw, win32con.GWL_EXSTYLE)
+            self.was_topmost = bool(ex_style & win32con.WS_EX_TOPMOST)
+            if not self.was_topmost:
+                # 无激活置顶：让窗口露出，但不抢键盘焦点
+                win32gui.SetWindowPos(hw, win32con.HWND_TOPMOST, 0, 0, 0, 0, self.flag)
+                self.topmost_changed = True
             # 可选：整理窗口形态（高度铺满 + 宽 50% + 靠左），保证控件完整在可点击范围内
             if self.layout:
                 layout_window_left_half(hw)
@@ -95,10 +104,9 @@ class WindowCaptureCtx:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        # 退出上下文：撤销置顶，恢复普通层级
+        # 退出上下文：只恢复本次真正改动过的 TOPMOST 状态。
         hw = self.hwnd
-        if self.is_valid and win32gui.IsWindow(hw):
-            # HWND_NOTOPMOST：取消置顶，让窗口回到普通 Z 序（不再挡在其他窗口前）
+        if self.is_valid and self.topmost_changed and win32gui.IsWindow(hw):
             win32gui.SetWindowPos(hw, win32con.HWND_NOTOPMOST, 0, 0, 0, 0, self.flag)
         # 返回 False：不吞掉上下文内抛出的异常
         return False
@@ -120,7 +128,7 @@ def set_window_z_pos(hwnd: int, bring_front: bool = True) -> bool:
         if win32gui.IsIconic(hwnd):
             win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
         # 标志：不改位置、不改尺寸，只动 Z 序
-        flag = win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
+        flag = win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE
         if bring_front:
             # 提到最前（HWND_TOP，非永久置顶）
             win32gui.SetWindowPos(hwnd, win32con.HWND_TOP, 0, 0, 0, 0, flag)

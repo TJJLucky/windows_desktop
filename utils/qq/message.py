@@ -401,10 +401,9 @@ class MessageList:
             # 全量刷新（截图 + 气泡检测 + OCR）
             self.refresh()
             return self.messages
-        except Exception:
-            # 面板切换的渲染延迟偶发超过等待时间（QQ 响应慢），消息区定位失败。
-            # 重试一次：重新激活（列表已稳定，L2 快照命中不再滚动，坐标可靠）+ 重读消息区。
-            # 不做多次重试：连续失败说明窗口/列表状态异常，交给上层 503 显式失败。
+        except RuntimeError as exc:
+            # 只重试窗口/区域定位可恢复错误，避免把 OCR 或编程错误也重复执行。
+            print(f"[WARN] 消息区刷新失败，重新激活后重试一次: {exc}")
             UserList().active_user_by_name(contact_name)
             self.refresh()
             return self.messages
