@@ -14,6 +14,8 @@
 
 # os：拼接模板目录路径
 import os
+# wraps：保留被缓存函数的元信息
+from functools import wraps
 # Path：路径对象
 from pathlib import Path
 
@@ -28,6 +30,8 @@ from ..vision.matcher import find_template, crop_region, draw_box
 from ..core.timing import timer
 # get_qq_window_image / get_qq_windows：窗口截图与窗口列表
 from .window_ops import get_qq_window_image, get_qq_windows
+# 区域定位结果短期缓存
+from .region_cache import get_region, save_region
 
 
 @dataclass
@@ -82,6 +86,35 @@ def _to_screen(window, region: dict) -> dict:
     }
 
 
+def _cached_region_result(name: str):
+    """缓存区域坐标；命中时仍使用当前整窗截图重新裁剪。"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(window, QQ_window_image=None):
+            if QQ_window_image is None:
+                QQ_window_image, _ = get_qq_window_image(window)
+            cached = get_region(name, window, QQ_window_image)
+            if cached is not None:
+                region = cached["region"]
+                return RegionResult(
+                    screen_region=_to_screen(window, region),
+                    image_region=region,
+                    image=crop_region(QQ_window_image, region),
+                    full_image=QQ_window_image,
+                    send_button_region=cached.get("send_button_region"),
+                )
+            result = func(window, QQ_window_image)
+            save_region(
+                name,
+                window,
+                QQ_window_image,
+                {"region": result.image_region, "send_button_region": result.send_button_region},
+            )
+            return result
+        return wrapper
+    return decorator
+
+@_cached_region_result("userlist")
 @timer
 def get_userList_region_and_image(window, QQ_window_image=None):
     """定位好友列表区域：搜索栏下方到窗口底部。返回 RegionResult。"""
@@ -142,6 +175,7 @@ def get_input_buttom_region(window, QQ_window_image=None):
     return _to_screen(window, right_bottom_region)
 
 
+@_cached_region_result("inputbox")
 @timer
 def get_inputbox_region_and_image(window, QQ_window_image=None):
     """定位输入框区域：输入框左上角 → 发送按钮上方。返回 RegionResult（含发送按钮坐标）。"""
@@ -182,6 +216,7 @@ def get_inputbox_region_and_image(window, QQ_window_image=None):
     )
 
 
+@_cached_region_result("messagebox")
 @timer
 def get_message_box_region_and_image(window, QQ_window_image=None):
     """定位消息框区域：消息框左上角 → 输入框上方。返回 RegionResult。"""

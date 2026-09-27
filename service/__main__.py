@@ -87,6 +87,8 @@ def main() -> None:
     else:
         state_dir = (default_runtime_dir / "state").resolve()
 
+    # 让窗口状态缓存跟随本次服务状态目录；显式环境变量优先。
+    os.environ.setdefault("QQ_WINDOW_CACHE_DB", str((state_dir / "qq-window-cache.sqlite3").resolve()))
     log_dir = (arguments.log_dir or (state_dir / "logs")).expanduser().resolve()
     app_log, console_log = setup_logging(log_dir)
     log_environment()

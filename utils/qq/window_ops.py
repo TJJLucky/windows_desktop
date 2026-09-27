@@ -9,6 +9,8 @@
 - 窗口就绪分级校验（L1/L2/L3）：保证"每次操作前窗口可用"，且用户未动窗口时跳过昂贵校验。
 """
 
+# ctypes：读取窗口 DPI（GetDpiForWindow）
+import ctypes
 # os：路径拼接
 import os
 # time：等待系统动画/渲染
@@ -22,6 +24,8 @@ import psutil
 import pygetwindow as gw
 # win32gui：窗口可见性/最小化状态查询
 import win32gui
+# win32con：窗口扩展样式常量（TOPMOST 等）
+import win32con
 # win32process：取窗口所属进程 PID
 import win32process
 # PIL.Image：模式切换按钮模板加载
@@ -35,9 +39,32 @@ from ..core.window import layout_window_left_half, set_window_z_pos
 from ..vision.matcher import find_template
 # 快捷键发送与配置表（唤醒主面板）
 from .hotkeys import send_hotkey, TOGGLE_QQ_WINDOWS
+# SQLite 窗口状态缓存
+from .window_cache import WindowSnapshot, WindowStateCache, default_window_cache_path
 
 # 模板目录：本文件在 utils/qq/，上溯三级到项目根再进 templates/
 _TEMPLATE_DIR = os.path.join(Path(__file__).parent.parent.parent, "templates")
+
+_WINDOW_FULL_REFRESH_TTL_SECONDS = 30.0
+_window_cache_instance: WindowStateCache | None = None
+
+def _window_full_refresh_ttl() -> float:
+    try:
+        return max(1.0, float(os.environ.get("QQ_WINDOW_CACHE_TTL", "30")))
+    except ValueError:
+        return _WINDOW_FULL_REFRESH_TTL_SECONDS
+
+def _get_window_cache() -> WindowStateCache:
+    global _window_cache_instance
+    if _window_cache_instance is None:
+        _window_cache_instance = WindowStateCache(default_window_cache_path())
+    return _window_cache_instance
+
+def _window_dpi(hwnd: int) -> int:
+    try:
+        return int(ctypes.windll.user32.GetDpiForWindow(hwnd))
+    except Exception:
+        return 0
 
 
 def start_qq():
@@ -189,38 +216,35 @@ class QQWindowNotReadyError(RuntimeError):
     """QQ 主窗口在重试耗尽后仍未就绪（不静默降级）。"""
 
 
-class _WindowState:
-    """窗口就绪状态快照：跨调用复用，用户未动窗口时跳过昂贵校验。"""
-
-    def __init__(self):
-        # 快照对应的窗口句柄
-        self.hwnd: int = 0
-        # 快照时的窗口几何（left, top, right, bottom）
-        self.rect: tuple[int, int, int, int] | None = None
-        # 快照时的最大化状态（目标形态非最大化；用户手动最大化会被识别为变化并恢复）
-        self.maximized: bool = False
-        # 快照是否有效（首次校验成功后才为 True）
-        self.valid: bool = False
-
-
-# 模块级窗口状态快照（全局唯一）
-_window_state = _WindowState()
+def _window_matches_snapshot(snapshot: WindowSnapshot, win) -> bool:
+    """比较当前窗口与 SQLite 快照，判断是否可跳过 L3。"""
+    _, pid = win32process.GetWindowThreadProcessId(win._hWnd)
+    rect = (int(win.left), int(win.top), int(win.right), int(win.bottom))
+    return snapshot.matches(
+        pid=pid,
+        title=win.title.strip(),
+        rect=rect,
+        minimized=bool(win32gui.IsIconic(win._hWnd)),
+        maximized=bool(win.isMaximized),
+        topmost=bool(win32gui.GetWindowLong(win._hWnd, win32con.GWL_EXSTYLE) & win32con.WS_EX_TOPMOST),
+        dpi=_window_dpi(win._hWnd),
+    )
 
 
 def _window_l2_changed(win) -> bool:
-    """L2 变更检测：窗口几何/最大化状态与快照不一致 = 用户动过窗口。"""
-    # 快照无效或窗口句柄变了 → 视为变化（需要重新校验）
-    if not _window_state.valid or _window_state.hwnd != win._hWnd:
+    """SQLite 快照不存在或与当前窗口状态不一致时，需要 L3。"""
+    snapshot = _get_window_cache().get(win._hWnd)
+    if snapshot is None:
         return True
-    # 当前几何与快照不一致 → 用户移动/缩放过窗口
-    rect = (win.left, win.top, win.right, win.bottom)
-    if rect != _window_state.rect:
-        return True
-    # 最大化状态变化 → 用户切换过（目标形态应为非最大化）
-    if bool(win.isMaximized) != _window_state.maximized:
-        return True
-    return False
+    return not _window_matches_snapshot(snapshot, win)
 
+
+def _window_full_refresh_due(win) -> bool:
+    """窗口状态长时间未执行 L3 时，强制周期性重新校验。"""
+    snapshot = _get_window_cache().get(win._hWnd)
+    if snapshot is None:
+        return True
+    return snapshot.full_refresh_due(time.time(), _window_full_refresh_ttl())
 
 def _snapshot_and_verify(win) -> bool:
     """L3 深度校验：置顶 + 形态整理 + WGC 试截，成功后更新快照。"""
@@ -235,11 +259,22 @@ def _snapshot_and_verify(win) -> bool:
     if image is None:
         # 试截失败 → 窗口仍不可用，不更新快照
         return False
-    # 校验通过 → 更新快照（下次 L2 直接命中复用）
-    _window_state.hwnd = win._hWnd
-    _window_state.rect = (win.left, win.top, win.right, win.bottom)
-    _window_state.maximized = bool(win.isMaximized)
-    _window_state.valid = True
+    # 校验通过 → 写入 SQLite 快照（下次 L2 直接命中复用）
+    now = time.time()
+    _, pid = win32process.GetWindowThreadProcessId(win._hWnd)
+    snapshot = WindowSnapshot(
+        hwnd=win._hWnd,
+        pid=pid,
+        title=win.title.strip(),
+        rect=(int(win.left), int(win.top), int(win.right), int(win.bottom)),
+        minimized=bool(win32gui.IsIconic(win._hWnd)),
+        maximized=bool(win.isMaximized),
+        topmost=bool(win32gui.GetWindowLong(win._hWnd, win32con.GWL_EXSTYLE) & win32con.WS_EX_TOPMOST),
+        dpi=_window_dpi(win._hWnd),
+        last_checked_at=now,
+        last_full_refresh_at=now,
+    )
+    _get_window_cache().save(snapshot)
     return True
 
 
@@ -262,10 +297,16 @@ def ensure_qq_window():
         main_win = get_main_window()
     if main_win is None:
         return None
-    # 最小化或几何变化（用户动过）→ L3 深度校验；否则 L2 命中直接复用
-    if win32gui.IsIconic(main_win._hWnd) or _window_l2_changed(main_win):
+    # 最小化、窗口状态变化或周期 TTL 到期 → L3；否则复用 SQLite 快照。
+    if (
+        win32gui.IsIconic(main_win._hWnd)
+        or _window_l2_changed(main_win)
+        or _window_full_refresh_due(main_win)
+    ):
         if not _snapshot_and_verify(main_win):
             return None
+    else:
+        _get_window_cache().touch(main_win._hWnd)
     return main_win
 
 
