@@ -60,6 +60,11 @@ class RegionResult:
 # 模板目录：本文件在 utils/qq/，上溯三级到项目根再进 templates/
 _TEMPLATE_DIR = os.path.join(Path(__file__).parent.parent.parent, "templates")
 
+# QQ 进入多消息选择态后，操作工具栏位于窗口底部。只在这块较小的 ROI 内查找
+# copy_icon.png，既避免将聊天正文里的相似图形误识别为按钮，也避免对整窗做匹配。
+_COPY_ACTION_TOOLBAR_TOP_RATIO = 0.65
+_COPY_ICON_MATCH_THRESHOLD = 0.88
+
 
 def load_image(path):
     """加载 templates 目录下的模板图。"""
@@ -84,6 +89,48 @@ def _to_screen(window, region: dict) -> dict:
         "right": right,
         "bottom": bottom,
     }
+
+
+@timer
+def get_copy_action_region(window, QQ_window_image=None) -> dict | None:
+    """定位 QQ 多消息选择工具栏中的“复制”图标。
+
+    返回值是可直接传给鼠标层的**屏幕绝对坐标矩形**；找不到则返回 ``None``。
+    这里刻意不使用 OCR：``copy_icon.png`` 是真正可点击的图标，模板匹配只扫描
+    窗口底部工具栏 ROI，避免 OCR 的模型推理开销和“复制”文字误命中。
+
+    ``QQ_window_image`` 可由调用方传入同一帧截图，避免为了定位按钮再次调用 WGC。
+    """
+    if QQ_window_image is None:
+        QQ_window_image, _ = get_qq_window_image(window)
+    if QQ_window_image is None:
+        return None
+
+    # 选择态操作栏在窗口下方；裁剪后得到的坐标仍是相对 ROI 的，需要在下方加回
+    # toolbar_top 才能恢复为相对整窗截图的坐标。
+    toolbar_top = round(QQ_window_image.height * _COPY_ACTION_TOOLBAR_TOP_RATIO)
+    toolbar_image = QQ_window_image.crop((0, toolbar_top, QQ_window_image.width, QQ_window_image.height))
+    copy_icon = load_image("copy_icon.png")
+    matched = find_template(
+        toolbar_image,
+        copy_icon,
+        threshold=_COPY_ICON_MATCH_THRESHOLD,
+        # 模板与当前 QQ 截图均来自同一 DPI 下时，固定尺寸匹配更快；若后续支持多
+        # DPI 模板，可将这里改为 True，而无需改变调用层契约。
+        multiscale=False,
+    )
+    if matched is None:
+        return None
+
+    image_region = {
+        "x": matched["x"],
+        "y": matched["y"] + toolbar_top,
+        "left": matched["left"],
+        "top": matched["top"] + toolbar_top,
+        "right": matched["right"],
+        "bottom": matched["bottom"] + toolbar_top,
+    }
+    return _to_screen(window, image_region)
 
 
 def _cached_region_result(name: str):
