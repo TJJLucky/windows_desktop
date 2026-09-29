@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 from PIL import Image
 
+from utils.qq.message import _MESSAGE_SELECTION_DRAG_DURATION
 from utils.qq import regions
 
 
@@ -45,3 +46,8 @@ def test_get_copy_action_region_returns_none_when_template_is_not_found(monkeypa
     )
 
     assert result is None
+
+
+def test_message_selection_drag_uses_fastest_verified_duration():
+    """0.0 秒已在真实 QQ 左上到右下多选测试中连续 10 次成功。"""
+    assert _MESSAGE_SELECTION_DRAG_DURATION == 0.0

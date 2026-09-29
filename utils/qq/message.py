@@ -45,6 +45,12 @@ from ..core.timing import timer
 from .user_list import UserList
 
 
+# 左上到右下的真实 QQ 多选测试中，0.0 秒连续 10 次均命中 copy_icon.png；C++ DLL
+# 会在按下后直接移动到终点。SmoothMousegoto 到起点的过程仍保留，因此动作不会失去
+# 原生输入轨迹。
+_MESSAGE_SELECTION_DRAG_DURATION = 0.0
+
+
 def _read_unicode_clipboard(retries: int = 5, delay: float = 0.1) -> str:
     """等待并读取 QQ 点击“复制”后写入的 Unicode 文本。
 
@@ -486,7 +492,7 @@ class MessageList:
 
                 # drag() 最终由 QQPilot InputEvent.dll 的 SendInput 注入，方向不可反转：
                 # 本 QQ 版本已实测只有左上 -> 右下会把可见消息切换成多选状态。
-                drag(*selection_start, *selection_end, duration=0.8)
+                drag(*selection_start, *selection_end, duration=_MESSAGE_SELECTION_DRAG_DURATION)
                 # 等待 QQ 渲染复选框和底部操作栏，再以复制图标模板确认选择态。
                 time.sleep(0.25)
                 image, window = get_qq_window_image(main_window)
