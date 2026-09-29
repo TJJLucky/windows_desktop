@@ -13,6 +13,8 @@ from collections import deque
 
 # os：环境变量读取（拼图调试展示开关 QQ_SHOW_COMPOSE）
 import os
+# time：等待 QQ 将拖拽选区和复制菜单渲染完成
+import time
 
 # cv2：轮廓检测（findContours/boundingRect）
 import cv2
@@ -27,6 +29,10 @@ from .models import Message
 from .regions import get_message_box_region_and_image
 # 窗口就绪保证 + 主窗口/截图
 from .window_ops import get_main_window, get_qq_window_image, ensure_qq_window_with_retry
+# 无焦点置顶上下文：让真实鼠标事件落到 QQ 窗口，但不抢键盘焦点
+from ..core.window import WindowCaptureCtx
+# 原生 DLL 鼠标适配：拖拽框选和点击“复制”菜单项
+from ..core.mouse import click_at, drag
 # OCR 引擎单例
 from ..vision.ocr import OCREngine
 # 拼图 OCR：气泡拼接一次识别 + 按 y 边界切分文本（性能优化）
@@ -37,6 +43,80 @@ from ..core.screenshot import getDPI
 from ..core.timing import timer
 # 用户列表（read_messages 内部激活目标会话）
 from .user_list import UserList
+
+
+_COPY_TEXT = "复制"
+
+
+def _normalise_menu_text(text: str) -> str:
+    """去除 OCR 结果中的空白，便于精确比较 QQ 菜单文字。"""
+    return "".join((text or "").split())
+
+
+def _ocr_box_center(box) -> tuple[int, int]:
+    """将 RapidOCR 的四角框 ``[[x,y], ...]`` 转换为截图内中心坐标。"""
+    xs = [point[0] for point in box]
+    ys = [point[1] for point in box]
+    return round(sum(xs) / len(xs)), round(sum(ys) / len(ys))
+
+
+def _find_copy_menu_point(ocr_lines: list, window_left: int, window_top: int, selection_end: tuple[int, int]) -> tuple[int, int] | None:
+    """从 QQ 整窗 OCR 结果中找到距离框选终点最近的“复制”菜单项。
+
+    聊天内容本身也可能包含“复制”二字，因此不能简单使用第一条 OCR 命中。
+    QQ 的浮动复制菜单通常出现在鼠标拖拽释放点附近，故选择离 ``selection_end``
+    最近的精确文字命中，降低点击到聊天正文的概率。
+    """
+    candidates: list[tuple[int, int]] = []
+    for line in ocr_lines:
+        if len(line) < 2 or _normalise_menu_text(str(line[1])) != _COPY_TEXT:
+            continue
+        image_x, image_y = _ocr_box_center(line[0])
+        candidates.append((window_left + image_x, window_top + image_y))
+    if not candidates:
+        return None
+    return min(candidates, key=lambda point: (point[0] - selection_end[0]) ** 2 + (point[1] - selection_end[1]) ** 2)
+
+
+def _find_bottom_copy_action(ocr_lines: list, window_left: int, window_top: int, window_height: int) -> tuple[int, int] | None:
+    """在选择态底部工具栏中寻找“复制”。
+
+    QQ 选中多条消息后，会以底部工具栏代替普通输入框；该工具栏在窗口下方约 30% 的
+    区域内。只接受这里的精确“复制”命中，避免误点聊天正文中的同名文字。
+    """
+    minimum_y = window_top + round(window_height * 0.7)
+    candidates: list[tuple[int, int]] = []
+    for line in ocr_lines:
+        if len(line) < 2 or _normalise_menu_text(str(line[1])) != _COPY_TEXT:
+            continue
+        image_x, image_y = _ocr_box_center(line[0])
+        point = window_left + image_x, window_top + image_y
+        if point[1] >= minimum_y:
+            candidates.append(point)
+    if not candidates:
+        return None
+    # 底部工具栏通常横向排列多个动作，“复制”位于靠右位置；取最靠右的精确命中。
+    return max(candidates, key=lambda point: point[0])
+
+
+def _read_unicode_clipboard(retries: int = 5, delay: float = 0.1) -> str:
+    """读取 QQ 点击“复制”后写入的 Unicode 文本；剪贴板短暂被占用时重试。"""
+    import win32clipboard
+
+    last_error: Exception | None = None
+    for _ in range(retries):
+        try:
+            win32clipboard.OpenClipboard()
+            try:
+                if not win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_UNICODETEXT):
+                    return ""
+                return str(win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT) or "")
+            finally:
+                win32clipboard.CloseClipboard()
+        except Exception as exc:
+            last_error = exc
+            time.sleep(delay)
+    raise RuntimeError("QQ_COPY_CLIPBOARD_UNAVAILABLE") from last_error
 
 
 def _show_composed_image(composed: Image.Image) -> None:
@@ -388,6 +468,68 @@ class MessageList:
         self.refresh_image()
         # 检测气泡 + OCR
         self.refresh_messageList()
+
+    @timer
+    def copy_visible_selection(self) -> str:
+        """框选当前消息区可见内容，OCR 找“复制”菜单并读取剪贴板文本。
+
+        这是对 QQ 原生“复制聊天记录”交互的尝试性实现，暂时不替换气泡 OCR 主流程。
+        它会改变系统剪贴板内容，因此调用方应把返回值立即保存到自己的业务状态中。
+
+        流程：
+
+        1. 重新定位消息区，确保坐标属于当前 QQ 窗口；
+        2. 从消息区右下向左上拖拽，框选大部分可见消息；
+        3. WGC 截取 QQ 整窗，用 OCR 找精确文字“复制”；
+        4. 点击离拖拽终点最近的“复制”菜单项；
+        5. 读取 QQ 写入系统剪贴板的 Unicode 文本。
+        """
+        # 从这里开始到菜单点击结束，QQ 都维持在最顶层。这样拖拽与点击不会落到覆盖它的窗口。
+        main_window = ensure_qq_window_with_retry()
+        self.hwnd = main_window._hWnd
+        with WindowCaptureCtx(self.hwnd):
+            # 先处理“已经选择”的状态。该状态下输入框会被底部操作栏替换，不能再用输入框模板定位。
+            image, window = get_qq_window_image(main_window)
+            if image is None:
+                raise RuntimeError("QQ_COPY_CAPTURE_FAILED")
+            ocr_lines = OCREngine().ocr(np.array(image)) or []
+            copy_point = _find_bottom_copy_action(ocr_lines, int(window.left), int(window.top), image.height)
+
+            if copy_point is None:
+                # 普通聊天态：先定位消息区，再从右下向左上拖拽，框选大部分可见消息。
+                self.refresh_image()
+                region = self.message_screen_region
+                if region is None:
+                    raise RuntimeError("QQ_MESSAGE_REGION_UNAVAILABLE")
+
+                # 留出边距，避免拖到消息标题栏、输入框边缘或窗口滚动条。
+                horizontal_padding = max(20, min(60, region["w"] // 10))
+                vertical_padding = max(20, min(40, region["h"] // 10))
+                selection_start = (region["right"] - horizontal_padding, region["bottom"] - vertical_padding)
+                selection_end = (region["left"] + horizontal_padding, region["top"] + vertical_padding)
+                if selection_start[0] <= selection_end[0] or selection_start[1] <= selection_end[1]:
+                    raise RuntimeError("QQ_MESSAGE_REGION_TOO_SMALL")
+
+                drag(*selection_start, *selection_end, duration=0.8)
+                # QQ 在拖拽结束后才显示浮动“复制”菜单；过早截图会导致 OCR 找不到菜单。
+                time.sleep(0.25)
+                image, window = get_qq_window_image(main_window)
+                if image is None:
+                    raise RuntimeError("QQ_COPY_CAPTURE_FAILED")
+                ocr_lines = OCREngine().ocr(np.array(image)) or []
+                copy_point = _find_copy_menu_point(ocr_lines, int(window.left), int(window.top), selection_end)
+                if copy_point is None:
+                    raise RuntimeError("QQ_COPY_ACTION_NOT_FOUND")
+
+            # 点击 OCR 框中心；restore=False 防止复制菜单在光标归位途中消失。
+            click_at(*copy_point, restore=False)
+
+        # 菜单点击后 QQ 会异步写剪贴板；短暂停顿后再由带重试的读取函数取文本。
+        time.sleep(0.15)
+        copied = _read_unicode_clipboard()
+        if not copied.strip():
+            raise RuntimeError("QQ_COPY_EMPTY")
+        return copied
 
     def read_messages(self, contact_name: str) -> list[Message]:
         """供智能体读取消息的唯一入口：内部激活目标会话后自动刷新，返回最新消息列表。
