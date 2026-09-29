@@ -65,15 +65,6 @@ _TEMPLATE_DIR = os.path.join(Path(__file__).parent.parent.parent, "templates")
 _COPY_ACTION_TOOLBAR_TOP_RATIO = 0.65
 _COPY_ICON_MATCH_THRESHOLD = 0.88
 
-# 右键菜单会围绕触发右键的消息弹出。以该消息为锚点裁剪一个有限区域后，再匹配
-# “多选”图标；不需要也不应该对整窗跑 OCR。
-_MULTI_SELECT_ICON_MATCH_THRESHOLD = 0.88
-_CONTEXT_MENU_LEFT_MARGIN = 200
-_CONTEXT_MENU_TOP_MARGIN = 100
-_CONTEXT_MENU_RIGHT_MARGIN = 240
-_CONTEXT_MENU_BOTTOM_MARGIN = 380
-
-
 def load_image(path):
     """加载 templates 目录下的模板图。"""
     template_path = os.path.join(_TEMPLATE_DIR, path)
@@ -137,56 +128,6 @@ def get_copy_action_region(window, QQ_window_image=None) -> dict | None:
         "top": matched["top"] + toolbar_top,
         "right": matched["right"],
         "bottom": matched["bottom"] + toolbar_top,
-    }
-    return _to_screen(window, image_region)
-
-
-@timer
-def get_multi_select_action_region(
-        window,
-        anchor_screen_point: tuple[int, int],
-        QQ_window_image=None,
-) -> dict | None:
-    """定位 QQ 消息右键菜单里的“多选”图标。
-
-    ``anchor_screen_point`` 是触发右键的消息气泡内坐标。QQ 会把右键菜单放在该点附近；
-    因此只扫描其邻域，返回可直接点击的屏幕绝对坐标矩形。模板未命中表示菜单尚未出现
-    或当前 QQ 版本的菜单布局已变化，调用方必须停止，而不是猜测固定偏移坐标。
-    """
-    if QQ_window_image is None:
-        QQ_window_image, _ = get_qq_window_image(window)
-    if QQ_window_image is None:
-        return None
-
-    # 屏幕坐标转换为整窗截图内坐标。菜单在靠近窗口边缘时会自动向左/向上翻转，故 ROI
-    # 在锚点四周都保留余量，而非假设它永远只会在右下方弹出。
-    anchor_x = int(anchor_screen_point[0] - window.left)
-    anchor_y = int(anchor_screen_point[1] - window.top)
-    roi_left = max(0, anchor_x - _CONTEXT_MENU_LEFT_MARGIN)
-    roi_top = max(0, anchor_y - _CONTEXT_MENU_TOP_MARGIN)
-    roi_right = min(QQ_window_image.width, anchor_x + _CONTEXT_MENU_RIGHT_MARGIN)
-    roi_bottom = min(QQ_window_image.height, anchor_y + _CONTEXT_MENU_BOTTOM_MARGIN)
-    if roi_left >= roi_right or roi_top >= roi_bottom:
-        return None
-
-    context_menu_image = QQ_window_image.crop((roi_left, roi_top, roi_right, roi_bottom))
-    multi_select_icon = load_image("multi_select_icon.png")
-    matched = find_template(
-        context_menu_image,
-        multi_select_icon,
-        threshold=_MULTI_SELECT_ICON_MATCH_THRESHOLD,
-        multiscale=False,
-    )
-    if matched is None:
-        return None
-
-    image_region = {
-        "x": matched["x"] + roi_left,
-        "y": matched["y"] + roi_top,
-        "left": matched["left"] + roi_left,
-        "top": matched["top"] + roi_top,
-        "right": matched["right"] + roi_left,
-        "bottom": matched["bottom"] + roi_top,
     }
     return _to_screen(window, image_region)
 

@@ -45,33 +45,3 @@ def test_get_copy_action_region_returns_none_when_template_is_not_found(monkeypa
     )
 
     assert result is None
-
-
-def test_get_multi_select_action_region_matches_near_right_click_anchor(monkeypatch):
-    """右键菜单只在消息锚点附近匹配，并正确还原为屏幕坐标。"""
-    captured: dict[str, object] = {}
-
-    def fake_find_template(big, small, threshold, use_mask=False, multiscale=True):
-        captured["roi_size"] = big.size
-        captured["threshold"] = threshold
-        captured["multiscale"] = multiscale
-        return {"x": 100, "y": 200, "left": 100, "top": 200, "right": 140, "bottom": 240}
-
-    monkeypatch.setattr(regions, "find_template", fake_find_template)
-    monkeypatch.setattr(regions, "load_image", lambda _: Image.new("RGB", (40, 40), "white"))
-    window = SimpleNamespace(left=100, top=200)
-    full_image = Image.new("RGB", (1000, 800), "white")
-
-    result = regions.get_multi_select_action_region(window, (800, 700), full_image)
-
-    assert captured == {"roi_size": (440, 400), "threshold": 0.88, "multiscale": False}
-    assert result == {
-        "x": 700,
-        "y": 800,
-        "w": 40,
-        "h": 40,
-        "left": 700,
-        "top": 800,
-        "right": 740,
-        "bottom": 840,
-    }
