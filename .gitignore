@@ -20,6 +20,8 @@ native/wgc_capture/.vs/
 native/wgc_capture/packages/
 native/wgc_capture/x64/
 native/wgc_capture/**/x64/
+native/input_event/InputEvent/
+native/input_event/x64/
 native/*.zip
 
 # 调试输出与历史残留目录
