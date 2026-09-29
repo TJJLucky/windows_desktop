@@ -25,14 +25,18 @@ from PIL import Image, ImageDraw
 
 # Message 数据模型（链式 setter）
 from .models import Message
-# 消息区、选择态“复制”按钮的区域识别
-from .regions import get_copy_action_region, get_message_box_region_and_image
+# 消息区、右键“多选”、选择态“复制”按钮的区域识别
+from .regions import (
+    get_copy_action_region,
+    get_message_box_region_and_image,
+    get_multi_select_action_region,
+)
 # 窗口就绪保证 + 主窗口/截图
 from .window_ops import get_main_window, get_qq_window_image, ensure_qq_window_with_retry
 # 无焦点置顶上下文：让真实鼠标事件落到 QQ 窗口，但不抢键盘焦点
 from ..core.window import WindowCaptureCtx
-# 原生 DLL 鼠标适配：拖拽框选和点击“复制”菜单项
-from ..core.mouse import click_at, drag
+# 原生 DLL 鼠标适配：右键打开菜单、点击“多选”和“复制”菜单项
+from ..core.mouse import click_at, right_click_at
 # OCR 引擎单例
 from ..vision.ocr import OCREngine
 # 拼图 OCR：气泡拼接一次识别 + 按 y 边界切分文本（性能优化）
@@ -444,22 +448,49 @@ class MessageList:
         # 检测气泡 + OCR
         self.refresh_messageList()
 
+    def _get_multi_select_anchor(self) -> tuple[int, int]:
+        """返回一个适合右键进入 QQ“多选”模式的可见消息气泡中心。
+
+        这里复用现有的颜色/轮廓气泡检测，**不运行 OCR**。选择最靠下且没有被输入框
+        截断的气泡，能避开顶部标题栏，也能减少右键菜单被窗口底边翻转后的不确定性。
+        """
+        if self.message_image is None or self.message_screen_region is None:
+            raise RuntimeError("QQ_MESSAGE_REGION_UNAVAILABLE")
+
+        boxes = self.detect_bubbles(self.message_image)
+        # 输入框会切掉最底部的半条消息；不要对它右键，以免命中空白或不可操作区域。
+        safe_bottom = self.message_image.height - max(30, round(24 * getDPI()))
+        candidates = [
+            box for box in boxes
+            if box[1] >= 20 and box[1] + box[3] <= safe_bottom
+        ]
+        if not candidates:
+            raise RuntimeError("QQ_VISIBLE_MESSAGE_NOT_FOUND")
+
+        x, y, width, height, _is_self = max(candidates, key=lambda box: box[1] + box[3])
+        # message_image 已经裁掉左右头像带，坐标换回屏幕时必须把相同的左侧裁剪量加回。
+        avatar_margin = round(60 * getDPI())
+        return (
+            self.message_screen_region["left"] + avatar_margin + x + width // 2,
+            self.message_screen_region["top"] + y + height // 2,
+        )
+
     @timer
     def copy_visible_selection(self) -> str:
-        """框选当前消息区可见内容，OCR 找“复制”菜单并读取剪贴板文本。
+        """复制当前可见消息中的一条：右键“多选”后点击模板定位的“复制”图标。
 
         这是对 QQ 原生“复制聊天记录”交互的尝试性实现，暂时不替换气泡 OCR 主流程。
         它会改变系统剪贴板内容，因此调用方应把返回值立即保存到自己的业务状态中。
 
         流程：
 
-        1. 重新定位消息区，确保坐标属于当前 QQ 窗口；
-        2. 从消息区右下向左上拖拽，框选大部分可见消息；
-        3. WGC 截取 QQ 整窗，在底部工具栏 ROI 匹配 ``copy_icon.png``；
-        4. 点击模板匹配到的“复制”图标中心；
+        1. 若 QQ 已处于多选状态，直接寻找底部 ``copy_icon.png``；
+        2. 否则用气泡检测选取一条完整可见消息，在其中心打开右键菜单；
+        3. 在右键菜单 ROI 匹配 ``multi_select_icon.png`` 并点击，进入 QQ 原生多选状态；
+        4. 在底部工具栏 ROI 匹配 ``copy_icon.png`` 并点击；
         5. 读取 QQ 写入系统剪贴板的 Unicode 文本。
         """
-        # 从这里开始到菜单点击结束，QQ 都维持在最顶层。这样拖拽与点击不会落到覆盖它的窗口。
+        # 从这里开始到菜单点击结束，QQ 都维持在最顶层。这样右键与点击不会落到覆盖它的窗口。
         main_window = ensure_qq_window_with_retry()
         self.hwnd = main_window._hWnd
         with WindowCaptureCtx(self.hwnd):
@@ -470,22 +501,27 @@ class MessageList:
             copy_action = get_copy_action_region(window, image)
 
             if copy_action is None:
-                # 普通聊天态：先定位消息区，再从右下向左上拖拽，框选大部分可见消息。
+                # 普通聊天态：QQ 不支持从空白处“框选消息”。必须先在真实气泡上右键，
+                # 通过其原生“多选”菜单项进入带勾选框的选择态。
                 self.refresh_image()
-                region = self.message_screen_region
-                if region is None:
-                    raise RuntimeError("QQ_MESSAGE_REGION_UNAVAILABLE")
+                anchor = self._get_multi_select_anchor()
+                right_click_at(*anchor, restore=False)
+                # 等待 QQ 弹出消息右键菜单；随后只在锚点附近匹配“多选”图标。
+                time.sleep(0.25)
+                image, window = get_qq_window_image(main_window)
+                if image is None:
+                    raise RuntimeError("QQ_COPY_CAPTURE_FAILED")
+                multi_select_action = get_multi_select_action_region(window, anchor, image)
+                if multi_select_action is None:
+                    raise RuntimeError("QQ_MULTI_SELECT_ACTION_NOT_FOUND")
 
-                # 留出边距，避免拖到消息标题栏、输入框边缘或窗口滚动条。
-                horizontal_padding = max(20, min(60, region["w"] // 10))
-                vertical_padding = max(20, min(40, region["h"] // 10))
-                selection_start = (region["right"] - horizontal_padding, region["bottom"] - vertical_padding)
-                selection_end = (region["left"] + horizontal_padding, region["top"] + vertical_padding)
-                if selection_start[0] <= selection_end[0] or selection_start[1] <= selection_end[1]:
-                    raise RuntimeError("QQ_MESSAGE_REGION_TOO_SMALL")
-
-                drag(*selection_start, *selection_end, duration=0.8)
-                # QQ 在拖拽结束后才显示底部选择工具栏；过早截图会导致模板匹配找不到图标。
+                click_at(
+                    multi_select_action["left"] + multi_select_action["w"] // 2,
+                    multi_select_action["top"] + multi_select_action["h"] // 2,
+                    restore=False,
+                )
+                # 点击“多选”后 QQ 需要渲染勾选框和底部操作栏，确认复制图标存在后才能
+                # 清空剪贴板并点击，避免误把此前的剪贴板内容当作本次结果。
                 time.sleep(0.25)
                 image, window = get_qq_window_image(main_window)
                 if image is None:
