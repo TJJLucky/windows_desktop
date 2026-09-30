@@ -32,7 +32,7 @@ SIZE_LIMIT_MB = 400
 COLLECT_DATA = ["rapidocr_onnxruntime"]
 
 # 代码按相对路径加载（__file__ 上溯）→ onefile 解压根目录 _MEIPASS
-ADD_DATA = [("templates", "templates"), ("libs/wgc_capture.dll", "libs")]
+ADD_DATA = [("templates", "templates"), ("libs/wgc_capture.dll", "libs"), ("libs/input_event.dll", "libs")]
 
 HIDDEN_IMPORTS = ["pyautogui", "pyscreeze", "mouseinfo", "pywinauto", "psutil", "pygetwindow"]
 
@@ -85,6 +85,8 @@ def verify_exe(exe: Path, smoke_start: bool) -> None:
     if mb > SIZE_LIMIT_MB:
         fail(f"体积 {mb:.1f}MB 超上限 {SIZE_LIMIT_MB}MB")
 
+    _verify_runtime_resources(exe)
+
     try:
         help_run = subprocess.run([str(exe), "--help"], capture_output=True, text=True, timeout=180)
     except subprocess.TimeoutExpired:
@@ -98,6 +100,28 @@ def verify_exe(exe: Path, smoke_start: bool) -> None:
     if smoke_start:
         _smoke_start(exe)
         _smoke_default(exe)
+
+
+def _verify_runtime_resources(exe: Path) -> None:
+    """让 onefile EXE 实际加载两个本地 DLL，防止漏配 ``--add-data``。
+
+    ``/v1/health`` 不会惰性加载 ``utils.qq.dispatcher``，所以仅做 HTTP 健康冒烟无法
+    发现 InputEvent DLL 漏打包。这个独立参数不操作 QQ，只 import 鼠标层并初始化 WGC
+    DLL；如果资源未被解压到 ``_MEIPASS/libs``，子进程会以非零状态退出。
+    """
+    try:
+        probe = subprocess.run(
+            [str(exe), "--verify-runtime-resources"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        fail("运行时资源自检超时（180s）")
+    output = probe.stdout + probe.stderr
+    if probe.returncode != 0 or "RUNTIME_RESOURCES_READY" not in output:
+        fail(f"运行时资源自检失败（input_event.dll / wgc_capture.dll）:\n{output[-3000:]}")
+    print("  运行时资源自检通过（input_event.dll / wgc_capture.dll）")
 
 
 def _smoke_start(exe: Path) -> None:
