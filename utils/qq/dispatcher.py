@@ -154,7 +154,7 @@ class Dispatcher:
             # 超时：返回失败 + 超时异常
             return False, TimeoutError("send_message task timeout")
 
-    def read_message_list(self, contact_name: str, timeout: float = 120.0) -> Tuple[list[dict], Optional[Exception]]:
+    def read_message_list(self, contact_name: str, timeout: float = 120.0) -> Tuple[dict, Optional[Exception]]:
         """提交读取消息任务到队列，阻塞等待执行完成。"""
         # 结果队列
         res_q = queue.Queue(maxsize=1)
@@ -164,8 +164,8 @@ class Dispatcher:
             # 阻塞等待
             return res_q.get(timeout=timeout)
         except queue.Empty:
-            # 超时：返回空列表 + 超时异常
-            return [], TimeoutError("read_message_list task timeout")
+            # 超时：返回空结果 + 超时异常
+            return {}, TimeoutError("read_message_list task timeout")
 
     # ========= 内部真正实现（在worker线程运行） =========
     def get_contact_list_impl(self) -> dict[str, dict]:
@@ -178,16 +178,6 @@ class Dispatcher:
         self.inputBox.send_text(contact_name, text)
         return True
 
-    def read_message_list_impl(self, contact_name: str) -> list[dict]:
-        """实际实现：读取消息（内部自动激活会话），翻译为对外结构。"""
-        # 读取方法内部自动激活用户（点击列表行切换会话，已激活跳过）→ 截图 + 气泡检测 + OCR
-        messages = self.messageList.read_messages(contact_name)
-        # 翻译为对外 dict 结构（text / is_self / rect）
-        return [
-            {
-                "text": m.text,
-                "is_self": m.is_self,
-                "rect": list(m.rect),
-            }
-            for m in messages
-        ]
+    def read_message_list_impl(self, contact_name: str) -> dict:
+        """委托 MessageList 完成激活、框选复制和解析。"""
+        return self.messageList.read_messages(contact_name)

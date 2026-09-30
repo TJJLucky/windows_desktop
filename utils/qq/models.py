@@ -1,8 +1,7 @@
-"""QQ 业务数据模型：联系人（User）与单条消息（Message）。
+"""QQ 业务数据模型：联系人（User）。
 
 纯数据类 + 链式 setter，不依赖任何其他子包，保证序列化结构稳定：
 - User.to_dict()  → {"name", "avatar": [cx, cy, r], "rect": [l, t, r, b], "active", "new_msg"}
-- Message         → text / rect / is_self 三字段
 """
 
 # dataclass：自动生成 __init__/__repr__ 等样板代码的数据类
@@ -63,32 +62,3 @@ class User:
             "active": self.active,
             "new_msg": self.new_msg,
         }
-
-
-@dataclass
-class Message:
-    """单条消息数据模型，含 OCR 文本、截图像素坐标与发送方判断。
-
-    参考 User 的链式 setter 风格：每个字段有对应 setXxx() 方法，
-    返回 self 以便链式构造，例如:
-        Message().setText("你好").setRect((0, 0, 10, 10)).setIsSelf(True)
-    """
-
-    text: str = ""  # OCR 识别文本
-    rect: tuple[int, int, int, int] = (0, 0, 0, 0)  # 气泡在消息区内的坐标 (x, y, w, h)
-    is_self: bool = False  # True=自己发的, False=对方
-
-    def setText(self, text: str) -> "Message":
-        """设置消息文本，返回 self 支持链式调用。"""
-        self.text = text
-        return self
-
-    def setRect(self, rect: tuple[int, int, int, int]) -> "Message":
-        """设置气泡在消息区内的坐标，返回 self 支持链式调用。"""
-        self.rect = rect
-        return self
-
-    def setIsSelf(self, is_self: bool) -> "Message":
-        """设置是否为自己发送，返回 self 支持链式调用。"""
-        self.is_self = is_self
-        return self

@@ -3,7 +3,7 @@
 职责：
 - 定义 QqAutomationPort 抽象（接口契约），Service 层只依赖该端口，测试可注入替身；
 - 提供 LegacyQqAutomationFacade 真实实现：复用既有 Dispatcher 单消费者队列，不改变
-  WGC 截图、OCR、模板匹配或输入模拟等底层实现（它们仍从 utils 包按原样使用）；
+  QQ 窗口定位、模板匹配、原生复制或输入模拟等底层实现；
 - 把 Dispatcher 的 (result, error) 元组约定翻译为 Service 层的异常语义（QqAutomationError），
   让 HTTP 层能统一投影为 503。
 """
@@ -54,7 +54,7 @@ class QqAutomationPort(Protocol):
 
 
 class LegacyQqAutomationFacade:
-    """复用既有 Dispatcher FIFO，不改变 WGC、OCR 或输入实现。"""
+    """复用既有 Dispatcher FIFO；消息读取使用 QQ 原生复制，不再使用气泡 OCR。"""
 
     def _operator(self):
         """惰性创建 Dispatcher 单例：延迟 import 避免在非 Windows 平台/无桌面环境加载重依赖。
@@ -87,23 +87,27 @@ class LegacyQqAutomationFacade:
     def read_messages(self, contact_name: str) -> dict:
         """读取可见消息：入队执行（最长等 60s），翻译成 Service 层消息结构。"""
         # 入队读取；error 非空表示失败
-        messages, error = self._operator().read_message_list(contact_name, timeout=60.0)
+        result, error = self._operator().read_message_list(contact_name, timeout=60.0)
         if error is not None:
             raise QqAutomationError("QQ_MESSAGES_UNAVAILABLE") from error
-        # 把 utils 层的 Message dict（text/is_self/rect）翻译为 HTTP 契约结构：
-        # 矩形拆成 x/y/w/h 四个字段（前端更好消费），is_self 保留（用于判断 in/out）
+        # 把 QQ 原生复制解析结果翻译为 HTTP 契约结构。
+        # sender/timestamp/text/rawText 是权威字段，消息归属由外部智能体按 sender 判断。
         payload = [
             {
                 "text": item["text"],
-                "isSelf": item["is_self"],
-                "x": item["rect"][0],
-                "y": item["rect"][1],
-                "w": item["rect"][2],
-                "h": item["rect"][3],
+                "sender": item.get("sender"),
+                "timestamp": item.get("timestamp"),
+                "rawText": item.get("rawText"),
             }
-            for item in messages
+            for item in result["messages"]
         ]
-        return {"ok": True, "messages": payload, "count": len(payload), "error": None}
+        return {
+            "ok": True,
+            "messages": payload,
+            "count": len(payload),
+            "copiedText": result["copiedText"],
+            "error": None,
+        }
 
     def check_capture_ready(self) -> dict:
         """检查 QQ 截图是否可用：调用 ensure_qq_window_with_retry 做窗口就绪检测。

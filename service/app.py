@@ -181,13 +181,13 @@ def create_app(
         "/v1/commands/read",
         response_model=ReadMessagesResponse,
         summary="读取指定联系人的可见消息",
-        description="激活联系人并读取当前可见消息窗口，成功后自动写入本地聊天记录。",
+        description="激活联系人并通过 QQ 框选复制读取当前可见消息窗口，成功后自动写入本地聊天记录。",
         tags=["消息"],
         response_description="当前可见消息列表",
     )
     def read_messages(request: ReadMessagesRequest) -> ReadMessagesResponse:
         try:
-            # 同步端点：FastAPI 自动在（线程池）执行视觉读取消息区 + OCR 识别文本
+            # 同步端点：FastAPI 自动在线程池执行 QQ 原生框选复制与文本解析
             payload = facade.read_messages(request.contact_name)
             logger.info(
                 "messages.read.success contact=%s count=%d",
@@ -248,10 +248,9 @@ def create_app(
             ledger.resolve(request.command_id, "FAILED", result)
             # 返回 FAILED 状态给调用方
             return CommandResponse(commandId=request.command_id, status="FAILED", result=result)
-        # 发送成功：账本落 SUCCEEDED 终态
+        # 发送成功：账本落 SUCCEEDED 终态。聊天历史以后续 QQ 原生复制结果为准；
+        # 服务不按正文猜测哪个复制记录对应这次发送。
         ledger.resolve(request.command_id, "SUCCEEDED", result)
-        # 发出的消息自动落库为 out（我方发出），关联 commandId 便于追溯；失败仅告警
-        _try_mark_outbound(chat_history, request.contact_name, request.text, request.command_id)
         logger.info("message.send.success command_id=%s", request.command_id)
         # 返回 SUCCEEDED 状态 + 实际执行结果
         return CommandResponse(commandId=request.command_id, status="SUCCEEDED", result=result)
@@ -280,21 +279,21 @@ def create_app(
         logger.info("command.status command_id=%s status=%s", command_id, current_status)
         return CommandResponse(commandId=command_id, status=current_status, result=result)
 
-    # —— 查询聊天记录接口（查询前自动视觉更新一次） ——
+    # —— 查询聊天记录接口（查询前自动通过 QQ 复制更新一次） ——
     @app.post(
         "/v1/chat/history",
         response_model=ChatHistoryResponse,
         summary="查询聊天记录",
-        description="查询本地聊天记录。查询前会先做一次视觉更新；更新失败时返回旧数据并标记 update=failed。",
+        description="查询本地聊天记录。查询前会先框选复制当前消息；更新失败时返回旧数据并标记 update=failed。",
         tags=["聊天记录"],
         response_description="联系人聊天记录",
     )
     def query_chat_history(request: ChatHistoryRequest) -> ChatHistoryResponse:
-        # 需求约定：每次查询先做一次视觉读取（拉到最新消息），再返回历史，保证数据新鲜
+        # 每次查询先做一次 QQ 原生复制（拉到最新消息），再返回历史，保证数据新鲜
         try:
             payload = facade.read_messages(request.contact_name)
         except QqAutomationError:
-            # 视觉读取失败（如窗口不可用）：不阻断历史查询，只把更新标记为 failed 告知调用方
+            # QQ 复制或文本解析失败：不阻断历史查询，只把更新标记为 failed 告知调用方
             logger.warning("chat.history.update_failed contact=%s", request.contact_name)
             update = "failed"  # 自动更新失败不阻断历史查询
         else:
@@ -311,7 +310,11 @@ def create_app(
         logger.info("chat.history.query contact=%s update=%s count=%d", request.contact_name, update, len(messages))
         # 返回联系人名、消息条数、消息列表与本次更新状态
         return ChatHistoryResponse(
-            contactName=request.contact_name, count=len(messages), messages=messages, update=update
+            contactName=request.contact_name,
+            count=len(messages),
+            messages=messages,
+            copiedText=payload.get("copiedText") if update == "ok" else None,
+            update=update,
         )
 
     # 返回构造好的应用对象（由调用方交给 uvicorn 托管）
@@ -319,23 +322,9 @@ def create_app(
 
 
 def _record_payload(chat_history: ChatHistoryStore, contact_name: str, payload: dict) -> None:
-    """把一次视觉读取结果作为可见窗口差异写入聊天记录存储。"""
+    """把一次复制解析结果作为可见窗口差异写入聊天记录存储。"""
     try:
         inserted = chat_history.append_visible(contact_name, payload["messages"])
         logger.info("chat.history.append contact=%s inserted=%d", contact_name, inserted)
     except Exception:
         logger.exception("chat.history.append_failed contact=%s", contact_name)
-
-
-def _try_mark_outbound(
-    chat_history: ChatHistoryStore,
-    contact_name: str,
-    text: str,
-    command_id: str,
-) -> None:
-    """登记已发送消息；写入失败仅打印告警，不阻断主流程。"""
-    try:
-        chat_history.mark_outbound(contact_name, text, command_id)
-        logger.info("chat.history.mark_outbound contact=%s command_id=%s", contact_name, command_id)
-    except Exception:
-        logger.exception("chat.history.mark_outbound_failed contact=%s command_id=%s", contact_name, command_id)

@@ -66,14 +66,20 @@ class ReadMessagesRequest(StrictModel):
 
 
 class ReadMessagesResponse(StrictModel):
-    """读取可见消息的响应。"""
+    """读取当前可见消息的响应（来源为 QQ 原生复制文本）。"""
 
-    ok: bool = Field(title="读取是否成功", description="视觉读取是否成功。")
+    ok: bool = Field(title="读取是否成功", description="QQ 框选复制与文本解析是否成功。")
     messages: list[dict[str, Any]] = Field(
         title="消息列表",
-        description="当前可见消息列表，包含 text、isSelf 和坐标字段。",
+        description="当前可见消息列表，包含 sender、timestamp、text 和 rawText。",
     )
     count: int = Field(ge=0, title="消息数量", description="本次返回的消息数量。")
+    copied_text: str | None = Field(
+        alias="copiedText",
+        default=None,
+        title="原始复制文本",
+        description="本次读取使用的完整 QQ 剪贴板文本。",
+    )
     error: str | None = Field(
         default=None,
         title="错误信息",
@@ -153,18 +159,16 @@ class ChatHistoryItem(StrictModel):
     """单条聊天记录。"""
 
     id: int = Field(title="记录 ID", description="聊天记录数据库中的自增主键。")
-    direction: Literal["in", "out"] = Field(
-        title="消息方向",
-        description="in：对方发来；out：我方发出。",
-    )
-    text: str = Field(title="消息文本", description="消息的 OCR 文本内容。")
-    seq: int = Field(title="消息序号", description="同一联系人维度下按时间顺序递增。")
-    command_id: str | None = Field(
-        alias="commandId",
+    sender: str | None = Field(default=None, title="发送人", description="QQ 复制文本中的发送人。")
+    timestamp: str | None = Field(default=None, title="消息时间", description="QQ 复制文本中的月日时分秒。")
+    text: str = Field(title="消息文本", description="QQ 复制文本中的消息正文。")
+    raw_text: str | None = Field(
+        alias="rawText",
         default=None,
-        title="命令 ID",
-        description="若为我方发送，关联对应的 commandId。",
+        title="原始消息文本",
+        description="从剪贴板中截取的完整单条消息，包含发送人、时间和正文。",
     )
+    seq: int = Field(title="消息序号", description="同一联系人维度下按时间顺序递增。")
     created_at: str = Field(alias="createdAt", title="记录时间", description="消息入库时间。")
 
 
@@ -190,11 +194,17 @@ class ChatHistoryResponse(StrictModel):
         description="聊天记录所属的 QQ 用户列表联系人名。",
     )
     count: int = Field(ge=0, title="消息数量", description="本次返回的历史消息数量。")
+    copied_text: str | None = Field(
+        alias="copiedText",
+        default=None,
+        title="本次原始复制文本",
+        description="本次更新成功时使用的完整 QQ 剪贴板文本；更新失败时为 null。",
+    )
     messages: list[ChatHistoryItem] = Field(
         title="历史消息",
         description="按 seq 升序排列的历史消息列表。",
     )
     update: Literal["ok", "failed"] = Field(
         title="自动更新结果",
-        description="ok：查询前视觉更新成功；failed：更新失败，返回旧数据。",
+        description="ok：查询前 QQ 复制更新成功；failed：复制或解析失败，返回旧数据。",
     )

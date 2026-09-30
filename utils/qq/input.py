@@ -115,7 +115,7 @@ class InputBox:
     def refresh(self):
         """定位输入框与发送按钮并获取截图，随后点击输入框把焦点交给它。
 
-        等价于 UserList.refresh / MessageList.refresh_messageList 的对外刷新入口：
+        与 UserList.refresh 同属区域定位刷新入口：
         refresh() 一次完成"定位 + 聚焦"，之后即可 paste_text / send_message。
         窗口不就绪时抛 QQWindowNotReadyError，不静默返回 False。
         """

@@ -39,11 +39,19 @@ class FakeAutomation:
         return {"ok": True, "sent": True, "textLength": len(text), "error": None}
 
     def read_messages(self, contact_name: str) -> dict:
-        # 固定返回一条消息
+        # 固定返回一条 QQ 原生复制解析消息
         return {
             "ok": True,
-            "messages": [{"text": "有货", "isSelf": False, "x": 1, "y": 2, "w": 3, "h": 4}],
+            "messages": [
+                {
+                    "sender": "TJJ",
+                    "timestamp": "09-30 12:00:01",
+                    "text": "有货",
+                    "rawText": "TJJ: 09-30 12:00:01 有货",
+                }
+            ],
             "count": 1,
+            "copiedText": "TJJ: 09-30 12:00:01 有货",
             "error": None,
         }
 
@@ -101,6 +109,8 @@ async def test_api_projects_legacy_automation_as_v1_contract(service) -> None:
     assert contacts.json()["count"] == 1
     # 断言：读到的消息文本正确
     assert messages.json()["messages"][0]["text"] == "有货"
+    assert messages.json()["messages"][0]["sender"] == "TJJ"
+    assert "direction" not in messages.json()["messages"][0]
 
 
 @pytest.mark.asyncio

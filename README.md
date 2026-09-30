@@ -171,10 +171,10 @@ Content-Type: application/json
 | --- | --- |
 | `window_ops.py` | QQ 进程/窗口枚举、快捷键唤起（Ctrl+Alt+X 打开/隐藏所有窗口，有进程无窗口时唤醒）、`get_main_window` / `ensure_qq_window_with_retry` |
 | `regions.py` | `RegionResult`；`get_userList_region_and_image` / `get_inputbox_region_and_image` / `get_message_box_region_and_image` / `get_input_buttom_region`；模板在 `templates/` |
-| `models.py` | 数据模型：`User`（`to_dict`）与 `Message`（text/rect/is_self） |
+| `models.py` | 数据模型：`User`（`to_dict`） |
 | `user_list.py` | `UserList`（单例）：霍夫圆定位用户行 → **拼图一次 OCR 识别全部昵称** → 红点检测；`find_user`（包含匹配 + 中英文规范化）、`active_user_by_name`、`get_user_list`（1s 缓存） |
 | `input.py` | `InputBox`（单例）：`send_text(contact_name, text)` 内部自动激活会话→聚焦→剪贴板粘贴→Ctrl+V→按 Enter 快捷键发送 |
-| `message.py` | `Message` + `MessageList`（单例）：`read_messages(contact_name)` 内部自动激活会话→气泡检测→**拼图一次 OCR**→按 y 边界切分文本→判断发送方 `is_self` |
+| `message.py` | `MessageList`（单例）：`read_messages(contact_name)` 内部自动激活会话→左上到右下框选→定位并点击 `copy_icon.png`→读取剪贴板→解析 sender/timestamp/text/rawText |
 | `hotkeys.py` | QQ 全局快捷键配置表（Ctrl+Alt+X 打开/隐藏所有窗口、Enter 发送）与 `send_hotkey` 发送原语 |
 | `dispatcher.py` | `Dispatcher` 单消费者任务队列（唯一入口）：`get_contact_list` / `send_message` / `read_message_list`（发送/读取内部自动激活用户） |
 
