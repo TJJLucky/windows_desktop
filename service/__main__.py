@@ -16,6 +16,8 @@ from __future__ import annotations
 
 # argparse：命令行参数解析（--endpoint-file / --state-dir）
 import argparse
+# ctypes：调用 Windows named mutex，阻止同一状态目录并发初始化
+import ctypes
 # asyncio：驱动 uvicorn 的异步事件循环
 import asyncio
 # logging：记录服务启动、接口执行和异常明细
@@ -24,6 +26,8 @@ import logging
 from datetime import datetime, timezone
 # json：endpoint 文件的序列化 / 反序列化
 import json
+# hashlib：把规范化 state_dir 映射为稳定且合法的 mutex 名称
+import hashlib
 # os：获取当前进程 pid（写入 endpoint 文件）、判断操作系统类型（Windows 数据目录选择）
 import os
 # Path：跨平台路径对象，统一处理 endpoint 文件与状态目录
@@ -87,67 +91,130 @@ def main() -> None:
     else:
         state_dir = (default_runtime_dir / "state").resolve()
 
-    # 让窗口状态缓存跟随本次服务状态目录；显式环境变量优先。
-    os.environ.setdefault("QQ_WINDOW_CACHE_DB", str((state_dir / "qq-window-cache.sqlite3").resolve()))
-    log_dir = (arguments.log_dir or (state_dir / "logs")).expanduser().resolve()
-    app_log, console_log = setup_logging(log_dir)
-    log_environment()
-    logger = logging.getLogger("qq_service.startup")
-    logger.info(
-        "service.config mode=%s endpoint_file=%s state_dir=%s log_dir=%s app_log=%s console_log=%s",
-        "default" if default_mode else "explicit",
-        endpoint_file,
-        state_dir,
-        log_dir,
-        app_log,
-        console_log,
-    )
-
-    # 默认模式下做"防重复拉起"检查：若已有实例在跑，直接提示并退出，避免双击两次起两个服务
-    if default_mode:
+    # named mutex 必须先于日志、SQLite、端口等共享资源初始化。即使两个进程在同一瞬间
+    # 启动，同一个 state_dir 也只有一个进程能继续执行。
+    instance_mutex = _StateDirectoryMutex.acquire(state_dir)
+    if instance_mutex is None:
         existing = _existing_running(endpoint_file)
-        if existing is not None:
-            # 打印友好提示后直接 return（不再绑定端口、不发布 endpoint、不启动 uvicorn）
-            print(f"[INFO] 服务已在运行 (pid={existing})，直接使用现有实例，本次退出。")
-            return
+        pid_text = f" (pid={existing})" if existing is not None else ""
+        print(f"[INFO] 相同状态目录的服务已在运行{pid_text}，本次退出。")
+        return
 
+    try:
+        # 让窗口状态缓存跟随本次服务状态目录；显式环境变量优先。
+        os.environ.setdefault("QQ_WINDOW_CACHE_DB", str((state_dir / "qq-window-cache.sqlite3").resolve()))
+        log_dir = (arguments.log_dir or (state_dir / "logs")).expanduser().resolve()
+        app_log, console_log = setup_logging(log_dir)
+        log_environment()
+        logger = logging.getLogger("qq_service.startup")
+        logger.info(
+            "service.config mode=%s endpoint_file=%s state_dir=%s log_dir=%s app_log=%s console_log=%s",
+            "default" if default_mode else "explicit",
+            endpoint_file,
+            state_dir,
+            log_dir,
+            app_log,
+            console_log,
+        )
+        _run_service(
+            default_mode=default_mode,
+            default_runtime_dir=default_runtime_dir,
+            endpoint_file=endpoint_file,
+            state_dir=state_dir,
+            log_dir=log_dir,
+            app_log=app_log,
+            console_log=console_log,
+            logger=logger,
+        )
+    finally:
+        instance_mutex.close()
+
+
+def _run_service(
+    *,
+    default_mode: bool,
+    default_runtime_dir: Path,
+    endpoint_file: Path,
+    state_dir: Path,
+    log_dir: Path,
+    app_log: Path,
+    console_log: Path,
+    logger: logging.Logger,
+) -> None:
+    """在已持有 state_dir mutex 的前提下初始化并运行服务。"""
     # 绑定 loopback 监听套接字（127.0.0.1 + 系统分配随机端口），只接受本机连接
     listener = _bind_loopback_listener()
-    # 从套接字取回操作系统实际分配的端口号
-    port = int(listener.getsockname()[1])
-    # 把「端口 + pid + 日志目录」原子写入 endpoint 文件（先写临时文件再 os.replace 覆盖）
-    _publish_endpoint(endpoint_file, port, log_dir, app_log, console_log)
-    logger.info("service.listening port=%d endpoint=http://127.0.0.1:%d", port, port)
-
-    # 默认模式额外打印数据目录，方便最终用户知道状态数据落在哪里
-    if default_mode:
-        print(f"[INFO] 默认运行模式，数据目录: {default_runtime_dir}")
-    # 打印 endpoint 与日志路径，方便最终用户直接定位
-    print(f"[INFO] endpoint 文件: {endpoint_file}")
-    print(f"[INFO] 日志目录: {log_dir}")
-    print(f"[INFO] 应用日志: {app_log}")
-    print(f"[INFO] 控制台日志: {console_log}")
-    # 打印调试页地址：Swagger UI（/docs），浏览器打开即可直接发请求调试（无需 token）
-    print(f"[INFO] 调试页面(Swagger): http://127.0.0.1:{port}/docs")
-
-    # 构造 FastAPI 应用：传入账本数据库路径（聊天记录库路径由 create_app 自动推导）
-    app = create_app(ledger_path=state_dir / "qq-command-ledger.sqlite3")
+    endpoint_published = False
     try:
-        # 用 asyncio 运行 uvicorn 服务：serve 绑定到已就绪的 listener 上（不再二次 bind）
-        # sockets 参数传入监听套接字，保证端口就是我们上面绑定的那个随机端口
-        # use_colors=False：关闭 ANSI 颜色码，避免 exe 控制台/日志查看器显示乱码
+        # 从套接字取回操作系统实际分配的端口号
+        port = int(listener.getsockname()[1])
+        # 把「端口 + pid + 日志目录」原子写入 endpoint 文件（先写临时文件再 os.replace 覆盖）
+        _publish_endpoint(endpoint_file, port, log_dir, app_log, console_log)
+        endpoint_published = True
+        logger.info("service.listening port=%d endpoint=http://127.0.0.1:%d", port, port)
+
+        if default_mode:
+            print(f"[INFO] 默认运行模式，数据目录: {default_runtime_dir}")
+        print(f"[INFO] endpoint 文件: {endpoint_file}")
+        print(f"[INFO] 日志目录: {log_dir}")
+        print(f"[INFO] 应用日志: {app_log}")
+        print(f"[INFO] 控制台日志: {console_log}")
+        print(f"[INFO] 调试页面(Swagger): http://127.0.0.1:{port}/docs")
+
+        # create_app 会初始化 SQLite，因此也必须处于 mutex 与清理保护范围内。
+        app = create_app(ledger_path=state_dir / "qq-command-ledger.sqlite3")
         asyncio.run(uvicorn.Server(uvicorn.Config(app, log_level="info", use_colors=False)).serve(sockets=[listener]))
     except Exception:
         logger.exception("service.crashed")
         raise
     finally:
         logger.info("service.stopping")
-        # 无论正常退出还是异常中断，都要先关闭监听套接字
         listener.close()
-        # 再清理 endpoint 文件：只有确认该文件是本进程写出的（pid 匹配）才删除，
-        # 避免误删其他实例或旧实例留下的文件
-        _delete_owned_endpoint(endpoint_file)
+        if endpoint_published:
+            _delete_owned_endpoint(endpoint_file)
 
+
+
+class _StateDirectoryMutex:
+    """同一 Windows 登录会话中按 state_dir 唯一的进程互斥锁。"""
+
+    ERROR_ALREADY_EXISTS = 183
+
+    def __init__(self, handle: int, close_handle) -> None:
+        self._handle = handle
+        self._close_handle = close_handle
+
+    @staticmethod
+    def name_for(state_dir: Path) -> str:
+        canonical = os.path.normcase(str(state_dir.expanduser().resolve()))
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+        return rf"Local\price-agent-qq-service-{digest}"
+
+    @classmethod
+    def acquire(cls, state_dir: Path) -> _StateDirectoryMutex | None:
+        if os.name != "nt":
+            raise RuntimeError("QQ Desktop Service 仅支持 Windows")
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_mutex = kernel32.CreateMutexW
+        create_mutex.argtypes = (ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p)
+        create_mutex.restype = ctypes.c_void_p
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (ctypes.c_void_p,)
+        close_handle.restype = ctypes.c_bool
+
+        handle = create_mutex(None, False, cls.name_for(state_dir))
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if ctypes.get_last_error() == cls.ERROR_ALREADY_EXISTS:
+            close_handle(handle)
+            return None
+        return cls(handle, close_handle)
+
+    def close(self) -> None:
+        if self._handle:
+            self._close_handle(self._handle)
+            self._handle = 0
 
 def _default_runtime_dir() -> Path:
     """计算默认数据目录：Windows 用 %LOCALAPPDATA%\\price-agent-qq-service，其余平台用 ~/.price-agent-qq-service。"""

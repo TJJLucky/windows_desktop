@@ -13,7 +13,7 @@ import pytest
 # 被测函数：
 # _default_runtime_dir —— 计算默认数据目录（%LOCALAPPDATA% 或主目录）
 # _existing_running —— 依据 endpoint 文件判断是否已有实例在跑
-from service.__main__ import _default_runtime_dir, _existing_running
+from service.__main__ import _StateDirectoryMutex, _default_runtime_dir, _existing_running
 
 
 def test_default_runtime_dir_uses_localappdata(monkeypatch):
@@ -51,3 +51,37 @@ def test_existing_running_none_when_dead(tmp_path):
 def test_existing_running_none_when_missing(tmp_path):
     # 场景：endpoint 文件根本不存在（首次运行）→ 应返回 None
     assert _existing_running(tmp_path / "absent.json") is None
+
+
+def test_state_directory_mutex_name_is_stable_and_path_specific(tmp_path):
+    first = _StateDirectoryMutex.name_for(tmp_path / "state-a")
+    same = _StateDirectoryMutex.name_for(tmp_path / "state-a" / ".." / "state-a")
+    other = _StateDirectoryMutex.name_for(tmp_path / "state-b")
+
+    assert first == same
+    assert first.startswith(r"Local\price-agent-qq-service-")
+    assert first != other
+
+
+def test_state_directory_mutex_close_is_idempotent():
+    closed: list[int] = []
+    mutex = _StateDirectoryMutex(123, lambda handle: closed.append(handle) or True)
+
+    mutex.close()
+    mutex.close()
+
+    assert closed == [123]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows named mutex only")
+def test_state_directory_mutex_rejects_second_owner_and_releases(tmp_path):
+    first = _StateDirectoryMutex.acquire(tmp_path / "state")
+    assert first is not None
+    try:
+        assert _StateDirectoryMutex.acquire(tmp_path / "state") is None
+    finally:
+        first.close()
+
+    reacquired = _StateDirectoryMutex.acquire(tmp_path / "state")
+    assert reacquired is not None
+    reacquired.close()
