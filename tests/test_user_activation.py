@@ -11,7 +11,7 @@ import pytest
 from utils.qq.models import User
 from utils.qq.regions import RegionResult
 from utils.qq import user_list as user_list_module
-from utils.qq.user_list import ContactNotFoundError, UserList
+from utils.qq.user_list import ContactNotFoundError, USER_LIST_CACHE_TTL_SECONDS, UserList
 
 
 class _DummyCaptureCtx:
@@ -24,6 +24,10 @@ class _DummyCaptureCtx:
     def __exit__(self, exc_type, exc_val, exc_tb):
         return False
 
+
+
+def test_user_list_cache_ttl_is_three_seconds():
+    assert USER_LIST_CACHE_TTL_SECONDS == 3.0
 
 def test_active_user_converts_full_image_circle_to_screen_coordinates(monkeypatch):
     user_list = UserList()

@@ -187,7 +187,7 @@ class Dispatcher:
         return {"ready": True, "windowTitle": getattr(win, "title", None)}
 
     def get_contact_list_impl(self) -> dict[str, dict]:
-        """实际实现：读用户列表（内部 1s 缓存）。"""
+        """实际实现：读用户列表（内部 3s 缓存）。"""
         return self.userList.get_user_list()
 
     def send_message_impl(self, contact_name: str, text: str) -> bool:

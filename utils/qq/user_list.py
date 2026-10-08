@@ -6,12 +6,12 @@
 3. 以头像为中心裁出行区域（排除头像，保留文字与红点区）；
 4. 图像预处理 + OCR 提取黑色昵称；顶部区域 OCR 判定当前激活会话；
 5. RGB 颜色检测未读红点；
-6. 组装 User 并整体替换 self.users（1s 缓存对外）。
+6. 组装 User 并整体替换 self.users（3s 缓存对外）。
 """
 
 # Counter：统计高频像素颜色（背景色判定）
 from collections import Counter
-# time：1s 缓存时间戳
+# time：3s 缓存时间戳
 import threading
 import time
 # re：昵称规范化（只留中英文）与 OCR 文本清洗
@@ -40,6 +40,9 @@ from ..vision.ocr import OCREngine
 from ..vision.compose import compose_bubbles_to_one, split_ocr_by_bubble
 # 随机点击（激活会话时点用户行）
 from ..core.mouse import random_click
+
+
+USER_LIST_CACHE_TTL_SECONDS = 3.0
 
 
 class ContactNotFoundError(ValueError):
@@ -575,7 +578,7 @@ class UserList:
     def _ensure_user_list_fresh(self, force: bool = False) -> None:
         """刷新用户列表；并发调用共享同一轮成功结果或失败异常。"""
         with self._cache_condition:
-            if not force and self.userList_region is not None and time.time() - self.cache_ts < 1.0:
+            if not force and self.userList_region is not None and time.time() - self.cache_ts < USER_LIST_CACHE_TTL_SECONDS:
                 return
 
             start_generation = self._cache_generation
