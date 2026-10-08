@@ -14,11 +14,11 @@ description: 构建并校验 price-agent-windows-desktop（QQ 桌面视觉 RPA �
 
 ```powershell
 # 构建单文件 exe + --help 冒烟 + 启动冒烟（默认 qq-desktop-service 环境）
-python scripts\build_exe.py --project-dir E:\Project\agent\windows_desktop --smoke-start
+conda run -n qq-desktop-service python .skills\qq-desktop-package\scripts\build_exe.py --project-dir E:\Project\agent\windows_desktop --smoke-start
 
 # 只校验现有 exe / 指定解释器 / 指定产物名
-python scripts\build_exe.py --project-dir <dir> --skip-build
-python scripts\build_exe.py --project-dir <dir> --python D:\anaconda3\envs\<env>\python.exe --name qq-desktop-service
+conda run -n qq-desktop-service python .skills\qq-desktop-package\scripts\build_exe.py --project-dir <dir> --skip-build
+conda run -n qq-desktop-service python .skills\qq-desktop-package\scripts\build_exe.py --project-dir <dir> --python D:\anaconda3\envs\<env>\python.exe --name qq-desktop-service
 ```
 
 退出码 0 = 可交付；非 0 = 有 `[FAIL]` 行，按提示修复后重跑。

@@ -4,7 +4,7 @@
 
 | 工具 | 产物 | 脚本 |
 | --- | --- | --- |
-| PyInstaller onefile | `dist-exe/qq-desktop-service.exe`（~110MB） | `scripts/build_exe.py` |
+| PyInstaller onefile | `dist-exe/qq-desktop-service.exe`（~110MB） | `.skills/qq-desktop-package/scripts/build_exe.py` |
 
 wheel 方案已废弃（`build_and_verify.py` 已删除，pyproject 移除 build-system 与 hatch 配置），
 不再产出 `dist/`。打包/发布只走 exe。
@@ -86,12 +86,12 @@ python -m service --endpoint-file <endpoint.json> --state-dir <state-dir> --log-
 
 ```powershell
 # --help 必须含 endpoint-file/state-dir/log-dir；--smoke-start 时启动后 /v1/health == READY
-python scripts\build_exe.py --project-dir E:\Project\agent\windows_desktop --smoke-start
+conda run -n qq-desktop-service python .skills\qq-desktop-package\scripts\build_exe.py --project-dir E:\Project\agent\windows_desktop --smoke-start
 # 只校验现有 exe（不重新构建）
-python scripts\build_exe.py --project-dir E:\Project\agent\windows_desktop --skip-build
+conda run -n qq-desktop-service python .skills\qq-desktop-package\scripts\build_exe.py --project-dir E:\Project\agent\windows_desktop --skip-build
 ```
 
 ## 校验清单变更规则
 
 每次改 PyInstaller 参数（COLLECT_DATA / ADD_DATA / HIDDEN_IMPORTS）或产物路径后，同步更新
-`scripts/build_exe.py` 里的常量与 `verify_exe` 的断言，并跑一次 `--skip-build` 验证。
+`.skills/qq-desktop-package/scripts/build_exe.py` 里的常量与 `verify_exe` 的断言，并跑一次 `--skip-build` 验证。
