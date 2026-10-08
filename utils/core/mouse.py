@@ -105,6 +105,12 @@ def smooth_move_to(x: int, y: int) -> None:
     _call("Mousegoto", x, y)
 
 
+def move_to(x: int, y: int) -> None:
+    """直接移动到目标坐标，不生成 WindMouse 中间轨迹。"""
+    _require_screen_coordinate(x, y)
+    _call("Mousegoto", x, y)
+
+
 def random_point(x: int, y: int, w: int, h: int) -> tuple[int, int]:
     """在矩形区域内随机取一点（不包含右/下边界）。"""
     if w <= 0 or h <= 0:
@@ -120,7 +126,7 @@ def random_click(x: int, y: int, w: int, h: int, delay: float = 0.05, restore: b
     click_at(*random_point(x, y, w, h), delay=delay, restore=restore)
 
 
-def click_at(x: int, y: int, delay: float = 0.05, restore: bool = True) -> None:
+def click_at(x: int, y: int, delay: float = 0.05, restore: bool = True, smooth: bool = True) -> None:
     """平滑移动到目标后点击；按原有约定可选地恢复鼠标位置。
 
     对应的 C++ 调用顺序为：
@@ -129,13 +135,13 @@ def click_at(x: int, y: int, delay: float = 0.05, restore: bool = True) -> None:
     """
     # 先记住用户原来的鼠标位置；False 时不读取也不恢复，适用于后续动作需要保留焦点的场景。
     old = _cursor_position() if restore else None
-    smooth_move_to(x, y)
+    (smooth_move_to if smooth else move_to)(x, y)
     _call("LmouseDown")
     time.sleep(delay)
     _call("LmouseUp")
     if old is not None:
-        # 归位同样走 DLL 的平滑移动，而不是 Python SetCursorPos，确保输入实现只有一套。
-        smooth_move_to(*old)
+        # 归位使用与前往目标相同的移动策略。
+        (smooth_move_to if smooth else move_to)(*old)
 
 
 def random_right_click(x: int, y: int, w: int, h: int, delay: float = 0.05, restore: bool = True) -> None:
@@ -163,7 +169,7 @@ def right_click_at(x: int, y: int, delay: float = 0.05, restore: bool = True) ->
 
 
 def drag(from_x: int, from_y: int, to_x: int, to_y: int, steps: int = 10, duration: float = 0.3) -> None:
-    """平滑移动到拖拽起点，再由 DLL 按线性时间轨迹执行拖拽。
+    """直接移动到拖拽起点，再由 DLL 按线性时间轨迹执行拖拽。
 
     ``steps`` 为兼容旧调用保留；上游 ``dragFromTo`` 固定以约 10 ms 一步执行。
     ``duration`` 会以 C++ ``float`` 传给 DLL，单位为秒。
@@ -175,6 +181,6 @@ def drag(from_x: int, from_y: int, to_x: int, to_y: int, steps: int = 10, durati
         raise ValueError("duration 不能小于 0")
     for x, y in ((from_x, from_y), (to_x, to_y)):
         _require_screen_coordinate(x, y)
-    # 先使用 WindMouse 走到拖拽起点，再调用 DLL 的完整按下/移动/抬起流程。
-    smooth_move_to(from_x, from_y)
+    # 起点要求速度和坐标准确性，直接跳转，避免 WindMouse 缓慢绕行。
+    move_to(from_x, from_y)
     _call("dragFromTo", from_x, from_y, to_x, to_y, ctypes.c_float(duration))

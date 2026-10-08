@@ -4,6 +4,7 @@ from PIL import Image
 
 from utils.qq.message import _MESSAGE_SELECTION_DRAG_DURATION
 from utils.qq import regions
+from utils.core import mouse
 
 
 def test_get_copy_action_region_matches_only_bottom_toolbar(monkeypatch):
@@ -51,3 +52,27 @@ def test_get_copy_action_region_returns_none_when_template_is_not_found(monkeypa
 def test_message_selection_drag_uses_fastest_verified_duration():
     """0.0 秒已在真实 QQ 左上到右下多选测试中连续 10 次成功。"""
     assert _MESSAGE_SELECTION_DRAG_DURATION == 0.0
+
+
+def test_direct_click_skips_windmouse(monkeypatch):
+    calls: list[tuple] = []
+    monkeypatch.setattr(mouse, "_call", lambda name, *args: calls.append((name, *args)))
+
+    mouse.click_at(100, 200, delay=0, restore=False, smooth=False)
+
+    assert calls == [
+        ("Mousegoto", 100, 200),
+        ("LmouseDown",),
+        ("LmouseUp",),
+    ]
+
+
+def test_drag_moves_directly_to_selection_start(monkeypatch):
+    calls: list[tuple] = []
+    monkeypatch.setattr(mouse, "_call", lambda name, *args: calls.append((name, *args)))
+
+    mouse.drag(100, 200, 300, 400, duration=0)
+
+    assert calls[0] == ("Mousegoto", 100, 200)
+    assert calls[1][0] == "dragFromTo"
+    assert all(call[0] != "SmoothMousegoto" for call in calls)

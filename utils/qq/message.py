@@ -132,6 +132,7 @@ class MessageList:
                 copy_action["left"] + copy_action["w"] // 2,
                 copy_action["top"] + copy_action["h"] // 2,
                 restore=False,
+                smooth=False,
             )
 
         time.sleep(0.15)
