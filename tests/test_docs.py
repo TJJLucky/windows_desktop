@@ -11,31 +11,31 @@ from pathlib import Path
 # pytest：测试框架
 import pytest
 # TestClient：不真正起服务器的 FastAPI 测试客户端（httpx 驱动）
-from fastapi.testclient import TestClient
+import httpx
 
 # create_app：被测应用的工厂函数
 from service.app import create_app
 
 
 @pytest.fixture
-def client(tmp_path: Path):
+def app(tmp_path: Path):
     # 每个测试都用独立临时目录放账本库，避免测试间相互污染
-    app = create_app(ledger_path=tmp_path / "ledger.sqlite3")
-    # 返回一个不发真实网络请求的测试客户端（直接调用 ASGI 应用）
-    return TestClient(app)
+    return create_app(ledger_path=tmp_path / "ledger.sqlite3")
 
 
-def test_docs_available(client):
+async def test_docs_available(app):
     # 场景：GET /docs 应返回 Swagger UI 页面
-    resp = client.get("/docs")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/docs")
     # 断言：200 且页面包含 swagger 字样（说明返回的是 Swagger 资源页而非 404）
     assert resp.status_code == 200
     assert "swagger" in resp.text.lower()
 
 
-def test_openapi_lists_v1_apis(client):
+async def test_openapi_lists_v1_apis(app):
     # 场景：GET /openapi.json 应返回完整机器可读合同
-    resp = client.get("/openapi.json")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/openapi.json")
     # 断言：200 可访问
     assert resp.status_code == 200
     # 取出 OpenAPI 契约中的路径表
@@ -45,8 +45,9 @@ def test_openapi_lists_v1_apis(client):
         assert path in paths
 
 
-def test_openapi_uses_chinese_descriptions(client):
-    body = client.get("/openapi.json").json()
+async def test_openapi_uses_chinese_descriptions(app):
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        body = (await client.get("/openapi.json")).json()
     assert body["info"]["title"] == "QQ 桌面自动化服务"
     assert body["paths"]["/v1/commands/send"]["post"]["summary"] == "发送消息"
     send_schema = body["components"]["schemas"]["SendMessageRequest"]
