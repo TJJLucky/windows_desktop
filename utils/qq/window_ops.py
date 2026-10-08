@@ -94,8 +94,13 @@ def get_qq_windows():
         return []
 
     qq_windows = []
-    # 遍历系统所有顶层窗口
+    seen_hwnds: set[int] = set()
+    # 遍历系统所有顶层窗口；pygetwindow 在部分机器上可能重复返回同一 HWND。
     for win in gw.getAllWindows():
+        hwnd = int(win._hWnd)
+        if hwnd in seen_hwnds or not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
+            continue
+        seen_hwnds.add(hwnd)
         title = win.title.strip()  # 窗口标题
         # 原实现曾跳过无标题/不可见窗口（已注释掉）：托盘缩起时主窗口可能不可见，
         # 保留全部窗口再由上层按需过滤更稳
@@ -170,13 +175,42 @@ def match_switch_to_small():
             "right": int(window.left + region["right"]), "bottom": int(window.top + region["bottom"])}
 
 
+def _main_window_candidates() -> list:
+    """返回标题恰为 QQ 的唯一可见窗口。"""
+    return [win for win in get_qq_windows() if win.title.strip().casefold() == "qq"]
+
+
+def _reset_duplicate_main_windows(windows: list, timeout: float = 5.0):
+    """关闭冲突的 QQ 主窗口，再通过 QQ 全局快捷键重新打开唯一主面板。"""
+    hwnds = sorted({int(win._hWnd) for win in windows})
+    print(f"[WARN] 检测到 {len(hwnds)} 个标题为 QQ 的窗口，关闭后重新打开主窗口: {hwnds}")
+    for hwnd in hwnds:
+        if win32gui.IsWindow(hwnd):
+            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+
+    deadline = time.time() + min(timeout, 2.0)
+    while time.time() < deadline and _main_window_candidates():
+        time.sleep(0.1)
+
+    # QQ 通常仍驻留托盘，使用用户配置的全局快捷键主动打开主面板。
+    send_hotkey(TOGGLE_QQ_WINDOWS)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        candidates = _main_window_candidates()
+        if len(candidates) == 1:
+            print(f"[OK] QQ 主窗口已重新打开 hwnd={candidates[0]._hWnd}")
+            return candidates[0]
+        time.sleep(0.2)
+    return None
+
+
 def get_main_window():
-    """查找 QQ 主窗口（标题恰为 QQ），返回窗口对象或 None。"""
-    # 遍历所有 QQ 窗口
-    for win in get_qq_windows():
-        # 标题（小写后）恰为 "qq" → 主窗口（会话窗口标题是联系人名，主窗口才是 qq）
-        if win.title.strip().lower() == "qq":
-            return win
+    """查找唯一 QQ 主窗口；冲突时关闭所有同名窗口并重新打开。"""
+    candidates = _main_window_candidates()
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        return _reset_duplicate_main_windows(candidates)
     return None
 
 

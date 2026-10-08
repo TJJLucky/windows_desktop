@@ -160,6 +160,19 @@ def _cached_region_result(name: str):
         return wrapper
     return decorator
 
+_QQ_NAVIGATION_BAR_WIDTH = 60
+
+
+def _fallback_user_list_region(image: Image.Image, right_top_region: dict) -> dict:
+    """左锚点失配时，以右锚点为右界，并固定排除最左侧 60px 导航栏。"""
+    left = min(_QQ_NAVIGATION_BAR_WIDTH, int(right_top_region["left"]))
+    top = int(right_top_region["bottom"])
+    return {
+        "x": left, "y": top, "top": top, "bottom": image.height,
+        "left": left, "right": int(right_top_region["right"]),
+    }
+
+
 @_cached_region_result("userlist")
 @timer
 def get_userList_region_and_image(window, QQ_window_image=None):
@@ -182,15 +195,25 @@ def get_userList_region_and_image(window, QQ_window_image=None):
 
     right_top_region = find_template(QQ_window_image, right_search_bar_image, 0.9)
 
-    # 任一锚点缺失 → 界面布局对不上（版本变更/窗口异常），直接报错让上层兜底
-    if left_top_region is None or right_top_region is None:
+    if right_top_region is None:
         raise RuntimeError(
-            f"get_userList_region_and_image failed: left_top={left_top_region is not None} right_top={right_top_region is not None}")
-    # 列表区域 = 搜索栏两角的最底部 → 窗口底边（列表顶边取两锚点 bottom 较大者）
-    region = {"x": left_top_region["x"], "y": left_top_region["y"],
-              "top": max(left_top_region['bottom'], right_top_region['bottom']),
-              "bottom": QQ_window_image.height,
-              "left": left_top_region['left'], "right": right_top_region['right']}
+            f"get_userList_region_and_image failed: left_top={left_top_region is not None} right_top=False")
+
+    # 新版/主题化 QQ 的搜索栏左侧外观可能变化。右锚点仍有效时，以它确定
+    # 右边界和顶部，左边界固定排除最左侧 60px 导航栏。
+    if left_top_region is None:
+        region = _fallback_user_list_region(QQ_window_image, right_top_region)
+        print(
+            "[WARN] 用户列表左搜索栏模板未命中，按固定导航栏宽度回退 "
+            f"left={region['left']} right={region['right']} top={region['top']}"
+        )
+    else:
+        left = int(left_top_region["left"])
+        top = max(int(left_top_region["bottom"]), int(right_top_region["bottom"]))
+
+    if left_top_region is not None:
+        region = {"x": left, "y": top, "top": top, "bottom": QQ_window_image.height,
+                  "left": left, "right": right_top_region['right']}
     # 返回屏幕坐标 + 截图坐标 + 区域图 + 整窗图
     return RegionResult(
         screen_region=_to_screen(window, region),
