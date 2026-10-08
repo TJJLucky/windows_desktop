@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 import logging
+import threading
+from pathlib import Path
 
 # Protocol：结构化类型协议（鸭子类型接口），无需继承即可满足
 from typing import Protocol
@@ -140,3 +142,67 @@ class LegacyQqAutomationFacade:
             logger.warning("capture.check.failed error=%s", error)
             return {"ready": False, "error": "QQ_WINDOW_NOT_READY"}
         return result
+
+    def identity_snapshot(self) -> dict:
+        return self._bound_operation("list")
+
+    def bound_read(self, expected: dict) -> dict:
+        return self._bound_operation("read", expected)
+
+    def bound_send(self, expected: dict, text: str) -> dict:
+        return self._bound_operation("send", expected, text)
+
+    def _bound_operation(self, operation: str, expected: dict | None = None, text: str | None = None) -> dict:
+        result, error = self._operator().bound_operation(operation, expected, text, timeout=60.0)
+        if error is not None:
+            raise QqAutomationError(str(error)) from error
+        return result
+
+
+class identity_facade:
+    """身份扩展端口；所有读写在 Dispatcher 内重新核对同一行与会话标题。"""
+
+    def __init__(self, automation, identity_store_path: Path, history_store) -> None:
+        from .identity_store import identity_store
+        self._automation = automation
+        self._identities = identity_store(identity_store_path)
+        self._history = history_store
+        self._lock = threading.RLock()
+        self.identity_warnings: list[dict] = []
+
+    def list_bound_contacts(self) -> dict[str, dict]:
+        with self._lock:
+            try:
+                snapshot = self._automation.identity_snapshot()
+                self.identity_warnings = snapshot.get("ambiguousContacts", [])
+                return self._identities.capture(snapshot)
+            except ValueError as exc:
+                raise QqAutomationError(str(exc)) from exc
+
+    def read_bound_messages(self, contact_name: str, session_id: str, conversation_id: str) -> dict:
+        with self._lock:
+            try:
+                expected = self._identities.require(session_id, conversation_id, contact_name)
+                result = self._automation.bound_read(expected)
+                self._identities.record_header(session_id, conversation_id, result["headerName"])
+                self._history.append_bound_visible(session_id, conversation_id, result["messages"])
+                sequence = self._history.bound_sequence(session_id, conversation_id)
+                messages = self.bound_history(session_id, conversation_id, max(0, sequence - 100))
+                return {"ok": True, "messages": messages, "count": len(messages), "sequence": sequence,
+                        "sessionId": session_id, "conversationId": conversation_id,
+                        "headerName": result["headerName"], "error": None}
+            except ValueError as exc:
+                raise QqAutomationError(str(exc)) from exc
+
+    def send_bound_message(self, contact_name: str, text: str, session_id: str, conversation_id: str) -> dict:
+        with self._lock:
+            try:
+                expected = self._identities.require(session_id, conversation_id, contact_name)
+                if not expected["headerName"]:
+                    raise ValueError("QQ_IDENTITY_READ_BASELINE_REQUIRED")
+                return self._automation.bound_send(expected, text)
+            except ValueError as exc:
+                raise QqAutomationError(str(exc)) from exc
+
+    def bound_history(self, session_id: str, conversation_id: str, after_sequence: int) -> list[dict]:
+        return self._history.get_bound_history(session_id, conversation_id, after_sequence)

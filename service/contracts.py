@@ -10,7 +10,8 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator, field_validator
+from urllib.parse import urlparse
 
 
 API_VERSION = "v1"
@@ -63,6 +64,14 @@ class ReadMessagesRequest(StrictModel):
         description="QQ 用户列表中的联系人名，必须使用 /v1/contacts:query 返回的 key。",
         examples=["华强电子"],
     )
+    session_id: str | None = Field(default=None, alias="sessionId", min_length=1, max_length=160)
+    conversation_id: str | None = Field(default=None, alias="conversationId", min_length=1, max_length=160)
+
+    @model_validator(mode="after")
+    def require_stable_identity(self):
+        if bool(self.session_id) != bool(self.conversation_id):
+            raise ValueError("sessionId 与 conversationId 必须同时提供")
+        return self
 
 
 class ReadMessagesResponse(StrictModel):
@@ -113,6 +122,53 @@ class SendMessageRequest(StrictModel):
         description="要发送的消息文本，最长 5000 个字符。",
         examples=["STM32F103C8T6，数量 100，请报价。"],
     )
+    session_id: str | None = Field(default=None, alias="sessionId", min_length=1, max_length=160)
+    conversation_id: str | None = Field(default=None, alias="conversationId", min_length=1, max_length=160)
+    subscription_id: str | None = Field(default=None, alias="subscriptionId", min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def require_callback_identity(self):
+        identity = (self.session_id, self.conversation_id, self.subscription_id)
+        if any(identity) and not all(identity):
+            raise ValueError("异步发送必须同时提供 sessionId、conversationId 与 subscriptionId")
+        return self
+
+
+class subscription_request(StrictModel):
+    """持久回调订阅。回调密钥只用于本机传输，不进入日志或自动化消息。"""
+
+    schema_version: Literal[1] = Field(alias="schemaVersion")
+    subscription_id: str = Field(alias="subscriptionId", min_length=1, max_length=128)
+    consumer_id: str = Field(alias="consumerId", min_length=1, max_length=128)
+    callback_url: str = Field(alias="callbackUrl", max_length=512)
+    callback_token: str = Field(alias="callbackToken", min_length=32, max_length=128, repr=False)
+    event_types: list[Literal["message.received", "command.completed"]] = Field(alias="eventTypes", min_length=1, max_length=1)
+    session_id: str = Field(alias="sessionId", min_length=1, max_length=160)
+    conversation_id: str = Field(alias="conversationId", min_length=1, max_length=160)
+    after_sequence: int = Field(alias="afterSequence", ge=0, strict=True)
+    command_id: str | None = Field(default=None, alias="commandId", min_length=16, max_length=128)
+
+    @field_validator("callback_url")
+    @classmethod
+    def require_loopback_callback(cls, value):
+        parsed = urlparse(value)
+        if (parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.port is None
+                or parsed.path != "/api/local-runtime/qq/events" or parsed.query or parsed.fragment
+                or parsed.username or parsed.password):
+            raise ValueError("回调只能投递到 Runtime 的本机端点")
+        return value
+
+    @model_validator(mode="after")
+    def require_command_filter(self):
+        if (self.event_types == ["command.completed"]) != bool(self.command_id):
+            raise ValueError("命令订阅必须指定 commandId，消息订阅不接受 commandId")
+        return self
+
+
+class consumer_request(StrictModel):
+    """退订与排队命令取消的消费方标识。"""
+
+    consumer_id: str = Field(alias="consumerId", min_length=1, max_length=128)
 
 class CommandResponse(StrictModel):
     """发送命令状态响应。"""

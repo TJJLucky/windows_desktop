@@ -209,3 +209,28 @@ class InputBox:
         self.paste_text(text)
         # 通过快捷键发送
         self.send_message()
+
+    def read_draft_text(self) -> str:
+        """复制输入框全文用于授权内容校验，保留现有草稿，不发送或删除任何文字。"""
+        self.click_inputbox()
+        win32clipboard.OpenClipboard()
+        try:
+            win32clipboard.EmptyClipboard()
+        finally:
+            win32clipboard.CloseClipboard()
+        send_hotkey(("ctrl", "a"))
+        send_hotkey(("ctrl", "c"))
+        time.sleep(0.1)
+        win32clipboard.OpenClipboard()
+        try:
+            # 图文混合草稿也可能附带 Unicode，必须先排除图片和文件再比较文字。
+            for clipboard_format in (win32con.CF_BITMAP, win32con.CF_DIB, 17, win32con.CF_HDROP):
+                if win32clipboard.IsClipboardFormatAvailable(clipboard_format):
+                    raise ValueError("QQ_DRAFT_NON_TEXT")
+            if win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_UNICODETEXT):
+                return str(win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)).replace("\r\n", "\n")
+            if win32clipboard.CountClipboardFormats():
+                raise ValueError("QQ_DRAFT_NON_TEXT")
+            return ""
+        finally:
+            win32clipboard.CloseClipboard()

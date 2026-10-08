@@ -106,6 +106,9 @@ class Dispatcher:
                     result = self.get_contact_list_impl()
                 elif task_type == "check_capture_ready":
                     result = self.check_capture_ready_impl()
+                elif task_type == "bound_operation":
+                    from .bound_operations import bound_operations
+                    result = bound_operations(self.userList, self.inputBox, self.messageList).execute(*args)
                 else:
                     # 未知任务类型 → 作为异常返回给调用方
                     raise ValueError(f"unknown task {task_type}")
@@ -179,6 +182,16 @@ class Dispatcher:
             return {}, TimeoutError("read_message_list task timeout")
 
     # ========= 内部真正实现（在worker线程运行） =========
+    def bound_operation(self, operation: str, expected: dict | None, text: str | None,
+                        timeout: float = 60.0) -> Tuple[dict, Optional[Exception]]:
+        """身份核对、选中、复制或发送作为一个队列元素，旧客户端也无法插队。"""
+        res_q = queue.Queue(maxsize=1)
+        self.task_queue.put(("bound_operation", (operation, expected, text), {}, res_q))
+        try:
+            return res_q.get(timeout=timeout)
+        except queue.Empty:
+            return {}, TimeoutError("QQ_BOUND_OPERATION_TIMEOUT")
+
     def check_capture_ready_impl(self) -> dict:
         """实际执行窗口就绪检查；仅在 Dispatcher worker 中调用。"""
         from .window_ops import ensure_qq_window_with_retry

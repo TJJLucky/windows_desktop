@@ -14,17 +14,22 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from contextlib import asynccontextmanager
 
 # Path：数据库文件路径的类型标注
 from pathlib import Path
 
 # FastAPI 框架组件：FastAPI(应用对象) / HTTPException(标准错误响应) / ApiPath(路径参数文档)
-from fastapi import FastAPI, HTTPException, Path as ApiPath
+from fastapi import FastAPI, HTTPException, Path as ApiPath, Response
+from fastapi.responses import JSONResponse
 
 # ChatHistoryStore：聊天记录 SQLite 存储（追加消息、按联系人查历史）
 from .chat_history import ChatHistoryStore
 # CommandConflictError：相同 commandId 配不同消息体的冲突异常；CommandLedger：命令幂等账本
 from .command_ledger import CommandConflictError, CommandLedger
+from .callback_store import callback_store, subscription_conflict
+from .callback_dispatcher import callback_dispatcher
+from .contracts import subscription_request, consumer_request
 # 全部 Pydantic 请求/响应契约模型（API 的输入输出 schema）
 from .contracts import API_VERSION, CaptureCheckResponse, ChatHistoryRequest, ChatHistoryResponse, CommandResponse, ListContactsResponse, ReadMessagesRequest, ReadMessagesResponse, SendMessageRequest, ServiceHealthResponse
 # QqAutomationPort：自动化端口抽象（测试时可注入替身）；LegacyQqAutomationFacade：真实实现（视觉 RPA）；QqAutomationError：QQ 操作失败统一异常
@@ -47,6 +52,8 @@ def create_app(
     *,
     ledger_path: Path,
     chat_history_path: Path | None = None,
+    bound_automation=None,
+    callback_transport=None,
 ) -> FastAPI:
     """构造 FastAPI 应用，注册全部 v1 接口并返回应用对象。
 
@@ -64,13 +71,44 @@ def create_app(
     facade = automation or LegacyQqAutomationFacade()
     # 初始化命令账本（打开 SQLite、建表），用于发送命令的幂等控制
     ledger = CommandLedger(ledger_path)
+    outbox = callback_store(ledger_path)
+    observer = None
+    if bound_automation is None:
+        from .facade import identity_facade
+        from .message_observer import message_observer
+
+        bound_automation = identity_facade(facade, ledger_path.parent / "qq-identities.sqlite3", chat_history)
+        callbacks = callback_dispatcher(outbox, bound_automation, transport=callback_transport)
+        observer = message_observer(
+            bound_automation, subscriptions_provider=outbox.active_message_subscriptions,
+            publish_received_message=callbacks.publish_received_message,
+            publish_identity_invalidated=callbacks.publish_identity_invalidated,
+        )
+    else:
+        callbacks = callback_dispatcher(outbox, bound_automation, transport=callback_transport)
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        await callbacks.start()
+        if observer is not None:
+            await observer.start()
+        try:
+            yield
+        finally:
+            if observer is not None:
+                await observer.close()
+            await callbacks.close()
     # 创建 FastAPI 应用：开启默认 /docs(Swagger) 与 /openapi.json，版本号取契约常量
     app = FastAPI(
         title="QQ 桌面自动化服务",
         version=API_VERSION,
         description=API_DESCRIPTION,
         openapi_tags=OPENAPI_TAGS,
+        lifespan=lifespan,
     )
+    app.state.callbacks = callbacks
+    app.state.callback_store = outbox
+    app.state.bound_automation = bound_automation
     logger.info(
         "application.create ledger_path=%s chat_history_path=%s automation=%s",
         ledger_path,
@@ -116,6 +154,38 @@ def create_app(
             elapsed_ms,
         )
         return response
+
+    @app.get("/v1/capabilities", tags=["系统"])
+    def callback_capabilities():
+        return {"protocolVersion": 1, "capabilities": ["callbacks.v1", "identity.v1", "deferred-commands.v1"]}
+
+    @app.put("/v1/subscriptions/{subscription_id}", tags=["消息"])
+    def subscribe(subscription_id: str, request: subscription_request):
+        if subscription_id != request.subscription_id:
+            raise HTTPException(status_code=422, detail="QQ_SUBSCRIPTION_ID_MISMATCH")
+        try:
+            outbox.subscribe(request.model_dump(by_alias=True))
+        except subscription_conflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        callbacks.notify()
+        return {"subscriptionId": subscription_id, "durable": True}
+
+    @app.delete("/v1/subscriptions/{subscription_id}", status_code=204, tags=["消息"])
+    def unsubscribe(subscription_id: str, request: consumer_request):
+        try:
+            outbox.unsubscribe(subscription_id, request.consumer_id)
+        except subscription_conflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return Response(status_code=204)
+
+    @app.delete("/v1/commands/{command_id}", tags=["消息"])
+    def cancel_queued_command(command_id: str, request: consumer_request):
+        try:
+            status = outbox.cancel_command(command_id, request.consumer_id)
+        except subscription_conflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        callbacks.notify()
+        return {"commandId": command_id, "status": status}
 
     # —— 健康检查接口 ——
     @app.get(
@@ -166,16 +236,19 @@ def create_app(
         tags=["联系人"],
         response_description="联系人列表和数量",
     )
-    def list_contacts() -> ListContactsResponse:
+    def list_contacts(identity: bool = False) -> ListContactsResponse:
         try:
             # 同步端点：FastAPI 自动在（线程池）执行 QQ 视觉识别，事件循环不被阻塞
-            contacts = facade.list_contacts()
+            contacts = bound_automation.list_bound_contacts() if identity else facade.list_contacts()
             logger.info("contacts.query.success count=%d", len(contacts))
         except QqAutomationError as exc:
             logger.exception("contacts.query.error")
             # QQ 操作失败（窗口不可用、识别失败等）统一返回 503，并把内部原因带给调用方
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         # 组装响应：联系人数组 + 数量
+        if identity:
+            return JSONResponse({"contacts": contacts, "count": len(contacts),
+                                 "identityWarnings": bound_automation.identity_warnings})
         return ListContactsResponse(contacts=contacts, count=len(contacts))
 
     # —— 读取指定联系人的可见消息接口 ——
@@ -190,6 +263,11 @@ def create_app(
     def read_messages(request: ReadMessagesRequest) -> ReadMessagesResponse:
         try:
             # 同步端点：FastAPI 自动在线程池执行 QQ 原生框选复制与文本解析
+            if request.session_id is not None:
+                payload = bound_automation.read_bound_messages(
+                    request.contact_name, request.session_id, request.conversation_id,
+                )
+                return JSONResponse(payload)
             payload = facade.read_messages(request.contact_name)
             logger.info(
                 "messages.read.success contact=%s count=%d",
@@ -219,6 +297,13 @@ def create_app(
         response_description="发送命令状态",
     )
     def send_message(request: SendMessageRequest) -> CommandResponse:
+        if request.subscription_id is not None:
+            try:
+                result = outbox.enqueue(request.model_dump(by_alias=True, exclude_none=True))
+            except (CommandConflictError, subscription_conflict) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            callbacks.notify()
+            return JSONResponse(result, status_code=202 if result["status"] in {"ACCEPTED", "RUNNING"} else 200)
         logger.info(
             "message.send.begin command_id=%s contact=%s text_length=%d",
             request.command_id,
@@ -273,6 +358,11 @@ def create_app(
     def command_status(
         command_id: str = ApiPath(description="发送接口使用的 commandId。", examples=["effect-key-0000001"]),
     ) -> CommandResponse:
+        deferred = outbox.get_command(command_id)
+        if deferred is not None:
+            if deferred["status"] == "ACCEPTED":
+                deferred["status"] = "RUNNING"
+            return JSONResponse(deferred)
         # 从账本按 commandId 查状态与结果（SQLite 毫秒级，同步直调）
         record = ledger.get(command_id)
         if record is None:

@@ -77,6 +77,8 @@ class UserList:
         self._initialized = True
         # 用户字典：name → User
         self.users: dict[str, User] = {}
+        # 身份扩展保留全部原始行，不能因同名 dict key 覆盖丢失歧义证据。
+        self.identity_rows: list[tuple[str, User]] = []
         # 列表区域识别结果（截图 + 区域坐标）
         self.userList_region: RegionResult | None = None
         # 当前关联的 QQ 主窗口句柄
@@ -492,6 +494,7 @@ class UserList:
         # 1) 刷新截图与区域
         self.refresh_image()
         new_users: dict[str, User] = {}
+        identity_rows: list[tuple[str, User]] = []
         # 2) 顶部区域 OCR：拿到当前激活会话的用户名
         _, active_name = self.get_user_list_top_right_ocr()  # 顶部区域 OCR：active 用户的名字
         # 记录最近一次顶部 OCR 的会话名（active_user：顶部有名字时不做行背景兜底）
@@ -528,9 +531,11 @@ class UserList:
             # 组装 User（链式 setter）
             new_users[key] = User().setName(key).setAvatar(avatar).setRect(rect).setActive(active).setNewMsg(
                 new_msg)
+            identity_rows.append((name, new_users[key]))
 
         # 整体替换（旧列表直接丢弃），并刷新短 TTL 快照。
         self.users = new_users
+        self.identity_rows = identity_rows
         self.cache_data = self.to_dict().copy()
         self.cache_ts = time.time()
 

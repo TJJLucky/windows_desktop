@@ -10,6 +10,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+import uuid
 from contextlib import closing
 from pathlib import Path
 from typing import Any
@@ -151,6 +152,55 @@ class ChatHistoryStore:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(_SCHEMA)
             self._migrate_messages_table(connection)
+            # 新会话按持久身份隔离；旧按昵称查询的 HTTP 契约继续使用原表。
+            connection.executescript("""
+                CREATE TABLE IF NOT EXISTS bound_message (
+                    message_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, conversation_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL, payload_json TEXT NOT NULL,
+                    UNIQUE(session_id, conversation_id, seq));
+                CREATE TABLE IF NOT EXISTS bound_snapshot (
+                    session_id TEXT NOT NULL, conversation_id TEXT NOT NULL, messages_json TEXT NOT NULL,
+                    PRIMARY KEY(session_id, conversation_id));
+            """)
+
+    def append_bound_visible(self, session_id: str, conversation_id: str, messages: list[dict]) -> None:
+        """按出现顺序持久化复制消息；同文同秒的多个可见实例仍各有消息 ID。"""
+        current = _normalise_visible(messages)
+        if any(not item["sender"] or not item["timestamp"] for item in current):
+            raise ValueError("QQ_MESSAGE_SOURCE_EVIDENCE_REQUIRED")
+        if not current:
+            return
+        with self._lock, closing(self._connect()) as connection, connection:
+            rows = connection.execute("""SELECT payload_json FROM bound_message
+                WHERE session_id=? AND conversation_id=? ORDER BY seq""", (session_id, conversation_id)).fetchall()
+            previous = _normalise_visible([json.loads(row[0]) for row in rows])
+            # 锚定持久序列而非上一屏：回看历史再返回时，旧消息不能换 ID 成为新回复。
+            overlap = _longest_common_subsequence_overlap(previous, current)
+            sequence = connection.execute("SELECT COALESCE(MAX(seq),0) FROM bound_message WHERE session_id=? AND conversation_id=?",
+                                          (session_id, conversation_id)).fetchone()[0]
+            for item in current[overlap:]:
+                sequence += 1
+                message_id = "qq-message-" + uuid.uuid4().hex
+                payload = {**item, "messageId": message_id, "sequence": sequence,
+                           "isSelf": None, "direction": "UNKNOWN", "source": "QQ_NATIVE_CLIPBOARD"}
+                connection.execute("INSERT INTO bound_message VALUES(?,?,?,?,?)",
+                                   (message_id, session_id, conversation_id, sequence, json.dumps(payload, ensure_ascii=False)))
+            connection.execute("""INSERT INTO bound_snapshot VALUES(?,?,?)
+                ON CONFLICT(session_id,conversation_id) DO UPDATE SET messages_json=excluded.messages_json""",
+                (session_id, conversation_id, json.dumps(current, ensure_ascii=False)))
+
+    def get_bound_history(self, session_id: str, conversation_id: str, after_sequence: int = 0,
+                          limit: int = 100) -> list[dict]:
+        with self._lock, closing(self._connect()) as connection:
+            rows = connection.execute("""SELECT payload_json FROM bound_message
+                WHERE session_id=? AND conversation_id=? AND seq>? ORDER BY seq LIMIT ?""",
+                (session_id, conversation_id, after_sequence, limit)).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def bound_sequence(self, session_id: str, conversation_id: str) -> int:
+        with self._lock, closing(self._connect()) as connection:
+            return connection.execute("SELECT COALESCE(MAX(seq),0) FROM bound_message WHERE session_id=? AND conversation_id=?",
+                                      (session_id, conversation_id)).fetchone()[0]
 
     @staticmethod
     def _migrate_messages_table(connection: sqlite3.Connection) -> None:
