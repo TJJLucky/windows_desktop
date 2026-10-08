@@ -154,30 +154,19 @@ class ChatHistoryStore:
 
     @staticmethod
     def _migrate_messages_table(connection: sqlite3.Connection) -> None:
-        """把包含 direction/command_id 的旧表迁移为 sender 驱动的记录表。
-
-        原表数据保留；旧记录没有 QQ 复制字段时，sender/timestamp/raw_text 保持 null。
-        不删除旧的 pending_outbound 表，以免破坏已有数据，但新版本不再读取或写入它。
-        """
-        columns = {row[1] for row in connection.execute("PRAGMA table_info(messages)")}
+        """删除旧版或中断迁移遗留表，只保留当前消息表结构。"""
         target_columns = {
             "id", "contact_name", "sender", "timestamp", "text", "raw_text", "seq", "fingerprint", "created_at"
         }
-        if columns == target_columns:
-            return
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(messages)")}
 
-        def source_column(name: str, fallback: str = "NULL") -> str:
-            return name if name in columns else fallback
+        connection.execute("DROP TABLE IF EXISTS messages_legacy")
+        connection.execute("DROP TABLE IF EXISTS pending_outbound")
+        if columns != target_columns:
+            connection.execute("DROP TABLE IF EXISTS messages")
+            connection.execute(_MESSAGES_TABLE_SQL)
+            connection.execute("DELETE FROM contact_snapshot")
 
-        connection.execute("ALTER TABLE messages RENAME TO messages_legacy")
-        connection.execute(_MESSAGES_TABLE_SQL)
-        connection.execute(
-            "INSERT INTO messages(id, contact_name, sender, timestamp, text, raw_text, seq, fingerprint, created_at) "
-            "SELECT id, contact_name, "
-            f"{source_column('sender')}, {source_column('timestamp')}, text, {source_column('raw_text')}, "
-            "seq, fingerprint, created_at FROM messages_legacy"
-        )
-        connection.execute("DROP TABLE messages_legacy")
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_contact_time ON messages (contact_name, created_at)"
         )

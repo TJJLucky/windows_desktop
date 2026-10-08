@@ -54,7 +54,7 @@ def test_history_keeps_sender_timestamp_and_raw_text(store):
     assert "commandId" not in history[0]
 
 
-def test_existing_direction_database_is_migrated_without_returning_direction(tmp_path):
+def test_existing_direction_database_is_dropped_and_recreated(tmp_path):
     chat_path = tmp_path / "chat.sqlite3"
     connection = sqlite3.connect(chat_path)
     connection.executescript(
@@ -80,10 +80,26 @@ def test_existing_direction_database_is_migrated_without_returning_direction(tmp
     connection.commit()
     connection.close()
 
-    history = ChatHistoryStore(chat_path).get_history("华强电子")
-    assert history[0]["sender"] == "TJJ"
-    assert history[0]["text"] == "旧消息"
-    assert "direction" not in history[0]
+    store = ChatHistoryStore(chat_path)
+    assert store.get_history("华强电子") == []
+    assert store.append_visible("华强电子", [_message("TJJ", "09-30 12:00:02", "新消息")]) == 1
+
+
+def test_stale_messages_legacy_table_is_removed(tmp_path):
+    chat_path = tmp_path / "chat.sqlite3"
+    connection = sqlite3.connect(chat_path)
+    connection.execute("CREATE TABLE messages_legacy(id INTEGER PRIMARY KEY)")
+    connection.commit()
+    connection.close()
+
+    ChatHistoryStore(chat_path)
+
+    connection = sqlite3.connect(chat_path)
+    legacy_exists = connection.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'messages_legacy'"
+    ).fetchone()[0]
+    connection.close()
+    assert legacy_exists == 0
 
 
 class _RecordingAutomation:
