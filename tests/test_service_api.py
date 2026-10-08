@@ -18,6 +18,7 @@ import pytest
 
 # create_app：被测应用工厂
 from service.app import create_app
+from service.facade import QqContactNotFoundError
 
 
 class FakeAutomation:
@@ -111,6 +112,24 @@ async def test_api_projects_legacy_automation_as_v1_contract(service) -> None:
     assert messages.json()["messages"][0]["text"] == "有货"
     assert messages.json()["messages"][0]["sender"] == "TJJ"
     assert "direction" not in messages.json()["messages"][0]
+
+
+@pytest.mark.asyncio
+async def test_read_returns_clear_not_found_message(service) -> None:
+    """联系人不在当前可见列表时，读取接口直接返回一次明确的 404。"""
+    automation, app = service
+
+    def fail_read(contact_name: str) -> dict:
+        raise QqContactNotFoundError(contact_name)
+
+    automation.read_messages = fail_read
+    async with client(app) as caller:
+        response = await caller.post("/v1/commands/read", json={"contactName": "不存在"})
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "detail": "QQ_CONTACT_NOT_FOUND: 当前可见 QQ 用户列表中未找到联系人「不存在」"
+    }
 
 
 @pytest.mark.asyncio

@@ -28,7 +28,7 @@ from .command_ledger import CommandConflictError, CommandLedger
 # 全部 Pydantic 请求/响应契约模型（API 的输入输出 schema）
 from .contracts import API_VERSION, CaptureCheckResponse, ChatHistoryRequest, ChatHistoryResponse, CommandResponse, ListContactsResponse, ReadMessagesRequest, ReadMessagesResponse, SendMessageRequest, ServiceHealthResponse
 # QqAutomationPort：自动化端口抽象（测试时可注入替身）；LegacyQqAutomationFacade：真实实现（视觉 RPA）；QqAutomationError：QQ 操作失败统一异常
-from .facade import LegacyQqAutomationFacade, QqAutomationError, QqAutomationPort
+from .facade import LegacyQqAutomationFacade, QqAutomationError, QqAutomationPort, QqContactNotFoundError
 
 logger = logging.getLogger("qq_service.api")
 
@@ -96,21 +96,23 @@ def create_app(
             response = await call_next(request)
         except Exception:
             logger.exception(
-                "http.request.error request_id=%s method=%s path=%s duration_ms=%.2f",
+                "http.request.error request_id=%s method=%s path=%s duration_ms=%.2f total_duration_ms=%.2f",
                 request_id,
                 request.method,
                 request.url.path,
+                (time.perf_counter() - started) * 1000,
                 (time.perf_counter() - started) * 1000,
             )
             raise
         elapsed_ms = (time.perf_counter() - started) * 1000
         response.headers["X-Request-ID"] = request_id
         logger.info(
-            "http.request.end request_id=%s method=%s path=%s status=%d duration_ms=%.2f",
+            "http.request.end request_id=%s method=%s path=%s status=%d duration_ms=%.2f total_duration_ms=%.2f",
             request_id,
             request.method,
             request.url.path,
             response.status_code,
+            elapsed_ms,
             elapsed_ms,
         )
         return response
@@ -194,6 +196,9 @@ def create_app(
                 request.contact_name,
                 len(payload.get("messages", [])),
             )
+        except QqContactNotFoundError as exc:
+            logger.info("messages.read.contact_not_found contact=%s", request.contact_name)
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
         except QqAutomationError as exc:
             logger.exception("messages.read.error contact=%s", request.contact_name)
             # QQ 操作失败 → 503（不会把读取结果落库，因为根本没读到）

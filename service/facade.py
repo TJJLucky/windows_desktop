@@ -27,6 +27,24 @@ class QqAutomationError(RuntimeError):
     """
 
 
+class QqContactNotFoundError(QqAutomationError):
+    """请求的联系人不在当前可见 QQ 用户列表中。"""
+
+    def __init__(self, contact_name: str) -> None:
+        self.contact_name = contact_name
+        super().__init__(f"QQ_CONTACT_NOT_FOUND: 当前可见 QQ 用户列表中未找到联系人「{contact_name}」")
+
+
+def _raise_operation_error(error: Exception, contact_name: str, fallback_code: str) -> None:
+    """把底层的联系人缺失异常保留为 HTTP 可辨识的业务错误。"""
+    # 延迟导入：保持 facade 在没有 Windows GUI 依赖的测试环境中仍可加载。
+    from utils.qq.user_list import ContactNotFoundError
+
+    if isinstance(error, ContactNotFoundError):
+        raise QqContactNotFoundError(contact_name) from error
+    raise QqAutomationError(fallback_code) from error
+
+
 class QqAutomationPort(Protocol):
     """QQ 自动化端口抽象：Service 层与具体实现解耦的接口约定。
 
@@ -80,7 +98,7 @@ class LegacyQqAutomationFacade:
         # 入队发送；error 非空表示失败（如窗口不可用、识别失败）
         sent, error = self._operator().send_message(contact_name, text, timeout=60.0)
         if error is not None:
-            raise QqAutomationError("QQ_SEND_FAILED") from error
+            _raise_operation_error(error, contact_name, "QQ_SEND_FAILED")
         # 规范化的成功结果：ok/sent 同值、消息长度、无错误
         return {"ok": bool(sent), "sent": bool(sent), "textLength": len(text), "error": None}
 
@@ -89,7 +107,7 @@ class LegacyQqAutomationFacade:
         # 入队读取；error 非空表示失败
         result, error = self._operator().read_message_list(contact_name, timeout=60.0)
         if error is not None:
-            raise QqAutomationError("QQ_MESSAGES_UNAVAILABLE") from error
+            _raise_operation_error(error, contact_name, "QQ_MESSAGES_UNAVAILABLE")
         # 把 QQ 原生复制解析结果翻译为 HTTP 契约结构。
         # sender/timestamp/text/rawText 是权威字段，消息归属由外部智能体按 sender 判断。
         payload = [
@@ -115,15 +133,10 @@ class LegacyQqAutomationFacade:
         与业务操作（读/发）不同，这是探测接口：窗口不可用返回 ready=False，
         不抛 QqAutomationError（HTTP 层 200 + ready=false，而非 503）。
         """
-        # 延迟 import：避免在非 Windows/无桌面环境加载窗口检测重依赖
-        from utils.qq.window_ops import ensure_qq_window_with_retry
-
-        try:
-            # 分级校验 + 重试：窗口存在 → 用户未动时快照复用 → 仅变化时置顶/最大化/试截
-            win = ensure_qq_window_with_retry()
-            # 就绪：报告窗口标题（辅助确认窗口身份）
-            return {"ready": True, "windowTitle": getattr(win, "title", None)}
-        except Exception as exc:
-            # 重试耗尽仍未就绪：返回不可用 + 错误码（不抛出，保持探测语义）
-            logger.warning("capture.check.failed error=%s", exc)
+        # capture 检查也必须经过 Dispatcher，避免与联系人 OCR、读消息、发送并发操作 QQ，
+        # 同时消除多个请求首次并发延迟导入 utils.qq 子模块时的模块锁死锁。
+        result, error = self._operator().check_capture_ready(timeout=30.0)
+        if error is not None:
+            logger.warning("capture.check.failed error=%s", error)
             return {"ready": False, "error": "QQ_WINDOW_NOT_READY"}
+        return result

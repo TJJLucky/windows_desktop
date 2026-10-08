@@ -104,6 +104,8 @@ class Dispatcher:
                     result = self.read_message_list_impl(contact_name)
                 elif task_type == "get_contact_list":
                     result = self.get_contact_list_impl()
+                elif task_type == "check_capture_ready":
+                    result = self.check_capture_ready_impl()
                 else:
                     # 未知任务类型 → 作为异常返回给调用方
                     raise ValueError(f"unknown task {task_type}")
@@ -125,6 +127,15 @@ class Dispatcher:
             self.worker_thread.join(timeout=3)
 
         # ========= 对外API：全部入队列，阻塞等待 =========
+
+    def check_capture_ready(self, timeout: float = 30.0) -> Tuple[dict, Optional[Exception]]:
+        """把截图能力检查也放入串行队列，避免与联系人/消息操作并发控制 QQ。"""
+        res_q = queue.Queue(maxsize=1)
+        self.task_queue.put(("check_capture_ready", (), {}, res_q))
+        try:
+            return res_q.get(timeout=timeout)
+        except queue.Empty:
+            return {}, TimeoutError("check_capture_ready task timeout")
 
     def get_contact_list(self, timeout: float = 120.0) -> Tuple[dict[str, dict], Optional[Exception]]:
         """获取联系人列表，入队列串行执行，缓存过期会执行截图解析。"""
@@ -168,6 +179,13 @@ class Dispatcher:
             return {}, TimeoutError("read_message_list task timeout")
 
     # ========= 内部真正实现（在worker线程运行） =========
+    def check_capture_ready_impl(self) -> dict:
+        """实际执行窗口就绪检查；仅在 Dispatcher worker 中调用。"""
+        from .window_ops import ensure_qq_window_with_retry
+
+        win = ensure_qq_window_with_retry()
+        return {"ready": True, "windowTitle": getattr(win, "title", None)}
+
     def get_contact_list_impl(self) -> dict[str, dict]:
         """实际实现：读用户列表（内部 1s 缓存）。"""
         return self.userList.get_user_list()

@@ -1,27 +1,31 @@
-"""计时装饰器：函数耗时输出。零依赖其他 utils 子包。"""
+"""计时装饰器与阶段计时工具。零依赖其他 utils 子包。"""
 
-# time：获取单调/墙钟时间，计算耗时
+from contextlib import contextmanager
+from functools import wraps
 import time
 
 
 def timer(func):
-    """装饰器：执行被装饰函数并打印其耗时（毫秒）。
+    """打印函数总耗时；即使函数抛异常也会输出耗时。"""
 
-    用于性能定位：在可疑的慢函数（如 OCR、模板匹配）上挂 @timer，
-    每次调用都会在控制台输出耗时，便于对比优化前后差异。
-    """
-
+    @wraps(func)
     def wrapper(*args, **kwargs):
-        # 记录调用前时间戳（秒）
-        t1 = time.time()
-        # 原样执行被装饰函数并保留其返回值
-        res = func(*args, **kwargs)
-        # 记录调用后时间戳
-        t2 = time.time()
-        # 打印函数名与耗时（毫秒，保留两位小数）
-        print(f"【{func.__name__}】耗时：{(t2 - t1) * 1000:.2f} ms")
-        # 原样返回函数结果，不影响业务逻辑
-        return res
+        started = time.perf_counter()
+        try:
+            return func(*args, **kwargs)
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            print(f"【{func.__name__}】耗时：{elapsed_ms:.2f} ms", flush=True)
 
-    # 返回包装后的函数
     return wrapper
+
+
+@contextmanager
+def timed_stage(label: str):
+    """打印一段内部阶段耗时；异常时也会输出。"""
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        print(f"【{label}】耗时：{elapsed_ms:.2f} ms", flush=True)

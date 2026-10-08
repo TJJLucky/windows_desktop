@@ -35,6 +35,8 @@ from PIL import Image
 from ..core.screenshot import WGCCapture, getDPI
 # 窗口形态整理（高度铺满 + 宽 50% + 靠左）/ 层级控制
 from ..core.window import layout_window_left_half, set_window_z_pos
+# timer：输出窗口就绪与 WGC 捕获阶段耗时
+from ..core.timing import timer
 # 模板匹配（模式切换按钮）
 from ..vision.matcher import find_template
 # 快捷键发送与配置表（唤醒主面板）
@@ -110,6 +112,7 @@ def get_qq_windows():
     return qq_windows
 
 
+@timer
 def get_qq_window_image(window=None):
     """捕获 QQ 主窗口的 WGC 后台截图，返回 (PIL.Image(RGB), window)"""
     # WGC 截图单例
@@ -246,6 +249,7 @@ def _window_full_refresh_due(win) -> bool:
         return True
     return snapshot.full_refresh_due(time.time(), _window_full_refresh_ttl())
 
+@timer
 def _snapshot_and_verify(win) -> bool:
     """L3 深度校验：置顶 + 形态整理 + WGC 试截，成功后更新快照。"""
     # 置顶（把窗口带到最前，不抢焦点）
@@ -310,6 +314,7 @@ def ensure_qq_window():
     return main_win
 
 
+@timer
 def ensure_qq_window_with_retry(retry: int = 3):
     """QQ 窗口就绪保证（带重试，默认每秒检查一次，最多等待约 2 秒）。
 

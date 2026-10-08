@@ -33,13 +33,21 @@ from .window_ops import ensure_qq_window_with_retry
 # 无焦点置顶上下文（激活用户时短暂置顶窗口）
 from ..core.window import WindowCaptureCtx
 # 计时装饰器
-from ..core.timing import timer
+from ..core.timing import timed_stage, timer
 # OCR 引擎单例
 from ..vision.ocr import OCREngine
 # 拼图 OCR：多行文字区拼接一次识别 + 按 y 边界切分文本（性能优化）
 from ..vision.compose import compose_bubbles_to_one, split_ocr_by_bubble
 # 随机点击（激活会话时点用户行）
 from ..core.mouse import random_click
+
+
+class ContactNotFoundError(ValueError):
+    """当前可见 QQ 用户列表中没有目标联系人的可公开业务错误。"""
+
+    def __init__(self, contact_name: str) -> None:
+        self.contact_name = contact_name
+        super().__init__(f"当前可见 QQ 用户列表中未找到联系人「{contact_name}」")
 
 
 # ── 用户列表管理器 ──────────────────────────────────────────────────
@@ -77,6 +85,9 @@ class UserList:
         self._cache_condition = threading.Condition(self._cache_lock)
         self._refreshing = False
         self._cache_generation = 0
+        # 最近完成的一轮刷新失败信息；只向等待该轮的调用者传播，下一次新调用可重试。
+        self._cache_error: BaseException | None = None
+        self._cache_error_generation = 0
         self.cache_ts: float = 0.0
         self.cache_data: dict = {}
 
@@ -253,7 +264,7 @@ class UserList:
     @staticmethod
     @timer
     def ocr_recognize(img: Image.Image) -> str:
-        """传入裁切好的文字区域图片，返回识别文本（只保留中文和英文字母）。"""
+        """传入裁切好的文字区域图片，返回清洗后的 OCR 昵称。"""
         # 图像预处理（二值化放大）
         proc = UserList.ocr_preprocess(img)  # 图像预处理
         # 调用 OCR 引擎
@@ -264,8 +275,8 @@ class UserList:
             text = line[1].strip()
             if text:
                 texts.append(text)
-        # 只保留中文和英文字母，剔除 OCR 误识别的特殊符号/省略号
-        return re.sub(r"[^\u4e00-\u9fffA-Za-z]", "", "".join(texts).strip())
+        # 有中文/英文时保持原有清洗规则；纯符号昵称（例如 QQ 用户名 "!"）则保留符号。
+        return UserList._clean_ocr_name("".join(texts))
 
     def get_user_image(self, rect: tuple[int, int, int, int],
                        avatar: tuple[int, int, int] | None = None) -> Image.Image:
@@ -335,23 +346,34 @@ class UserList:
         # 精确 key 优先，避免包含匹配命中其他相似联系人。
         if contact_name in self.users:
             return self.users[contact_name]
-        # 双方都只保留中英文再比较：OCR 名字已移除符号（如 D_Isaac → DIsaac），
-        # 输入的名字可能带下划线等符号，需同样规范化后才能命中。
-        norm_contact = re.sub(r"[^\u4e00-\u9fffA-Za-z]", "", contact_name)
-        # 规范化后为空（纯符号名）→ 无法匹配
+        # 中文/英文联系人按规范化文本匹配；纯符号联系人（如 "!"）保留符号。
+        norm_contact = self._normalise_name(contact_name)
+        # 规范化后为空才表示请求名确实为空，不能参与包含匹配。
         if not norm_contact:
             return None
         # 遍历用户，双向包含匹配（任一方向命中即可）
         for name, user in self.users.items():
-            norm_name = re.sub(r"[^\u4e00-\u9fffA-Za-z]", "", name)
+            norm_name = self._normalise_name(name)
+            # OCR 空行不能作为通配符："" in 任意字符串都会成立。
+            if not norm_name:
+                continue
             if norm_contact in norm_name or norm_name in norm_contact:
                 return user
         return None
 
     @staticmethod
+    def _clean_ocr_name(name: str) -> str:
+        """清洗 OCR 昵称：文字昵称去符号，纯符号昵称保留。"""
+        raw = re.sub(r"\s+", "", name or "")
+        if not raw:
+            return ""
+        text = re.sub(r"[^\u4e00-\u9fffA-Za-z]", "", raw)
+        return text or raw
+
+    @staticmethod
     def _normalise_name(name: str) -> str:
-        """清除 OCR 名字中的符号，供激活验证使用。"""
-        return re.sub(r"[^\u4e00-\u9fffA-Za-z]", "", name or "")
+        """规范化联系人名；纯符号名保留，空名保持为空。"""
+        return UserList._clean_ocr_name(name)
 
     def _panel_switched_to(self, contact_name: str) -> bool:
         """用列表右上角 OCR 判断当前会话名是否命中目标联系人。"""
@@ -406,11 +428,8 @@ class UserList:
         self._ensure_user_list_fresh(force=True)
         user = self.find_user(contact_name)
         if user is None:
-            # 列表刚发生变化时再刷新一次。
-            self._ensure_user_list_fresh(force=True)
-            user = self.find_user(contact_name)
-        if user is None:
-            raise ValueError(f"用户列表中没有找到与「{contact_name}」匹配的联系人")
+            # 联系人不在当前可见列表时直接返回；不再做第二次完整 OCR 刷新。
+            raise ContactNotFoundError(contact_name)
         clicked = False
         if not user.active:
             clicked = self.active_user(user)
@@ -426,7 +445,7 @@ class UserList:
         self._ensure_user_list_fresh(force=True)
         user = self.find_user(contact_name)
         if user is None:
-            raise ValueError(f"用户列表中没有找到与「{contact_name}」匹配的联系人")
+            raise ContactNotFoundError(contact_name)
         clicked = self.active_user(user)
         full_name = self._wait_panel_switched(contact_name)
         if full_name is not None:
@@ -439,18 +458,24 @@ class UserList:
     # ── 刷新 ────────────────────────────────────────────────────
     # 刷新前要调用
     @timer
-    def refresh_image(self, stabilize: bool = True):
-        """图片和句柄的刷新（窗口不就绪时抛 QQWindowNotReadyError）。"""
-        # 确保窗口就绪（分级校验 + 重试）
-        main_window = ensure_qq_window_with_retry()
-        # 等 QQ 列表滚动稳定后再截图：ensure 的 L3 整理窗口（layout 左半）会触发
-        # QQ 异步滚动会话列表，滚动在截图后 ~1s 内才完成；若不等稳定直接截图，
-        # 拿到的坐标是"滚动前"的，点击时列表已滚动导致点偏（激活错误会话）。
-        # 窗口已稳定（L2 快照命中）时该等待无副作用，仅增加 ~1s 延迟。
-        if stabilize:
-            time.sleep(1.2)
+    def refresh_image(self, stabilize: bool = False):
+        """刷新图片和句柄（窗口不就绪时抛 QQWindowNotReadyError）。
+
+        WGC 截图本身会等待并取得当前已渲染帧。对当前 QQ 版本的实测表明，
+        窗口重新布局后不需要再固定等待 1.2 秒即可稳定定位用户列表，因此默认
+        直接截图以减少 contacts/read 的延迟。保留 ``stabilize=True`` 兼容旧调用，
+        仅在明确需要给 QQ 异步动画留出额外时间时启用。
+        """
+        # 每个阶段单独计时；外层 @timer 输出 refresh_image 总耗时。
+        with timed_stage("refresh_image.ensure_window"):
+            main_window = ensure_qq_window_with_retry()
+        # 兼容旧调用：只有显式 stabilize=True 时才等待旧的 1.2 秒。
+        with timed_stage("refresh_image.stabilize_wait"):
+            if stabilize:
+                time.sleep(1.2)
         # 识别好友列表区域（含截图）
-        self.userList_region = get_userList_region_and_image(main_window)
+        with timed_stage("refresh_image.user_list_region"):
+            self.userList_region = get_userList_region_and_image(main_window)
         # 记录窗口句柄（激活用户时用）
         self.hwnd = main_window._hWnd
 
@@ -488,9 +513,11 @@ class UserList:
 
         # 逐行组装 User（名字已从拼图 OCR 获得）
         for (avatar, rect, image), name in zip(rows, raw_names, strict=True):
-            # 清洗：只保留中文和英文字母（剔除 OCR 误识别的特殊符号/省略号）
-            name = re.sub(r"[^\u4e00-\u9fffA-Za-z]", "", name.strip())
-            # 顶部 OCR 是当前会话的完整名字；当前行命中时直接提升为 canonical key。
+            # 主拼图 OCR 识别到纯符号时原样保留；空结果直接跳过。
+            name = self._clean_ocr_name(name)
+            if not name:
+                continue
+            # 顶部 OCR 是当前会话的完整名字；当前行命中时直接提升为 canonical key.
             active = self._name_matches(name, active_name)
             key = self._normalise_name(active_name) if active else name
             # RGB(247,76,48) 红点检测
@@ -546,7 +573,7 @@ class UserList:
             self.cache_ts = 0.0
 
     def _ensure_user_list_fresh(self, force: bool = False) -> None:
-        """刷新用户列表；并发调用等待并复用同一次进行中的刷新。"""
+        """刷新用户列表；并发调用共享同一轮成功结果或失败异常。"""
         with self._cache_condition:
             if not force and self.userList_region is not None and time.time() - self.cache_ts < 1.0:
                 return
@@ -554,19 +581,30 @@ class UserList:
             start_generation = self._cache_generation
             while self._refreshing:
                 self._cache_condition.wait()
-            # 等待期间已有刷新完成时，即使本次要求 force，也复用这次结果。
+            # 只复用本调用等待期间完成的那一轮。失败时所有等待者得到同一个异常，
+            # 而刷新结束后才进入的新调用不会被旧异常永久阻断，可以开始下一轮重试。
             if self._cache_generation > start_generation:
+                if self._cache_error_generation == self._cache_generation and self._cache_error is not None:
+                    raise self._cache_error
                 return
 
             self._refreshing = True
 
+        error: BaseException | None = None
         try:
             self.refresh()
+        except BaseException as exc:
+            error = exc
         finally:
             with self._cache_condition:
                 self._cache_generation += 1
+                self._cache_error = error
+                self._cache_error_generation = self._cache_generation if error is not None else 0
                 self._refreshing = False
                 self._cache_condition.notify_all()
+
+        if error is not None:
+            raise error
 
     def get_user_list(self):
         """普通查询优先复用短 TTL 缓存；send/read 使用 force=True。"""
