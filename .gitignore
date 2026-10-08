@@ -27,3 +27,6 @@ native/*.zip
 # 调试输出与历史残留目录
 debug/
 composed/
+
+# 本地真实接口压力测试临时目录
+.tmp-live-*/
