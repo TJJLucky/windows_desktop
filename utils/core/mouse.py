@@ -25,6 +25,106 @@ from pathlib import Path
 # 鼠标移动、按下、抬起本身由下方的 InputEvent.dll 执行。
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
 
+# Windows 标准尺寸调整光标。QQ 的会话分隔条使用系统 SIZEWE 命中区，
+# 框选消息前必须先避开这段命中区，否则按下鼠标会被 QQ 当成拖动分隔条。
+_IDC_SIZEWE = 32644
+_IDC_SIZENS = 32645
+_IDC_SIZENWSE = 32642
+_IDC_SIZENESW = 32643
+_RESIZE_CURSOR_RESOURCES = (
+    _IDC_SIZEWE,
+    _IDC_SIZENS,
+    _IDC_SIZENWSE,
+    _IDC_SIZENESW,
+)
+
+
+class _CURSORINFO(ctypes.Structure):
+    """GetCursorInfo 的 Win32 结构；只读取当前光标句柄。"""
+
+    _fields_ = (
+        ("cbSize", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("hCursor", wintypes.HANDLE),
+        ("ptScreenPos", wintypes.POINT),
+    )
+
+
+_resize_cursor_handles: set[int] | None = None
+
+
+def _load_resize_cursor_handles() -> set[int]:
+    """加载标准尺寸调整光标句柄，用于识别 QQ 分隔条命中区。"""
+    global _resize_cursor_handles
+    if _resize_cursor_handles is not None:
+        return _resize_cursor_handles
+
+    _user32.LoadCursorW.argtypes = (wintypes.HINSTANCE, wintypes.LPCWSTR)
+    _user32.LoadCursorW.restype = wintypes.HANDLE
+    handles: set[int] = set()
+    for resource_id in _RESIZE_CURSOR_RESOURCES:
+        # MAKEINTRESOURCEW：把整数资源 ID 传给 LPCWSTR 参数。
+        resource = ctypes.cast(ctypes.c_void_p(resource_id), wintypes.LPCWSTR)
+        handle = _user32.LoadCursorW(None, resource)
+        if handle:
+            handles.add(int(handle))
+    _resize_cursor_handles = handles
+    return handles
+
+
+def _current_cursor_handle() -> int:
+    """读取当前系统光标句柄。"""
+    info = _CURSORINFO()
+    info.cbSize = ctypes.sizeof(info)
+    _user32.GetCursorInfo.argtypes = (ctypes.POINTER(_CURSORINFO),)
+    _user32.GetCursorInfo.restype = wintypes.BOOL
+    if not _user32.GetCursorInfo(ctypes.byref(info)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return int(info.hCursor)
+
+
+def find_non_resize_x(
+    x_start: int,
+    y: int,
+    x_end: int,
+    *,
+    settle: float = 0.03,
+    max_search: int = 32,
+) -> int | None:
+    """返回区间内第一个不属于系统尺寸调整光标横坐标。
+
+    QQ 消息区和成员栏之间有一条真实的 SIZEWE 命中区。模板得到的区域左边界
+    可能落在该命中区上，直接按下拖动会改变布局，而不是进入消息框选态。这里
+    按真实鼠标位置逐像素探测，不使用固定偏移或内边距。探测结束后恢复原光标。
+
+    参数中的 ``x_end`` 为包含端点的闭区间上限。``max_search`` 只用于限制
+    异常环境下的探测距离，不代表区域边距。
+    """
+    if settle < 0:
+        raise ValueError("settle 不能小于 0")
+    if max_search < 1:
+        raise ValueError("max_search 必须大于 0")
+    if x_end < x_start:
+        raise ValueError("x_end 不能小于 x_start")
+
+    resize_handles = _load_resize_cursor_handles()
+    if not resize_handles:
+        raise RuntimeError("CURSOR_RESIZE_HANDLE_UNAVAILABLE")
+
+    old_x, old_y = _cursor_position()
+    try:
+        search_end = min(x_end, x_start + max_search - 1)
+        for x in range(x_start, search_end + 1):
+            move_to(x, y)
+            if settle:
+                time.sleep(settle)
+            if _current_cursor_handle() not in resize_handles:
+                return x
+        return None
+    finally:
+        move_to(old_x, old_y)
+
+
 # __file__ 是当前 mouse.py 的绝对路径：
 #   <项目根>/utils/core/mouse.py
 # parents[2] 回到 <项目根>，从而无论服务从哪里启动，都能找到 <项目根>/libs/input_event.dll。

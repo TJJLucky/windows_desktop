@@ -60,6 +60,9 @@ def _get_window_cache() -> WindowStateCache:
     global _window_cache_instance
     if _window_cache_instance is None:
         _window_cache_instance = WindowStateCache(default_window_cache_path())
+        removed = _window_cache_instance.prune_invalid()
+        if removed:
+            print(f"[INFO] 已清理失效 QQ 窗口缓存 {removed} 条")
     return _window_cache_instance
 
 def _window_dpi(hwnd: int) -> int:

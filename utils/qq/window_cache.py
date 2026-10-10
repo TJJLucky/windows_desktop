@@ -93,6 +93,29 @@ class WindowStateCache:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(_SCHEMA)
 
+    def prune_invalid(self) -> int:
+        """删除已失效或已不属于原进程的 HWND 快照。"""
+        try:
+            import win32gui
+            import win32process
+        except ImportError:
+            return 0
+        removed = 0
+        with self._lock, closing(self._connect()) as connection, connection:
+            rows = connection.execute("SELECT hwnd, pid FROM window_cache").fetchall()
+            for hwnd, expected_pid in rows:
+                valid = bool(win32gui.IsWindow(hwnd))
+                if valid:
+                    try:
+                        _, actual_pid = win32process.GetWindowThreadProcessId(hwnd)
+                        valid = expected_pid is None or actual_pid == expected_pid
+                    except Exception:
+                        valid = False
+                if not valid:
+                    connection.execute("DELETE FROM window_cache WHERE hwnd = ?", (hwnd,))
+                    removed += 1
+        return removed
+
     def get(self, hwnd: int) -> WindowSnapshot | None:
         with self._lock, closing(self._connect()) as connection:
             row = connection.execute(
