@@ -52,6 +52,19 @@ CREATE TABLE IF NOT EXISTS contact_snapshot (
     messages_json TEXT NOT NULL,
     updated_at   TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
+
+CREATE TABLE IF NOT EXISTS operation_attempt (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id     TEXT NOT NULL,
+    operation      TEXT NOT NULL,
+    contact_name   TEXT,
+    status         TEXT NOT NULL,
+    failure_code   TEXT,
+    duration_ms    REAL NOT NULL,
+    details_json   TEXT,
+    created_at     TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_operation_attempt_created ON operation_attempt(created_at);
 """
 
 
@@ -225,6 +238,20 @@ class ChatHistoryStore:
                 (contact_name, snapshot_json),
             )
             return len(new_messages)
+
+    def record_operation(
+        self, *, request_id: str, operation: str, contact_name: str | None, status: str,
+        duration_ms: float, failure_code: str | None = None, details: dict[str, Any] | None = None,
+    ) -> None:
+        """记录不含消息正文的接口执行诊断。"""
+        with self._lock, closing(self._connect()) as connection, connection:
+            connection.execute(
+                "INSERT INTO operation_attempt("
+                "request_id, operation, contact_name, status, failure_code, duration_ms, details_json"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (request_id, operation, contact_name, status, failure_code, duration_ms,
+                 json.dumps(details, ensure_ascii=False, separators=(",", ":")) if details else None),
+            )
 
     def list_conversations(self, limit: int = 50) -> list[dict]:
         """返回会话的最后更新时间、消息数和最后一条正文。"""

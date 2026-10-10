@@ -35,6 +35,40 @@ class QqContactNotFoundError(QqAutomationError):
         super().__init__(f"QQ_CONTACT_NOT_FOUND: 当前可见 QQ 用户列表中未找到联系人「{contact_name}」")
 
 
+_ERROR_CODE_PREFIXES = (
+    "QQ_USER_LIST_REGION_NOT_FOUND",
+    "QQ_MESSAGE_REGION_NOT_FOUND",
+    "QQ_INPUT_REGION_NOT_FOUND",
+    "QQ_COPY_ACTION_NOT_FOUND",
+    "QQ_SELECTION_NOT_ENTERED",
+    "QQ_COPY_CLIPBOARD_UNCHANGED",
+    "QQ_COPY_TEXT_EMPTY",
+    "QQ_COPY_PARSE_FAILED",
+    "QQ_COPY_CAPTURE_FAILED",
+    "QQ_MESSAGE_REGION_TOO_SMALL",
+    "QQ_WINDOW_NOT_READY",
+)
+
+
+def _operation_error_code(error: Exception, fallback_code: str) -> str:
+    """从底层异常提取稳定的公开错误码，无法识别时使用阶段兜底码。"""
+    detail = str(error).strip()
+    if error.__class__.__name__ == "QQWindowNotReadyError":
+        return "QQ_WINDOW_NOT_READY"
+    if "get_message_box_region_and_image" in detail:
+        return "QQ_MESSAGE_REGION_NOT_FOUND"
+    if "get_inputbox_region_and_image" in detail:
+        return "QQ_INPUT_REGION_NOT_FOUND"
+    if "get_userList_region_and_image" in detail:
+        return "QQ_USER_LIST_REGION_NOT_FOUND"
+    for code in _ERROR_CODE_PREFIXES:
+        if code in detail:
+            return code
+    if detail.startswith("QQ_") and " " not in detail:
+        return detail
+    return fallback_code
+
+
 def _raise_operation_error(error: Exception, contact_name: str, fallback_code: str) -> None:
     """把底层的联系人缺失异常保留为 HTTP 可辨识的业务错误。"""
     # 延迟导入：保持 facade 在没有 Windows GUI 依赖的测试环境中仍可加载。
@@ -42,7 +76,7 @@ def _raise_operation_error(error: Exception, contact_name: str, fallback_code: s
 
     if isinstance(error, ContactNotFoundError):
         raise QqContactNotFoundError(contact_name) from error
-    raise QqAutomationError(fallback_code) from error
+    raise QqAutomationError(_operation_error_code(error, fallback_code)) from error
 
 
 class QqAutomationPort(Protocol):
@@ -90,7 +124,7 @@ class LegacyQqAutomationFacade:
         contacts, error = self._operator().get_contact_list(timeout=60.0)
         if error is not None:
             # 失败统一投影为业务错误（HTTP 层转 503），错误码带出失败阶段
-            raise QqAutomationError("QQ_CONTACTS_UNAVAILABLE") from error
+            raise QqAutomationError(_operation_error_code(error, "QQ_CONTACTS_UNAVAILABLE")) from error
         return contacts
 
     def send_message(self, contact_name: str, text: str) -> dict:

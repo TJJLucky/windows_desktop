@@ -193,3 +193,19 @@ def test_history_returns_latest_page(store):
     latest = store.get_history("华强电子", limit=2)
     assert [item["text"] for item in latest] == ["b", "c"]
     assert [item["seq"] for item in latest] == [2, 3]
+
+
+def test_operation_attempt_is_persisted_without_message_body(store):
+    store.record_operation(
+        request_id="req-1", operation="READ", contact_name="华强电子",
+        status="FAILED", failure_code="QQ_COPY_ACTION_NOT_FOUND", duration_ms=123.4,
+        details={"messageRegion": [1, 2, 3, 4]},
+    )
+    with sqlite3.connect(store._path) as connection:
+        row = connection.execute(
+            "SELECT request_id, operation, contact_name, status, failure_code, duration_ms, details_json "
+            "FROM operation_attempt"
+        ).fetchone()
+    assert row[:5] == ("req-1", "READ", "华强电子", "FAILED", "QQ_COPY_ACTION_NOT_FOUND")
+    assert row[5] == pytest.approx(123.4)
+    assert "messageRegion" in row[6]

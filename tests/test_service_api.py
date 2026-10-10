@@ -18,7 +18,7 @@ import pytest
 
 # create_app：被测应用工厂
 from service.app import create_app
-from service.facade import QqContactNotFoundError
+from service.facade import QqAutomationError, QqContactNotFoundError
 
 
 class FakeAutomation:
@@ -206,3 +206,54 @@ async def test_capture_check_not_ready_is_200(service) -> None:
     assert body["ready"] is False
     assert body["windowTitle"] is None
     assert body["error"] == "QQ_WINDOW_NOT_READY"
+
+
+@pytest.mark.asyncio
+async def test_read_preserves_specific_automation_error_code(service) -> None:
+    """读取阶段的底层错误码应保留到 503 响应，不能被泛化为 QQ_MESSAGES_UNAVAILABLE。"""
+    automation, app = service
+
+    def fail_read(contact_name: str) -> dict:
+        raise QqAutomationError("QQ_COPY_ACTION_NOT_FOUND")
+
+    automation.read_messages = fail_read
+    async with client(app) as caller:
+        response = await caller.post("/v1/commands/read", json={"contactName": "华强电子"})
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "QQ_COPY_ACTION_NOT_FOUND"}
+
+
+@pytest.mark.asyncio
+async def test_validation_error_is_logged_with_field_location(service, caplog) -> None:
+    """422 请求体错误必须记录字段位置，不能只留下状态码。"""
+    _, app = service
+    with caplog.at_level("WARNING", logger="qq_service.api"):
+        async with client(app) as caller:
+            response = await caller.post("/v1/commands/read", json={})
+
+    assert response.status_code == 422
+    assert any("http.request.validation_error" in record.message for record in caplog.records)
+    assert any("contactName" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_successful_read_writes_messages_snapshot_and_operation_diagnostics(service, tmp_path) -> None:
+    """成功读取应写聊天记录、当前窗口快照和操作诊断；重复读取不重复插入。"""
+    _, app = service
+    async with client(app) as caller:
+        first = await caller.post("/v1/commands/read", json={"contactName": "华强电子"})
+        second = await caller.post("/v1/commands/read", json={"contactName": "华强电子"})
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    database = tmp_path / "qq-chat-history.sqlite3"
+    assert database.exists()
+    import sqlite3
+    with sqlite3.connect(database) as connection:
+        messages = connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        snapshots = connection.execute("SELECT COUNT(*) FROM contact_snapshot").fetchone()[0]
+        attempts = connection.execute("SELECT COUNT(*) FROM operation_attempt WHERE operation = 'READ'").fetchone()[0]
+    assert messages == 1
+    assert snapshots == 1
+    assert attempts == 2
