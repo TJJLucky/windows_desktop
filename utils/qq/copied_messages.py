@@ -14,8 +14,17 @@ _MESSAGE_HEADER = re.compile(
 )
 
 
-def parse_copied_messages(copied_text: str) -> list[dict[str, str]]:
-    """Split QQ clipboard text while preserving sender, time, body, and raw text."""
+def parse_copied_messages(
+    copied_text: str,
+    *,
+    fallback_sender: str | None = None,
+) -> list[dict[str, str]]:
+    """Split QQ clipboard text while preserving sender, time, body, and raw text.
+
+    Private chats and service accounts can copy only the message body, without
+    ``sender: timestamp`` headers. When a caller knows the active contact, use
+    that contact as the sender while leaving the unavailable timestamp empty.
+    """
     text = html.unescape(str(copied_text or "")).replace("\r\n", "\n").replace("\r", "\n")
     text = text.replace("\u00a0", " ").strip()
     if not text:
@@ -23,6 +32,9 @@ def parse_copied_messages(copied_text: str) -> list[dict[str, str]]:
 
     matches = list(_MESSAGE_HEADER.finditer(text))
     if not matches:
+        sender = str(fallback_sender or "").strip()
+        if sender:
+            return [{"sender": sender, "timestamp": "", "text": text, "rawText": text}]
         raise ValueError("QQ_COPIED_MESSAGE_FORMAT_INVALID")
 
     messages: list[dict[str, str]] = []

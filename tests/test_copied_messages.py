@@ -41,6 +41,29 @@ def test_parse_qq_copied_sample_supports_newline_separators():
     ]
 
 
+def test_parse_qq_plain_text_uses_contact_name_as_sender():
+    messages = parse_copied_messages(
+        "尊贵的VIP客户您好，很高兴为您服务！",
+        fallback_sender="杰兴电子科技单片机销售",
+    )
+
+    assert messages == [
+        {
+            "sender": "杰兴电子科技单片机销售",
+            "timestamp": "",
+            "text": "尊贵的VIP客户您好，很高兴为您服务！",
+            "rawText": "尊贵的VIP客户您好，很高兴为您服务！",
+        }
+    ]
+
+
+def test_parse_qq_plain_text_without_contact_still_rejects_format():
+    import pytest
+
+    with pytest.raises(ValueError, match="QQ_COPIED_MESSAGE_FORMAT_INVALID"):
+        parse_copied_messages("没有发送人和时间")
+
+
 def test_message_list_integrates_activation_copy_and_parser(monkeypatch):
     calls: list[str] = []
     reader = MessageList()
