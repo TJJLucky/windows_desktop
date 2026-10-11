@@ -94,21 +94,22 @@ class Dispatcher:
             task_type, args, kwargs, res_q = task
             result: Any = None
             exc: Optional[Exception] = None
+            from .template_runtime import operation_scope
             try:
-                # 按任务类型分发到对应实现（全部在 worker 线程串行执行）
-                if task_type == "send_message":
-                    contact_name, text = args
-                    result = self.send_message_impl(contact_name, text)
-                elif task_type == "read_message_list":
-                    contact_name, = args
-                    result = self.read_message_list_impl(contact_name)
-                elif task_type == "get_contact_list":
-                    result = self.get_contact_list_impl()
-                elif task_type == "check_capture_ready":
-                    result = self.check_capture_ready_impl()
-                else:
-                    # 未知任务类型 → 作为异常返回给调用方
-                    raise ValueError(f"unknown task {task_type}")
+                with operation_scope():
+                    # 全部在 worker 线程串行执行，固定本次操作的模板版本。
+                    if task_type == "send_message":
+                        contact_name, text = args
+                        result = self.send_message_impl(contact_name, text)
+                    elif task_type == "read_message_list":
+                        contact_name, = args
+                        result = self.read_message_list_impl(contact_name)
+                    elif task_type == "get_contact_list":
+                        result = self.get_contact_list_impl()
+                    elif task_type == "check_capture_ready":
+                        result = self.check_capture_ready_impl()
+                    else:
+                        raise ValueError(f"unknown task {task_type}")
             except Exception as e:
                 # 捕获实现抛出的任何异常
                 exc = e

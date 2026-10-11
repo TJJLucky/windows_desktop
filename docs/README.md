@@ -15,6 +15,7 @@
 9. [09-chat-history.md](09-chat-history.md)：按用户列表名字维护的聊天记录。
 10. [10-logging-and-diagnostics.md](10-logging-and-diagnostics.md)：应用日志、控制台捕获和诊断字段。
 11. [11-testing-and-operations.md](11-testing-and-operations.md)：构建、测试、冒烟和运行检查清单。
+12. [12-layout-profiles.md](12-layout-profiles.md)：布局版本、模板图片持久化、识别位置接口及可视化管理。
 
 ## 统一约定
 
@@ -22,5 +23,5 @@
 - 运行形态：Windows 登录用户交互桌面，不注册 Windows Service。
 - 网络边界：只监听 `127.0.0.1` 随机端口。
 - 联系人键：使用 QQ 用户列表中的名字。
-- 串行边界：所有 QQ 桌面操作通过 `Dispatcher` 单消费者队列执行。
+- 串行边界：QQ 读写通过 `Dispatcher` 单消费者队列执行；布局检测和切换与该队列共享桌面操作锁，忙碌时拒绝管理操作。
 - 日志：应用结构化日志和完整控制台日志都写入 `<state-dir>/logs/`。

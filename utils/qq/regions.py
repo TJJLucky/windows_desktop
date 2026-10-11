@@ -12,12 +12,8 @@
 前者用于裁剪图片做 OCR/模板匹配，后者用于鼠标点击。
 """
 
-# os：拼接模板目录路径
-import os
 # wraps：保留被缓存函数的元信息
 from functools import wraps
-# Path：路径对象
-from pathlib import Path
 
 # PIL.Image：模板图加载与区域裁剪
 from PIL import Image
@@ -25,7 +21,9 @@ from PIL import Image
 from dataclasses import dataclass
 
 # find_template：模板匹配定位锚点；crop_region：按区域裁剪；draw_box：调试画框
-from ..vision.matcher import find_template, crop_region, draw_box
+from ..vision.matcher import crop_region, draw_box
+from .template_runtime import (find_template, load_image, record_frame, record_region, observing,
+                              template_observations, restore_observations)
 # timer：给区域识别函数自动打耗时日志
 from ..core.timing import timer
 # get_qq_window_image / get_qq_windows：窗口截图与窗口列表
@@ -57,9 +55,6 @@ class RegionResult:
     send_button_region: dict | None = None
 
 
-# 模板目录：本文件在 utils/qq/，上溯三级到项目根再进 templates/
-_TEMPLATE_DIR = os.path.join(Path(__file__).parent.parent.parent, "templates")
-
 # QQ 进入多消息选择态后，操作工具栏位于窗口底部。只在这块较小的 ROI 内查找
 # copy_icon.png，既避免将聊天正文里的相似图形误识别为按钮，也避免对整窗做匹配。
 _COPY_ACTION_TOOLBAR_TOP_RATIO = 0.65
@@ -72,12 +67,6 @@ _COPY_TOOLBAR_COMPANION_TEXTS = frozenset({
     "收藏",
     "删除",
 })
-
-def load_image(path):
-    """加载 templates 目录下的模板图。"""
-    template_path = os.path.join(_TEMPLATE_DIR, path)
-    return Image.open(template_path)
-
 
 def _to_screen(window, region: dict) -> dict:
     """将图片相对坐标转为屏幕绝对坐标（用于鼠标点击）"""
@@ -125,6 +114,7 @@ def get_copy_action_region(window, QQ_window_image=None, threshold: float | None
         # 模板与当前 QQ 截图均来自同一 DPI 下时，固定尺寸匹配更快；若后续支持多
         # DPI 模板，可将这里改为 True，而无需改变调用层契约。
         multiscale=False,
+        origin=(0, toolbar_top),
     )
     if matched is None:
         return None
@@ -308,22 +298,28 @@ def _cached_region_result(name: str):
         def wrapper(window, QQ_window_image=None):
             if QQ_window_image is None:
                 QQ_window_image, _ = get_qq_window_image(window)
-            cached = get_region(name, window, QQ_window_image)
+            record_frame(window, QQ_window_image)
+            cached = None if observing() else get_region(name, window, QQ_window_image)
             if cached is not None:
                 region = cached["region"]
-                return RegionResult(
+                result = RegionResult(
                     screen_region=_to_screen(window, region),
                     image_region=region,
                     image=crop_region(QQ_window_image, region),
                     full_image=QQ_window_image,
                     send_button_region=cached.get("send_button_region"),
                 )
+                restore_observations(cached.get("templates", {}))
+                record_region(name, result)
+                return result
             result = func(window, QQ_window_image)
+            record_region(name, result)
             save_region(
                 name,
                 window,
                 QQ_window_image,
-                {"region": result.image_region, "send_button_region": result.send_button_region},
+                {"region": result.image_region, "send_button_region": result.send_button_region,
+                 "templates": template_observations()},
             )
             return result
         return wrapper

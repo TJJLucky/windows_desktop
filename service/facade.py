@@ -115,6 +115,9 @@ class LegacyQqAutomationFacade:
         保证所有视觉操作串行执行、互不并发。
         """
         from utils.qq.dispatcher import Dispatcher
+        if getattr(self, "layout_store", None) is not None:
+            from utils.qq.template_runtime import configure
+            configure(self.layout_store)
 
         return Dispatcher()
 

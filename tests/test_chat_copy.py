@@ -16,10 +16,11 @@ def test_get_copy_action_region_matches_only_bottom_toolbar(monkeypatch):
     """模板匹配只看窗口下方，并将 ROI 相对坐标还原为屏幕绝对坐标。"""
     captured: dict[str, object] = {}
 
-    def fake_find_template(big, small, threshold, use_mask=False, multiscale=True):
+    def fake_find_template(big, small, threshold, use_mask=False, multiscale=True, *, origin=(0, 0)):
         captured["roi_size"] = big.size
         captured["threshold"] = threshold
         captured["multiscale"] = multiscale
+        captured["origin"] = origin
         return {"x": 300, "y": 40, "left": 300, "top": 40, "right": 340, "bottom": 80}
 
     monkeypatch.setattr(regions, "find_template", fake_find_template)
@@ -29,7 +30,7 @@ def test_get_copy_action_region_matches_only_bottom_toolbar(monkeypatch):
 
     result = regions.get_copy_action_region(window, full_image)
 
-    assert captured == {"roi_size": (1000, 280), "threshold": 0.88, "multiscale": False}
+    assert captured == {"roi_size": (1000, 280), "threshold": 0.88, "multiscale": False, "origin": (0, 520)}
     assert result == {
         "x": 400,
         "y": 760,

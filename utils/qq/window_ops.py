@@ -38,14 +38,11 @@ from ..core.window import layout_window_left_half, set_window_z_pos
 # timer：输出窗口就绪与 WGC 捕获阶段耗时
 from ..core.timing import timer
 # 模板匹配（模式切换按钮）
-from ..vision.matcher import find_template
+from .template_runtime import find_template, load_image
 # 快捷键发送与配置表（唤醒主面板）
 from .hotkeys import send_hotkey, TOGGLE_QQ_WINDOWS
 # SQLite 窗口状态缓存
 from .window_cache import WindowSnapshot, WindowStateCache, default_window_cache_path
-
-# 模板目录：本文件在 utils/qq/，上溯三级到项目根再进 templates/
-_TEMPLATE_DIR = os.path.join(Path(__file__).parent.parent.parent, "templates")
 
 _WINDOW_FULL_REFRESH_TTL_SECONDS = 30.0
 _window_cache_instance: WindowStateCache | None = None
@@ -142,8 +139,7 @@ def match_switch_to_big():
     # 只保留顶部 40px（切换按钮在标题栏区域）
     image = image.crop((0, 0, image.width, 40))
     # 加载切换按钮模板
-    template_path = os.path.join(_TEMPLATE_DIR, 'switch_to_big.png')
-    small_image = Image.open(template_path)
+    small_image = load_image('switch_to_big.png')
     # 匹配（阈值 1.0 严格要求）
     region = find_template(image, small_image, 1)
     if not region:
@@ -164,8 +160,7 @@ def match_switch_to_small():
     # 顶部 40px 区域（切换按钮在标题栏）
     image = image.crop((0, 0, image.width, 40))
     # 加载切换按钮模板
-    template_path = os.path.join(_TEMPLATE_DIR, 'switch_to_small.png')
-    small_image = Image.open(template_path)
+    small_image = load_image('switch_to_small.png')
     # 匹配
     region = find_template(image, small_image, 1)
     if not region:

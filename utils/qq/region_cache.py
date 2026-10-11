@@ -27,7 +27,9 @@ def _ttl_seconds() -> float:
 
 def _window_signature(window, image) -> tuple[Any, ...]:
     """返回窗口几何、状态和截图像素尺寸签名。"""
+    from .template_runtime import profile_id
     return (
+        profile_id(),
         int(getattr(window, "_hWnd", 0)),
         int(window.left),
         int(window.top),

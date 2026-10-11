@@ -52,6 +52,7 @@ def create_app(
     *,
     ledger_path: Path,
     chat_history_path: Path | None = None,
+    layout_desktop=None,
 ) -> FastAPI:
     """构造 FastAPI 应用，注册全部 v1 接口并返回应用对象。
 
@@ -76,6 +77,17 @@ def create_app(
         description=API_DESCRIPTION,
         openapi_tags=OPENAPI_TAGS,
     )
+    from utils.vision.layout_store import LayoutStore, LayoutError
+    from .layouts import layout_router
+    layout_store = LayoutStore(ledger_path.parent / "qq-layouts.sqlite3")
+    if isinstance(facade, LegacyQqAutomationFacade):
+        facade.layout_store = layout_store
+    app.state.layout_store = layout_store
+    app.include_router(layout_router(layout_store, layout_desktop))
+
+    @app.exception_handler(LayoutError)
+    async def layout_error_handler(request: Request, exc: LayoutError):
+        return JSONResponse(status_code=exc.status, content={"detail": str(exc)})
     logger.info(
         "application.create ledger_path=%s chat_history_path=%s automation=%s",
         ledger_path,
