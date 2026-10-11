@@ -13,12 +13,13 @@ import win32gui
 from ..vision.layout_store import LayoutError
 from ..core.clipboard import ClipboardCopy, ClipboardCopyError
 from ..core.mouse import click_at, right_click_at
+from ..core.screenshot import WGCCapture, WgcCaptureError
 from ..core.window import WindowCaptureCtx
 from .hotkeys import send_hotkey
 from .regions import RegionResult, get_userList_region_and_image
 from .template_runtime import find_unique_template, load_image, window_signature
 from .user_list import UserList
-from .window_ops import ensure_qq_window_with_retry, get_qq_window_image
+from .window_ops import ensure_qq_window_with_retry
 
 logger = logging.getLogger("qq_service.contact_number")
 MENU_WAIT_SECONDS = 2.0
@@ -40,12 +41,25 @@ def _row_image(region: RegionResult, row: ContactRow) -> Image.Image:
 
 def _active_row(region: RegionResult) -> ContactRow:
     rows = [ContactRow(avatar, rect) for avatar, rect in UserList.crop_user_row_by_avatar(region.image)]
-    active = [row for row in rows if UserList.is_active_bg(_row_image(region, row))]
-    if not active:
+    images = [_row_image(region, row) for row in rows]
+    if not images:
         raise RuntimeError("QQ_CONTACT_NUMBER_ACTIVE_NOT_FOUND")
-    if len(active) != 1:
+    # 绝对色带（浅色 226 / 深色 113 一档）是主判据；相对离群（主题无关）只做否决与兜底。
+    # 实测同一列表里激活行(226)与鼠标悬停行(235)都是离群色，因此离群集合出现多个候选时
+    # 仍需先看色带结论：只要色带命中行也在离群集合内，就采纳色带结果，绝不因悬停多一个候选放弃。
+    absolute = [index for index, image in enumerate(images) if UserList.is_active_bg(image)]
+    relative = UserList.active_row_index([UserList.modal_color(image) for image in images])
+    if len(absolute) > 1:
         raise RuntimeError("QQ_CONTACT_NUMBER_ACTIVE_AMBIGUOUS")
-    return active[0]
+    if len(absolute) == 1:
+        if relative and absolute[0] not in relative:
+            raise RuntimeError("QQ_CONTACT_NUMBER_ACTIVE_AMBIGUOUS")
+        return rows[absolute[0]]
+    if len(relative) == 1:
+        return rows[relative[0]]
+    if len(relative) > 1:
+        raise RuntimeError("QQ_CONTACT_NUMBER_ACTIVE_AMBIGUOUS")
+    raise RuntimeError("QQ_CONTACT_NUMBER_ACTIVE_NOT_FOUND")
 
 
 def _same_image(first: Image.Image, second: Image.Image) -> bool:
@@ -69,6 +83,7 @@ def _same_avatar(first: Image.Image, second: Image.Image) -> bool:
 
 class ContactNumberReader:
     def identify_current(self) -> str | None:
+        self._generation = None
         window = ensure_qq_window_with_retry()
         with WindowCaptureCtx(window._hWnd):
             image = self._capture(window)
@@ -76,11 +91,19 @@ class ContactNumberReader:
             return self.copy_row(window, region, _active_row(region))
 
     @staticmethod
-    def _capture(window):
-        image, _ = get_qq_window_image(window)
-        if image is None:
-            raise RuntimeError("QQ_CONTACT_NUMBER_CAPTURE_FAILED")
-        return image
+    def _clock():
+        return WGCCapture().clock_100ns()
+
+    def _capture(self, window, *, after_100ns=None):
+        try:
+            frame = WGCCapture().capture_frame(window._hWnd, after_100ns=after_100ns)
+        except WgcCaptureError as exc:
+            raise RuntimeError("QQ_CONTACT_NUMBER_" + exc.code) from exc
+        previous = getattr(self, "_generation", None)
+        if previous is not None and previous != frame.info.generation:
+            raise RuntimeError("QQ_CONTACT_NUMBER_WINDOW_CHANGED")
+        self._generation = frame.info.generation
+        return frame.image
 
     def copy_row(self, window, region: RegionResult, row: ContactRow) -> str | None:
         """复制内部已识别的行；当前阶段只由 identify_current 调用。"""
@@ -97,6 +120,7 @@ class ContactNumberReader:
         menu_open = False
         require_foreground = False
         code = "SUCCESS"
+        action_barrier = None
 
         def checked_frame():
             if window_signature(window) != signature or not win32gui.IsWindowVisible(window._hWnd) or win32gui.IsIconic(window._hWnd):
@@ -106,7 +130,9 @@ class ContactNumberReader:
                 logger.warning("contacts.number.foreground_changed expected=%s actual=%s title=%r",
                                window._hWnd, foreground, win32gui.GetWindowText(foreground))
                 raise RuntimeError("QQ_CONTACT_NUMBER_WINDOW_CHANGED")
-            frame = self._capture(window)
+            frame = self._capture(window, after_100ns=action_barrier)
+            if window_signature(window) != signature:
+                raise RuntimeError("QQ_CONTACT_NUMBER_WINDOW_CHANGED")
             if frame.size != full.size:
                 logger.warning("contacts.number.identity_changed part=frame_size")
                 raise RuntimeError("QQ_CONTACT_NUMBER_ROW_CHANGED")
@@ -141,6 +167,7 @@ class ContactNumberReader:
                     raise RuntimeError("QQ_CONTACT_NUMBER_ROW_CHANGED")
                 menu_open = True
                 right_click_at(click_x, click_y, restore=False, smooth=False)
+                action_barrier = self._clock()
                 require_foreground = True
                 deadline = time.monotonic() + MENU_WAIT_SECONDS
                 action = None
@@ -161,6 +188,7 @@ class ContactNumberReader:
                 clipboard.mark()
                 click_at(signature["left"] + current["left"] + (current["right"] - current["left"]) // 2,
                          signature["top"] + current["top"] + (current["bottom"] - current["top"]) // 2, restore=False, smooth=False)
+                action_barrier = self._clock()
                 value = clipboard.read(expected_pid=signature["pid"]).strip()
                 if not re.fullmatch(r"[1-9][0-9]{4,19}", value):
                     raise RuntimeError("QQ_CONTACT_NUMBER_INVALID")

@@ -9,6 +9,16 @@ from utils.qq.user_list import UserList
 @pytest.mark.parametrize("color,expected", [
     ((222, 222, 222), True),
     ((230, 230, 230), True),
+    ((216, 216, 216), True),
+    ((234, 234, 234), True),
+    ((215, 215, 215), False),
+    ((235, 235, 235), False),
+    ((113, 113, 113), True),
+    ((100, 100, 100), True),
+    ((118, 118, 118), True),
+    ((99, 99, 99), False),
+    ((119, 119, 119), False),
+    ((122, 122, 122), False),
     ((221, 226, 226), False),
     ((226, 231, 226), False),
     ((226, 226, 241), False),
@@ -18,6 +28,26 @@ from utils.qq.user_list import UserList
 ])
 def test_background_color_boundaries(color, expected):
     assert UserList.is_active_bg(Image.new("RGB", (30, 10), color)) is expected
+
+
+def test_dark_gray_noise_is_not_filtered_as_shadow():
+    """深色主题背景（113/122）必须保留为主体像素，不能被旧阴影规则 (<200) 丢弃。"""
+    pixels = np.array([(122, 122, 122)] * 300, dtype=np.uint8).reshape(10, 30, 3)
+    kept = UserList.background_pixels(Image.fromarray(pixels))
+    assert len(kept) == 300
+    assert UserList.is_active_bg(Image.fromarray(pixels)) is False
+
+
+@pytest.mark.parametrize("backgrounds,expected", [
+    ([(113, 113, 113)] + [(122, 122, 122)] * 9, [0]),
+    ([(122, 122, 122)] * 9 + [(113, 113, 113)], [9]),
+    ([(226, 226, 226)] + [(245, 245, 245)] * 6, [0]),
+    ([(122, 122, 122)] * 10, []),
+    ([(240, 240, 240)] * 5 + [(226, 226, 226), (230, 230, 230)], [5, 6]),
+    ([(113, 113, 113), (226, 226, 226)] + [(122, 122, 122)] * 4, [0, 1]),
+])
+def test_active_row_index_is_theme_independent(backgrounds, expected):
+    assert UserList.active_row_index(backgrounds) == expected
 
 
 @pytest.mark.parametrize("first,second,expected", [

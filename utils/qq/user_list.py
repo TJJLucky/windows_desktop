@@ -86,43 +86,80 @@ class UserList:
         self.cache_data: dict = {}
 
     @staticmethod
-    def is_active_bg(img: Image.Image) -> bool:
-        """判断好友条目背景：226 激活 / 245 未激活。
+    def background_pixels(img: Image.Image) -> np.ndarray:
+        """剔除文字/图标/边缘光晕，仅保留行主体背景像素（深浅主题通用）。
 
-        过滤文字、边缘残留、抗锯齿光晕后，取高频像素为背景色，
-        用区间容错判定。
-        :param img: 裁切好的单行好友背景图（建议排除头像右侧区域）
-        :return: True=激活, False=未激活
+        旧实现用 `arr < 200` 当阴影噪声，会把深色主题的整块背景（113/122 灰）
+        全部丢弃，导致深色主题永远判不出激活行。这里把阴影限定为 183~200 的
+        中间灰光晕，深色背景得以保留。
         """
-        # 转 numpy 数组
-        arr = np.array(img)
-        # 剔除干扰像素：
+        arr = np.array(img.convert("RGB"))
         dark_text = np.all(arr < 45, axis=-1)  # 黑色文字/图标
         gray_text = np.all((arr >= 123) & (arr <= 183), axis=-1)  # 灰色昵称/签名
-        shadow = np.all(arr < 200, axis=-1)  # 头像边缘阴影
-        noise_mask = dark_text | gray_text | shadow
-        # 剩余像素即"主体背景"
-        bg_pixels = arr[~noise_mask]
+        halo = np.all((arr >= 183) & (arr < 200), axis=-1)  # 头像/文字边缘光晕
+        return arr[~(dark_text | gray_text | halo)]
 
-        # 有效背景像素太少（图太花/误判）→ 兜底按未激活处理
-        if len(bg_pixels) < 150:  # 有效背景像素太少，兜底
-            return False
-
-        # 最高频 RGB 即主体背景色
-        rgb = bg_pixels.astype(np.uint32)
+    @staticmethod
+    def mode_color(pixels: np.ndarray) -> tuple[tuple[int, int, int], int]:
+        """取出现次数最多的 RGB 及次数；并列时首次出现的颜色优先。"""
+        rgb = pixels.astype(np.uint32)
         colors = (rgb[:, 0] << 16) | (rgb[:, 1] << 8) | rgb[:, 2]
         values, first_indices, counts = np.unique(colors, return_index=True, return_counts=True)
         candidates = np.flatnonzero(counts == counts.max())
-        # 并列时保留原 Counter 的语义：首次出现的颜色优先。
         winner = int(values[candidates[np.argmin(first_indices[candidates])]])
-        r, g, b = winner >> 16, (winner >> 8) & 255, winner & 255
+        return (winner >> 16, (winner >> 8) & 255, winner & 255), int(counts.max())
 
-        # 区间容错判定：222~230 灰 = 激活态背景（QQ 深一点）；241~249 = 未激活（白一点）
-        if 222 <= r <= 230 and 222 <= g <= 230 and 222 <= b <= 230:
-            return True  # 激活
-        if 241 <= r <= 249 and 241 <= g <= 249 and 241 <= b <= 249:
-            return False  # 未激活
-        return False  # 中间值偏亮，默认未激活
+    @staticmethod
+    def modal_color(img: Image.Image) -> tuple[int, int, int]:
+        """行内主体背景色；背景像素全被判为噪声时退回整图众数。"""
+        pixels = UserList.background_pixels(img)
+        if pixels.size == 0:
+            pixels = np.array(img.convert("RGB")).reshape(-1, 3)
+        return UserList.mode_color(pixels)[0]
+
+    @staticmethod
+    def is_active_bg(img: Image.Image) -> bool:
+        """按绝对色带判断单行是否为激活态（浅色与深色主题各一档）。
+
+        浅色主题：激活 222~230 灰，未激活 241~249 灰。
+        深色主题：激活约 100~118 灰，未激活约 119~135 灰。
+        非中性灰背景一律按未激活处理。
+
+        :param img: 裁切好的单行好友背景图（建议排除头像右侧区域）
+        :return: True=激活, False=未激活
+        """
+        pixels = UserList.background_pixels(img)
+        # 有效背景像素太少（图太花/误判）→ 兜底按未激活处理
+        if len(pixels) < 150:
+            return False
+        (r, g, b), _ = UserList.mode_color(pixels)
+        # 非中性灰（带色调）不作为纯背景判定依据
+        if max(r, g, b) - min(r, g, b) > 3:
+            return False
+        value = (r + g + b) / 3
+        if value >= 200:  # 浅色主题
+            return 216 <= value <= 234
+        return 100 <= value <= 118  # 深色主题
+
+    @staticmethod
+    def active_row_index(backgrounds: list[tuple[int, int, int]]) -> list[int]:
+        """按行主体背景色的相对深浅给出激活行候选索引（主题无关）。
+
+        深浅主题下激活行都比未激活行深/亮一档，与主题色值无关，因此用
+        "最大同色簇 + 最小对比度"挑离群行；返回空 = 无离群行，多个 = 歧义。
+        """
+        luminance = [sum(background) / 3 for background in backgrounds]
+        if not luminance:
+            return []
+        tolerance, min_contrast = 2.0, 4.0
+        # 未激活行是多数派；并列时偏向较亮一侧（激活行在深浅主题都更暗）。
+        best_center, best_count = luminance[0], -1
+        for center in luminance:
+            count = sum(1 for value in luminance if abs(value - center) <= tolerance)
+            if count > best_count or (count == best_count and center > best_center):
+                best_center, best_count = center, count
+        return [index for index, value in enumerate(luminance)
+                if abs(value - best_center) >= min_contrast]
 
     @staticmethod
     def check_new_msg(img_rgb: np.ndarray) -> bool:

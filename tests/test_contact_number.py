@@ -31,7 +31,10 @@ def copy_flow(monkeypatch):
     monkeypatch.setattr(cn.time, "sleep", lambda seconds: None)
     monkeypatch.setattr(cn, "send_hotkey", lambda keys: state.closed.append(keys))
     monkeypatch.setattr(cn, "_active_row", lambda r: state.after_row)
-    def capture(window):
+    state.barriers = []
+    monkeypatch.setattr(cn.ContactNumberReader, "_clock", staticmethod(lambda: len(state.clicks) * 100))
+    def capture(window, *, after_100ns=None):
+        state.barriers.append(after_100ns)
         frame = image.copy()
         if state.changed_header:
             frame.paste("black", (180, 0, 400, 60))
@@ -70,6 +73,7 @@ def test_copy_right_clicks_avatar_center_and_left_clicks_current_menu(copy_flow)
     assert state.clicks[0][1:3] == (50, 95)
     assert state.clicks[2][1:3] == (65, 140)
     assert all(c[-1]["smooth"] is False for c in (state.clicks[0], state.clicks[2]))
+    assert state.barriers == [None, 100, 100, 300]
 
 
 @pytest.mark.parametrize("property,value,code", [
@@ -102,6 +106,33 @@ def test_window_change_after_menu_stops_before_left_click(copy_flow, monkeypatch
     with pytest.raises(RuntimeError, match="WINDOW_CHANGED"):
         copy()
     assert not any(c[0] == "left" for c in state.clicks)
+
+
+def test_frame_timeout_after_right_click_does_not_replay_or_click_menu(copy_flow, monkeypatch):
+    state, copy = copy_flow
+    capture = cn.ContactNumberReader._capture
+    def timeout(window, **kw):
+        if kw.get("after_100ns") is not None:
+            raise RuntimeError("QQ_CONTACT_NUMBER_WGC_TIMEOUT")
+        return capture(window, **kw)
+    monkeypatch.setattr(cn.ContactNumberReader, "_capture", staticmethod(timeout))
+    with pytest.raises(RuntimeError, match="QQ_CONTACT_NUMBER_WGC_TIMEOUT"):
+        copy()
+    assert [click[0] for click in state.clicks] == ["right"]
+    assert state.closed == [("esc",)]
+
+
+def test_capture_generation_change_stops_even_when_pixels_are_identical(monkeypatch):
+    from utils.core.screenshot import CapturedFrame, WgcFrameInfo
+    reader = cn.ContactNumberReader()
+    frame = CapturedFrame(Image.new("RGB", (40, 30)), WgcFrameInfo())
+    frame.info.generation = 1
+    monkeypatch.setattr(cn, "WGCCapture", lambda: SimpleNamespace(capture_frame=lambda *a, **kw: frame))
+    window = SimpleNamespace(_hWnd=1)
+    reader._capture(window)
+    frame.info.generation = 2
+    with pytest.raises(RuntimeError, match="QQ_CONTACT_NUMBER_WINDOW_CHANGED"):
+        reader._capture(window)
 
 
 @pytest.fixture
@@ -209,3 +240,44 @@ def test_identification_uses_single_consumer_queue(monkeypatch):
     finally:
         release.set()
         dispatcher.stop()
+
+
+LIGHT_ACTIVE, LIGHT_HOVER, LIGHT_IDLE = (226, 226, 226), (235, 235, 235), (245, 245, 245)
+
+
+def _list_region(backgrounds, monkeypatch):
+    """构造只有行背景色差异的假列表，用于验证激活行判定。"""
+    width, band = 200, 40
+    image = Image.new("RGB", (width, band * len(backgrounds)), LIGHT_IDLE)
+    rows = []
+    for index, color in enumerate(backgrounds):
+        top = index * band
+        image.paste(Image.new("RGB", (width, band), color), (0, top))
+        rows.append(((30, top + band // 2, 10), (0, top, width, top + band)))
+    monkeypatch.setattr(cn.UserList, "crop_user_row_by_avatar", staticmethod(lambda _image: rows))
+    rect = dict(left=0, top=0, right=width, bottom=band * len(backgrounds))
+    return RegionResult(rect, rect, image, image)
+
+
+def test_active_row_keeps_band_result_when_another_row_is_hovered(monkeypatch):
+    """实测：激活行 226 与鼠标悬停行 235 同时离群，必须仍认定激活行，不报歧义。"""
+    region = _list_region([LIGHT_ACTIVE, LIGHT_HOVER] + [LIGHT_IDLE] * 9, monkeypatch)
+    assert cn._active_row(region).avatar[1] == 20
+
+
+def test_active_row_rejects_two_rows_inside_active_band(monkeypatch):
+    region = _list_region([LIGHT_ACTIVE, LIGHT_ACTIVE] + [LIGHT_IDLE] * 9, monkeypatch)
+    with pytest.raises(RuntimeError, match="QQ_CONTACT_NUMBER_ACTIVE_AMBIGUOUS"):
+        cn._active_row(region)
+
+
+def test_active_row_reports_not_found_without_any_candidate(monkeypatch):
+    region = _list_region([LIGHT_IDLE] * 11, monkeypatch)
+    with pytest.raises(RuntimeError, match="QQ_CONTACT_NUMBER_ACTIVE_NOT_FOUND"):
+        cn._active_row(region)
+
+
+def test_active_row_falls_back_to_relative_outlier_for_unknown_theme(monkeypatch):
+    """未收录的主题（两个灰阶都不在绝对色带内）仍按单一离群行认定激活行。"""
+    region = _list_region([(60, 60, 60)] + [(80, 80, 80)] * 5, monkeypatch)
+    assert cn._active_row(region).avatar[1] == 20
