@@ -33,6 +33,8 @@ WGC 帧时间与到达时间、错误码与 `hresult`。返回码 `1` 成功、`
 | 旧一次性 `WgcSnapshot` | 69.79 ms | 59.26 ms | 67.81 ms |
 | 持续挂载按需读取 | 6.53 ms | 15.43 ms | 22.17 ms |
 
+同一 `WgcSnapshot` 接口分别加载旧、新 DLL 各采样 20 次（2 秒间隔，`dll-snapshot-bench.json`）：旧 DLL 首次 66.00 ms、热调用中位数 61.97 ms、P95 66.76 ms；新 DLL 首次 6.92 ms、热调用中位数 9.33 ms、P95 11.71 ms。
+
 静止窗口也能拿到新帧：`static-feasibility-final.json` 连续 12 次读取全部 `fresh=true`，像素摘要完全相同——
 说明"像素相同"必须按新帧接受，不能靠像素变化判断画面更新。
 
