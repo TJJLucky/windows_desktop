@@ -19,7 +19,7 @@ import win32api
 # win32con：键盘常量（VK_CONTROL 等）
 import win32con
 
-# 输入框区域识别（含发送按钮坐标）
+# 输入框区域识别
 from .regions import get_inputbox_region_and_image, RegionResult
 # 窗口就绪保证
 from .window_ops import ensure_qq_window_with_retry
@@ -38,7 +38,7 @@ from .user_list import UserList
 class InputBox:
     """QQ 聊天输入框管理器（单例）。
 
-    持有输入框截图、屏幕坐标与发送按钮坐标，提供聚焦→粘贴→发送的完整流程。
+    持有输入框截图与屏幕坐标，提供聚焦→粘贴→发送的完整流程。
 
     用法:
         ib = InputBox()
@@ -63,7 +63,7 @@ class InputBox:
         self._initialized = True
         # 关联的 QQ 主窗口句柄
         self.hwnd: int = 0
-        # 输入框定位结果（含区域坐标与发送按钮坐标）
+        # 输入框定位结果（截图与区域坐标）
         self.input_region: RegionResult | None = None  # 直接存储整个定位结果（RegionResult）
 
     # ── 剪贴板原语（方案 2） ────────────────────────────────────
@@ -113,7 +113,7 @@ class InputBox:
     # ── 刷新 ────────────────────────────────────────────────────
     @timer
     def refresh(self):
-        """定位输入框与发送按钮并获取截图，随后点击输入框把焦点交给它。
+        """定位输入框并获取截图，随后点击输入框把焦点交给它。
 
         与 UserList.refresh 同属区域定位刷新入口：
         refresh() 一次完成"定位 + 聚焦"，之后即可 paste_text / send_message。
@@ -121,10 +121,10 @@ class InputBox:
         """
         # 确保 QQ 主窗口就绪（分级校验 + 重试）
         main_window = ensure_qq_window_with_retry()
-        # 记录句柄（点击输入框/发送按钮时置顶窗口用）
+        # 记录句柄（点击输入框时置顶窗口用）
         self.hwnd = main_window._hWnd
 
-        # 定位输入框（截图 + 屏幕坐标），send_button_region 字段保留但发送已改快捷键
+        # 定位输入框（截图 + 屏幕坐标）
         self.input_region = get_inputbox_region_and_image(main_window)
 
         return True

@@ -125,8 +125,7 @@ def record_region(name, result):
         return
     matched = {k for k, v in session["templates"].items() if v["status"] == "matched"}
     fallback = ((name == "userlist" and "search_bar_left" not in matched) or
-                (name in ("inputbox", "messagebox") and not matched.intersection({"inputbox_top_right1", "inputbox_top_right2"})) or
-                (name == "inputbox" and not matched.intersection({"input_buttom_active", "input_buttom_deactive"})))
+                (name in ("inputbox", "messagebox") and not matched.intersection({"inputbox_top_right1", "inputbox_top_right2"})))
     session["regions"][name] = dict(status="fallback" if fallback else "matched", screenRect=result.screen_region, imageRect=result.image_region)
 
 
@@ -181,6 +180,7 @@ def cached_recognition(store, selected):
                 reason = "desktop_changed"
         except Exception:
             reason = "window_unavailable"
+    result["templates"] = [item for item in result.get("templates", []) if item["key"] in TEMPLATES]
     result.update(valid=reason is None, staleReason=reason)
     return result
 

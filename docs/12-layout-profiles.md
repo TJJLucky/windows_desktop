@@ -8,7 +8,7 @@
 
 位置为物理像素，分别提供窗口内 `imageRect` 与虚拟桌面 `screenRect`；副屏可以是负坐标。`desktop` 返回整个虚拟桌面的边界和每个显示器的边界/DPI。前端用虚拟桌面原点和统一缩放绘图，不使用 CSS 屏幕尺寸推测桌面坐标。
 
-重启后的历史识别记录标记 `service_restarted`，超过 30 秒标记 `expired`；窗口/显示器改变标记 `desktop_changed`。这些状态只会标记定位失效，仍保留上一次窗口、模板和业务区域坐标供页面核对；新的识别成功后才替换它们。正常运行的区域缓存按版本和窗口几何隔离，切换时清除区域、联系人及输入/消息对象缓存。
+重启后的历史识别记录标记 `service_restarted`；距截图时间达到 30 秒标记 `expired`；窗口/显示器改变标记 `desktop_changed`。这些状态只会标记定位失效，仍保留上一次窗口、模板和业务区域坐标供页面核对；新的识别成功后才替换它们。正常运行的区域缓存按版本和窗口几何隔离，切换时清除区域、联系人及输入/消息对象缓存。
 
 ## HTTP
 
@@ -31,11 +31,13 @@
 
 新建响应为 `{profile,recognition,recognitionError}`，HTTP 201 表示数据保存完成，识别失败不会回滚模板。客户端已占用 QQ 会话确认队列时传 `recognizeAfterSave:false`，提示 `LAYOUT_DESKTOP_BUSY`，稍后由用户重新识别。
 
-识别响应包含 `profileId,snapshotId,capturedAt,valid,staleReason,window,desktop,templates,regions`。模板状态是 `matched/not_found/not_checked`；业务区域状态是 `matched/fallback/not_found`。非当前状态的复制按钮、发送按钮变体等不会被伪造为已命中；托盘旧模板仍保留但不参与当前 QQ 主窗口识别。
+识别响应包含 `profileId,snapshotId,capturedAt,valid,staleReason,window,desktop,templates,regions`。模板状态是 `matched/not_found/not_checked`；业务区域状态是 `matched/fallback/not_found`。发送使用 Enter，两种发送按钮模板不再参与定位或版本管理；旧截图记录中的按钮项在读取时过滤。非当前状态的复制按钮不会被伪造为已命中；托盘旧模板仍保留但不参与当前 QQ 主窗口识别。
 
 错误采用 `{"detail":"CODE"}`：默认保护、启用项保护、桌面占用/变化为 409；版本/模板不存在为 404；非法 PNG 或字段为 422；资源损坏为 503。
 
 每次手动识别和保存后的自动识别，先调用与 `/v1/capture:check` 相同的 `ensure_qq_window_with_retry()`：恢复/唤起 QQ，按现有规则整理为当前显示器工作区左半屏，并确认 WGC 可用，然后截图匹配。就绪检查失败则终止，不使用之前的窗口坐标。准备、截图、匹配处于同一个桌面操作锁内；不切换联系人或发送消息。
+
+2026-10-11 移除发送按钮定位验证：94 项测试通过，包括 30 秒过期边界、历史位置保留、真实截图输入区及 Enter 调用。新版 EXE 启动冒烟通过；正常应用单实例手动识别真实 QQ，窗口 `(0,0)-(1280,1390)`，三个业务区域均命中，输入区 `(471,1183)-(1275,1320)`。默认版本和两份已有自定义版本均返回 10 张模板，不含发送按钮；现场没有发送消息。截图与响应位于相邻 price-agent-next 的 `.local-artifacts/layout-enter-only.png` 和 `layout-enter-only.json`。
 
 ## 页面
 

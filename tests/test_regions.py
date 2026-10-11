@@ -62,3 +62,22 @@ def test_private_chat_real_machine_regions():
     assert input_box == {
         "x": 308, "y": 871, "top": 871, "bottom": 963, "left": 308, "right": 957,
     }
+
+
+def test_input_region_and_enter_send_do_not_require_button(monkeypatch):
+    from utils.qq import regions, input as qq_input
+    clear_region_cache()
+    original_load = regions.load_image
+    def load_without_button(filename):
+        assert not filename.startswith("input_buttom")
+        return original_load(filename)
+    monkeypatch.setattr(regions, "load_image", load_without_button)
+    image = _debug_image("655d3acd056c0ef6e31363698cda717e.png")
+    result = regions.get_inputbox_region_and_image(_window(image), image)
+    assert result.send_button_region is None
+    assert result.image_region["bottom"] == image.height - 70
+    calls = []
+    monkeypatch.setattr(qq_input, "send_hotkey", lambda keys: calls.append(keys))
+    monkeypatch.setattr(qq_input.time, "sleep", lambda seconds: None)
+    qq_input.InputBox.send_message(SimpleNamespace(input_region=result))
+    assert calls == [("enter",)]

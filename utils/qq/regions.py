@@ -3,9 +3,9 @@
 依赖 core + vision + qq/window_ops。
 
 思路：QQ 窗口布局相对固定，用模板图（templates/*.png）在整窗截图上定位关键锚点
-（搜索栏左右角、输入框角、发送按钮、消息框角），再由锚点矩形推导各业务区域：
+（搜索栏左右角、输入框角、消息框角），再由锚点矩形推导各业务区域：
 - 好友列表区：搜索栏下方到窗口底部；
-- 输入框区：输入框左上角到发送按钮上方；
+- 输入框区：输入框左上角到窗口底部安全留白上方；
 - 消息区：消息框左上角到输入框上方。
 
 所有区域都同时给出 截图内坐标（image_region）与 屏幕坐标（screen_region），
@@ -40,7 +40,7 @@ class RegionResult:
     - image_region：截图内相对坐标（裁剪/匹配用）；
     - image：按 image_region 裁出的区域图；
     - full_image：完整窗口截图（可选，调试/复用）；
-    - send_button_region：发送按钮的屏幕坐标（输入框场景附带）。
+    - send_button_region：兼容旧调用的字段，Enter 发送时为 None。
     """
 
     # 屏幕绝对坐标（点击用）
@@ -51,7 +51,7 @@ class RegionResult:
     image: Image.Image
     # 完整窗口截图（复用/调试）
     full_image: Image.Image | None = None
-    # 发送按钮屏幕坐标（输入框场景）
+    # 兼容字段，不再定位发送按钮
     send_button_region: dict | None = None
 
 
@@ -388,44 +388,19 @@ def get_userList_region_and_image(window, QQ_window_image=None):
     )
 
 
-@timer
-def get_input_buttom_region(window, QQ_window_image=None):
-    """定位右下角发送按钮（屏幕坐标）；找不到返回 None。"""
-    # 未传截图时现截
-    if QQ_window_image is None:
-        QQ_window_image, _ = get_qq_window_image(window)
-    # 先找"未激活"态发送按钮图标
-    input_buttom = load_image("input_buttom_deactive.png")
-    right_bottom_region = find_template(QQ_window_image, input_buttom)
-
-    if right_bottom_region is None:  # 那就看激活的图标
-        # 未激活态找不到 → 试"激活"态图标（输入框有内容时按钮态会变）
-        input_buttom = load_image("input_buttom_active.png")
-        right_bottom_region = find_template(QQ_window_image, input_buttom)
-    if right_bottom_region is None:
-        # 两种态都找不到 → 无法定位发送按钮，返回 None 由调用方决定
-        return None
-    # 转成屏幕坐标返回
-    return _to_screen(window, right_bottom_region)
-
-
 _INPUT_BOX_BOTTOM_SAFE_MARGIN = 70
 
 
 def _resolve_input_box_region(
     image: Image.Image, left_top_region: dict, right_top_region: dict | None,
-    right_bottom_region: dict | None, *, window_top: int = 0,
 ) -> dict:
-    """生成安全输入区域；新样式发送按钮失配时避开底部按钮行。"""
+    """生成安全输入区域；Enter 发送无需定位按钮，底部保留安全留白。"""
     top = max(
         int(left_top_region["bottom"]),
         int(right_top_region["bottom"]) if right_top_region is not None else int(left_top_region["bottom"]),
     )
     right = int(right_top_region["right"]) if right_top_region is not None else image.width
-    if right_bottom_region is not None:
-        bottom = int(right_bottom_region["top"]) - int(window_top) - 30
-    else:
-        bottom = image.height - _INPUT_BOX_BOTTOM_SAFE_MARGIN
+    bottom = image.height - _INPUT_BOX_BOTTOM_SAFE_MARGIN
     return {
         "x": int(left_top_region["x"]), "y": top, "top": top,
         "bottom": max(top + 1, bottom), "left": int(left_top_region["left"]), "right": right,
@@ -435,7 +410,7 @@ def _resolve_input_box_region(
 @_cached_region_result("inputbox")
 @timer
 def get_inputbox_region_and_image(window, QQ_window_image=None):
-    """定位输入框区域：输入框左上角 → 发送按钮上方。返回 RegionResult（含发送按钮坐标）。"""
+    """定位输入框区域：顶部锚点 → 窗口底部安全留白上方。"""
     # 未传截图时现截
     if QQ_window_image is None:
         QQ_window_image, _ = get_qq_window_image(window)
@@ -452,28 +427,21 @@ def get_inputbox_region_and_image(window, QQ_window_image=None):
         inputbox_top_right = load_image("inputbox_top_right2.png")
         right_top_region = find_template(QQ_window_image, inputbox_top_right, 0.9)
 
-    # 底部锚点：发送按钮位置（输入框底边就在按钮上方）
-    right_bottom_region = get_input_buttom_region(window, QQ_window_image)
-
-    # 左上锚点必须存在；右侧栏和发送按钮在新样式/私聊中允许缺失。
+    # 左上锚点必须存在；右侧栏在新样式/私聊中允许缺失。
     if left_top_region is None:
         raise RuntimeError(
             f"get_inputbox_region_and_image failed: left_top=False "
-            f"right_top={right_top_region is not None} right_bottom={right_bottom_region is not None}")
+            f"right_top={right_top_region is not None}")
     region = _resolve_input_box_region(
-        QQ_window_image, left_top_region, right_top_region, right_bottom_region, window_top=window.top
+        QQ_window_image, left_top_region, right_top_region
     )
     if right_top_region is None:
         print(f"[WARN] 输入区右上锚点未命中，使用窗口右边界 right={region['right']}")
-    if right_bottom_region is None:
-        print(f"[WARN] 发送按钮模板未命中，输入区避开底部 {_INPUT_BOX_BOTTOM_SAFE_MARGIN}px")
     return RegionResult(
         screen_region=_to_screen(window, region),
         image_region=region,
         image=crop_region(QQ_window_image, region),
         full_image=QQ_window_image,
-        # 附带发送按钮屏幕坐标（点击发送时直接用，不必再匹配一次）
-        send_button_region=right_bottom_region,
     )
 
 

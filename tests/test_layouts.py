@@ -149,6 +149,21 @@ def test_profile_is_fixed_for_operation_and_cache_isolated(runtime):
         assert get_region("test", window, image) is None
 
 
+def test_recognition_expiry_keeps_positions_and_ignores_retired_templates(runtime, monkeypatch):
+    rt, store, _, _ = runtime
+    previous = rt.recognize(DEFAULT_ID)
+    previous["templates"].append(dict(key="input_buttom_active", status="matched"))
+    store.save_recognition(DEFAULT_ID, previous)
+    monkeypatch.setattr(rt.time, "time", lambda: previous["capturedAt"] + 29.9)
+    assert rt.cached_recognition(store, DEFAULT_ID)["valid"]
+    monkeypatch.setattr(rt.time, "time", lambda: previous["capturedAt"] + 30)
+    expired = rt.cached_recognition(store, DEFAULT_ID)
+    assert expired["staleReason"] == "expired"
+    assert expired["regions"] == previous["regions"]
+    assert all(not item["key"].startswith("input_buttom") for item in expired["templates"])
+    assert all(not item["key"].startswith("input_buttom") for item in store.detail(DEFAULT_ID)["templates"])
+
+
 def test_desktop_management_does_not_interrupt_operation(runtime):
     rt, store, _, _ = runtime
     from service.layouts import LayoutDesktop

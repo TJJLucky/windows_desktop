@@ -19,7 +19,6 @@ TEMPLATES = {
     "search_bar_left": "搜索栏左侧", "search_bar_right": "搜索栏右侧",
     "inputbox_top_left": "输入区左上角", "inputbox_top_right1": "输入区右上角（样式一）",
     "inputbox_top_right2": "输入区右上角（样式二）", "messagebox_top": "消息区顶部",
-    "input_buttom_active": "发送按钮（可用）", "input_buttom_deactive": "发送按钮（不可用）",
     "copy_icon": "复制按钮", "switch_to_big": "切换经典模式",
     "switch_to_small": "切换效率模式", "QQ_NotifyIconOverflowWindow": "旧版托盘图标（未使用）",
 }
