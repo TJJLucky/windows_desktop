@@ -158,6 +158,8 @@ _input_event.RmouseDown.argtypes = ()
 _input_event.RmouseDown.restype = wintypes.BOOL
 _input_event.RmouseUp.argtypes = ()
 _input_event.RmouseUp.restype = wintypes.BOOL
+_input_event.scrollUp.argtypes = (ctypes.c_int,)
+_input_event.scrollUp.restype = wintypes.BOOL
 _input_event.dragFromTo.argtypes = (wintypes.UINT, wintypes.UINT, wintypes.UINT, wintypes.UINT, ctypes.c_float)
 _input_event.dragFromTo.restype = wintypes.BOOL
 
@@ -209,6 +211,18 @@ def move_to(x: int, y: int) -> None:
     """直接移动到目标坐标，不生成 WindMouse 中间轨迹。"""
     _require_screen_coordinate(x, y)
     _call("Mousegoto", x, y)
+
+
+def scroll_at(x: int, y: int, delta: int) -> None:
+    """在指定区域注入滚轮；正数向上、负数向下，结束后恢复光标。"""
+    old = _cursor_position()
+    try:
+        move_to(x, y)
+        time.sleep(0.1)
+        _call("scrollUp", delta)
+        time.sleep(0.1)
+    finally:
+        move_to(*old)
 
 
 def random_point(x: int, y: int, w: int, h: int) -> tuple[int, int]:

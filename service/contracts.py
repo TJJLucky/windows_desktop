@@ -38,6 +38,15 @@ class ServiceHealthResponse(StrictModel):
     )
 
 
+class ListContactsRequest(StrictModel):
+    """不指定目标时读当前屏幕；指定目标且不可见时滚动查找。"""
+
+    contact_name: str | None = Field(
+        alias="contactName", default=None, min_length=1, max_length=256,
+        title="待查找联系人", description="可选的已确认联系人名；当前屏幕找不到时才滚动截图。",
+    )
+
+
 class ListContactsResponse(StrictModel):
     """联系人列表响应。"""
 

@@ -29,9 +29,11 @@ class FakeAutomation:
         self.sent: list[tuple[str, str]] = []
         # 截图可用性开关（测试可翻转为 False 模拟窗口不可用）
         self.capture_ready: bool = True
+        self.contact_queries: list[str | None] = []
 
-    def list_contacts(self) -> dict[str, dict]:
+    def list_contacts(self, contact_name: str | None = None) -> dict[str, dict]:
         # 固定返回一个联系人
+        self.contact_queries.append(contact_name)
         return {"华强电子": {"name": "华强电子", "active": True, "new_msg": False}}
 
     def send_message(self, contact_name: str, text: str) -> dict:
@@ -115,6 +117,19 @@ async def test_api_projects_legacy_automation_as_v1_contract(service) -> None:
 
 
 @pytest.mark.asyncio
+async def test_contact_query_optional_target_keeps_existing_empty_request(service):
+    automation, app = service
+    async with client(app) as caller:
+        for body in ({}, {"contactName": "华强电子"}):
+            response = await caller.post("/v1/contacts:query", json=body)
+            assert response.status_code == 200
+        for body in ({"contactName": ""}, {"url": "https://example.invalid"}, {"script": "alert(1)"}):
+            response = await caller.post("/v1/contacts:query", json=body)
+            assert response.status_code == 422
+    assert automation.contact_queries == [None, "华强电子"]
+
+
+@pytest.mark.asyncio
 async def test_read_returns_clear_not_found_message(service) -> None:
     """联系人不在当前可见列表时，读取接口直接返回一次明确的 404。"""
     automation, app = service
@@ -128,7 +143,7 @@ async def test_read_returns_clear_not_found_message(service) -> None:
 
     assert response.status_code == 404
     assert response.json() == {
-        "detail": "QQ_CONTACT_NOT_FOUND: 当前可见 QQ 用户列表中未找到联系人「不存在」"
+        "detail": "QQ_CONTACT_NOT_FOUND: QQ 用户列表滚动查找后未找到联系人「不存在」"
     }
 
 

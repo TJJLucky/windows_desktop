@@ -102,8 +102,8 @@ def test_active_user_by_name_forces_user_list_refresh(monkeypatch):
     assert calls == ["force=True"]
 
 
-def test_active_user_by_name_stops_after_one_refresh_when_contact_is_missing(monkeypatch):
-    """联系人未出现在当前列表时，不重复完整 OCR 刷新。"""
+def test_active_user_by_name_scans_when_contact_is_missing(monkeypatch):
+    """联系人未出现在当前屏幕时，滚动查找仍不存在才失败。"""
     user_list = UserList()
     calls: list[str] = []
 
@@ -113,11 +113,15 @@ def test_active_user_by_name_stops_after_one_refresh_when_contact_is_missing(mon
         lambda force=False: calls.append(f"force={force}"),
     )
     monkeypatch.setattr(user_list, "find_user", lambda name: None)
+    def scan(name):
+        calls.append("scan")
+        raise ContactNotFoundError(name)
+    monkeypatch.setattr(user_list, "_scan_contacts", scan)
 
     with pytest.raises(ContactNotFoundError, match="未找到联系人「不存在」"):
         user_list.active_user_by_name("不存在")
 
-    assert calls == ["force=True"]
+    assert calls == ["force=True", "scan"]
 
 
 def test_concurrent_force_refreshes_share_single_refresh(monkeypatch):

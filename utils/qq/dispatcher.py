@@ -105,7 +105,7 @@ class Dispatcher:
                         contact_name, = args
                         result = self.read_message_list_impl(contact_name)
                     elif task_type == "get_contact_list":
-                        result = self.get_contact_list_impl()
+                        result = self.get_contact_list_impl(*args)
                     elif task_type == "check_capture_ready":
                         result = self.check_capture_ready_impl()
                     else:
@@ -138,12 +138,12 @@ class Dispatcher:
         except queue.Empty:
             return {}, TimeoutError("check_capture_ready task timeout")
 
-    def get_contact_list(self, timeout: float = 120.0) -> Tuple[dict[str, dict], Optional[Exception]]:
+    def get_contact_list(self, timeout: float = 120.0, contact_name: str | None = None) -> Tuple[dict[str, dict], Optional[Exception]]:
         """获取联系人列表，入队列串行执行，缓存过期会执行截图解析。"""
         # 结果队列（容量 1：只放一个 (result, exc)）
         res_q = queue.Queue(maxsize=1)
         # 入队
-        self.task_queue.put(("get_contact_list", (), {}, res_q))
+        self.task_queue.put(("get_contact_list", (contact_name,), {}, res_q))
         try:
             # 阻塞等待结果（最长 timeout 秒）
             return res_q.get(timeout=timeout)
@@ -187,9 +187,9 @@ class Dispatcher:
         win = ensure_qq_window_with_retry()
         return {"ready": True, "windowTitle": getattr(win, "title", None)}
 
-    def get_contact_list_impl(self) -> dict[str, dict]:
+    def get_contact_list_impl(self, contact_name: str | None = None) -> dict[str, dict]:
         """实际实现：读用户列表（内部 3s 缓存）。"""
-        return self.userList.get_user_list()
+        return self.userList.get_user_list(contact_name)
 
     def send_message_impl(self, contact_name: str, text: str) -> bool:
         """实际实现：输入文本（内部自动激活会话）→ 快捷键发送。"""

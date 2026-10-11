@@ -30,7 +30,7 @@ from .chat_history import ChatHistoryStore
 # CommandConflictError：相同 commandId 配不同消息体的冲突异常；CommandLedger：命令幂等账本
 from .command_ledger import CommandConflictError, CommandLedger
 # 全部 Pydantic 请求/响应契约模型（API 的输入输出 schema）
-from .contracts import API_VERSION, CaptureCheckResponse, ChatHistoryRequest, ChatHistoryResponse, CommandResponse, ListContactsResponse, ReadMessagesRequest, ReadMessagesResponse, SendMessageRequest, ServiceHealthResponse
+from .contracts import API_VERSION, CaptureCheckResponse, ChatHistoryRequest, ChatHistoryResponse, CommandResponse, ListContactsRequest, ListContactsResponse, ReadMessagesRequest, ReadMessagesResponse, SendMessageRequest, ServiceHealthResponse
 # QqAutomationPort：自动化端口抽象（测试时可注入替身）；LegacyQqAutomationFacade：真实实现（视觉 RPA）；QqAutomationError：QQ 操作失败统一异常
 from .facade import LegacyQqAutomationFacade, QqAutomationError, QqAutomationPort, QqContactNotFoundError
 
@@ -207,15 +207,16 @@ def create_app(
         "/v1/contacts:query",
         response_model=ListContactsResponse,
         summary="查询 QQ 联系人列表",
-        description="读取当前 QQ 用户列表。返回的 contacts key 可原样用于消息读取、发送和聊天记录查询。",
+        description="先读取当前屏幕的 QQ 用户列表；指定联系人或当前会话不可见时才滚动截图查找。返回的 contacts key 可原样用于消息读取、发送和聊天记录查询。",
         tags=["联系人"],
         response_description="联系人列表和数量",
     )
-    def list_contacts() -> ListContactsResponse:
+    def list_contacts(request: ListContactsRequest | None = None) -> ListContactsResponse:
         operation_started = time.perf_counter()
         try:
             # 同步端点：FastAPI 自动在（线程池）执行 QQ 视觉识别，事件循环不被阻塞
-            contacts = facade.list_contacts()
+            contacts = (facade.list_contacts(request.contact_name)
+                        if request and request.contact_name else facade.list_contacts())
             logger.info("contacts.query.success count=%d", len(contacts))
         except QqAutomationError as exc:
             record_attempt("CONTACT_QUERY", operation_started, status="FAILED", failure_code=str(exc))

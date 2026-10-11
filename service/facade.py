@@ -28,14 +28,17 @@ class QqAutomationError(RuntimeError):
 
 
 class QqContactNotFoundError(QqAutomationError):
-    """请求的联系人不在当前可见 QQ 用户列表中。"""
+    """滚动查找后仍没有请求的联系人。"""
 
     def __init__(self, contact_name: str) -> None:
         self.contact_name = contact_name
-        super().__init__(f"QQ_CONTACT_NOT_FOUND: 当前可见 QQ 用户列表中未找到联系人「{contact_name}」")
+        super().__init__(f"QQ_CONTACT_NOT_FOUND: QQ 用户列表滚动查找后未找到联系人「{contact_name}」")
 
 
 _ERROR_CODE_PREFIXES = (
+    "QQ_CONTACT_SCAN_LIMIT",
+    "QQ_CONTACT_SCAN_CHANGED",
+    "QQ_CONTACT_AMBIGUOUS",
     "QQ_USER_LIST_REGION_NOT_FOUND",
     "QQ_MESSAGE_REGION_NOT_FOUND",
     "QQ_INPUT_REGION_NOT_FOUND",
@@ -85,7 +88,7 @@ class QqAutomationPort(Protocol):
     三个操作全部是阻塞式（视觉识别 + 模拟点击），HTTP 层用 asyncio.to_thread 放进线程池。
     """
 
-    def list_contacts(self) -> dict[str, dict]:
+    def list_contacts(self, contact_name: str | None = None) -> dict[str, dict]:
         """读取当前可见联系人列表，返回 联系人名 → 信息 dict。"""
         ...
 
@@ -121,13 +124,14 @@ class LegacyQqAutomationFacade:
 
         return Dispatcher()
 
-    def list_contacts(self) -> dict[str, dict]:
+    def list_contacts(self, contact_name: str | None = None) -> dict[str, dict]:
         """读联系人列表：入队执行（最长等 60s），失败抛 QqAutomationError。"""
         # Dispatcher 返回 (结果, 异常) 二元组：error 非空表示失败
-        contacts, error = self._operator().get_contact_list(timeout=60.0)
+        contacts, error = (self._operator().get_contact_list(timeout=60.0, contact_name=contact_name)
+                           if contact_name else self._operator().get_contact_list(timeout=60.0))
         if error is not None:
             # 失败统一投影为业务错误（HTTP 层转 503），错误码带出失败阶段
-            raise QqAutomationError(_operation_error_code(error, "QQ_CONTACTS_UNAVAILABLE")) from error
+            _raise_operation_error(error, contact_name or "", "QQ_CONTACTS_UNAVAILABLE")
         return contacts
 
     def send_message(self, contact_name: str, text: str) -> dict:

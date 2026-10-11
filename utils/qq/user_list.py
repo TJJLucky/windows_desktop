@@ -40,17 +40,10 @@ from ..vision.ocr import OCREngine
 from ..vision.compose import compose_bubbles_to_one, split_ocr_by_bubble
 # 随机点击（激活会话时点用户行）
 from ..core.mouse import random_click
+from .contact_scan import ContactNotFoundError, ContactScanner
 
 
 USER_LIST_CACHE_TTL_SECONDS = 3.0
-
-
-class ContactNotFoundError(ValueError):
-    """当前可见 QQ 用户列表中没有目标联系人的可公开业务错误。"""
-
-    def __init__(self, contact_name: str) -> None:
-        self.contact_name = contact_name
-        super().__init__(f"当前可见 QQ 用户列表中未找到联系人「{contact_name}」")
 
 
 # ── 用户列表管理器 ──────────────────────────────────────────────────
@@ -339,10 +332,7 @@ class UserList:
         return True
 
     def find_user(self, contact_name: str) -> "User | None":
-        """按名字查找用户：直接使用包含匹配（OCR 名字可能截断/多符号），精确匹配天然被包含覆盖。
-
-        返回第一个匹配的用户，找不到返回 None。
-        """
+        """精确名字优先；OCR 截断只能匹配唯一候选，歧义时停止。"""
         # 空名字直接失败
         if not contact_name:
             return None
@@ -355,14 +345,17 @@ class UserList:
         if not norm_contact:
             return None
         # 遍历用户，双向包含匹配（任一方向命中即可）
+        matches = []
         for name, user in self.users.items():
             norm_name = self._normalise_name(name)
             # OCR 空行不能作为通配符："" in 任意字符串都会成立。
             if not norm_name:
                 continue
             if norm_contact in norm_name or norm_name in norm_contact:
-                return user
-        return None
+                matches.append(user)
+        if len(matches) > 1:
+            raise RuntimeError("QQ_CONTACT_AMBIGUOUS")
+        return matches[0] if matches else None
 
     @staticmethod
     def _clean_ocr_name(name: str) -> str:
@@ -431,8 +424,7 @@ class UserList:
         self._ensure_user_list_fresh(force=True)
         user = self.find_user(contact_name)
         if user is None:
-            # 联系人不在当前可见列表时直接返回；不再做第二次完整 OCR 刷新。
-            raise ContactNotFoundError(contact_name)
+            user = self._scan_contacts(contact_name)
         clicked = False
         if not user.active:
             clicked = self.active_user(user)
@@ -448,7 +440,8 @@ class UserList:
         self._ensure_user_list_fresh(force=True)
         user = self.find_user(contact_name)
         if user is None:
-            raise ContactNotFoundError(contact_name)
+            # 已完成一次定位却无法确认会话，目标又消失时暂停，避免再次长时间扫描。
+            raise RuntimeError("QQ_CONTACT_SCAN_CHANGED")
         clicked = self.active_user(user)
         full_name = self._wait_panel_switched(contact_name)
         if full_name is not None:
@@ -534,6 +527,9 @@ class UserList:
         self.cache_data = self.to_dict().copy()
         self.cache_ts = time.time()
 
+    def _scan_contacts(self, contact_name: str):
+        return ContactScanner(self).scan(contact_name)
+
     def to_dict(self) -> dict[str, dict]:
         """返回用户列表的完整可序列化信息 {name: User.to_dict()}。"""
         return {
@@ -609,7 +605,10 @@ class UserList:
         if error is not None:
             raise error
 
-    def get_user_list(self):
-        """普通查询优先复用短 TTL 缓存；send/read 使用 force=True。"""
-        self._ensure_user_list_fresh(force=False)
+    def get_user_list(self, contact_name: str | None = None):
+        """先读当前屏幕；指定目标或当前会话不在列表中时才滚动查找。"""
+        self._ensure_user_list_fresh(force=contact_name is not None)
+        target = contact_name or self.last_active_name
+        if target and self.find_user(target) is None:
+            self._scan_contacts(target)
         return self.cache_data.copy()
