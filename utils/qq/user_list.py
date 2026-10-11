@@ -9,8 +9,6 @@
 6. 组装 User 并整体替换 self.users（3s 缓存对外）。
 """
 
-# Counter：统计高频像素颜色（背景色判定）
-from collections import Counter
 # time：3s 缓存时间戳
 import threading
 import time
@@ -111,8 +109,13 @@ class UserList:
             return False
 
         # 最高频 RGB 即主体背景色
-        most_common_rgb = Counter(tuple(px) for px in bg_pixels).most_common(1)[0][0]
-        r, g, b = most_common_rgb
+        rgb = bg_pixels.astype(np.uint32)
+        colors = (rgb[:, 0] << 16) | (rgb[:, 1] << 8) | rgb[:, 2]
+        values, first_indices, counts = np.unique(colors, return_index=True, return_counts=True)
+        candidates = np.flatnonzero(counts == counts.max())
+        # 并列时保留原 Counter 的语义：首次出现的颜色优先。
+        winner = int(values[candidates[np.argmin(first_indices[candidates])]])
+        r, g, b = winner >> 16, (winner >> 8) & 255, winner & 255
 
         # 区间容错判定：222~230 灰 = 激活态背景（QQ 深一点）；241~249 = 未激活（白一点）
         if 222 <= r <= 230 and 222 <= g <= 230 and 222 <= b <= 230:
