@@ -21,6 +21,30 @@ from service.app import create_app
 from service.facade import QqAutomationError, QqContactNotFoundError
 
 
+@pytest.mark.asyncio
+async def test_lifespan_closes_automation_after_requests(tmp_path):
+    from types import SimpleNamespace
+    calls = []
+    app = create_app(automation=SimpleNamespace(close=lambda: calls.append("closed")),
+                     ledger_path=tmp_path / "ledger.sqlite3")
+    async with app.router.lifespan_context(app):
+        assert calls == []
+    assert calls == ["closed"]
+
+
+def test_facade_shutdown_stops_consumer_before_capture_release(monkeypatch):
+    from types import SimpleNamespace
+    from service.facade import LegacyQqAutomationFacade
+    from utils.core.screenshot import WGCCapture
+    calls = []
+    facade = LegacyQqAutomationFacade()
+    facade._dispatcher = SimpleNamespace(stop=lambda: calls.append("consumer_stopped"))
+    monkeypatch.setattr(WGCCapture, "release", lambda: calls.append("capture_released"))
+    facade.close()
+    facade.close()
+    assert calls == ["consumer_stopped", "capture_released"]
+
+
 class FakeAutomation:
     """自动化替身：不操作 QQ，记录发送调用并返回固定数据。"""
 

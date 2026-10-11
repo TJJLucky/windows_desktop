@@ -126,7 +126,17 @@ class LegacyQqAutomationFacade:
             from utils.qq.template_runtime import configure
             configure(self.layout_store)
 
-        return Dispatcher()
+        self._dispatcher = Dispatcher()
+        return self._dispatcher
+
+    def close(self):
+        """Stop the business consumer before closing native capture; keep GUI imports lazy."""
+        dispatcher = getattr(self, "_dispatcher", None)
+        if dispatcher is not None:
+            dispatcher.stop()
+            from utils.core.screenshot import WGCCapture
+            WGCCapture.release()
+            self._dispatcher = None
 
     def identify_current_contact(self) -> dict:
         result, error = self._operator().identify_current_contact(timeout=30.0)

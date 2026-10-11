@@ -128,9 +128,9 @@ class Dispatcher:
         """停止工作线程，程序退出调用。"""
         # 置位停止信号（worker 会在下一次循环检查退出）
         self.stop_event.set()
-        # 等待线程退出（最多 3 秒）
+        # 当前业务完成并退出后才能释放它正在使用的采集资源。
         if self.worker_thread:
-            self.worker_thread.join(timeout=3)
+            self.worker_thread.join()
 
         # ========= 对外API：全部入队列，阻塞等待 =========
 

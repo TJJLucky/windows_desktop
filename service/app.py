@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 import logging
+import asyncio
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 import time
 import uuid
@@ -70,12 +72,22 @@ def create_app(
     facade = automation or LegacyQqAutomationFacade()
     # 初始化命令账本（打开 SQLite、建表），用于发送命令的幂等控制
     ledger = CommandLedger(ledger_path)
+    @asynccontextmanager
+    async def lifespan(app):
+        try:
+            yield
+        finally:
+            close = getattr(facade, "close", None)
+            if close is not None:
+                await asyncio.to_thread(close)
+                logger.info("automation.closed capture_released=true")
     # 创建 FastAPI 应用：开启默认 /docs(Swagger) 与 /openapi.json，版本号取契约常量
     app = FastAPI(
         title="QQ 桌面自动化服务",
         version=API_VERSION,
         description=API_DESCRIPTION,
         openapi_tags=OPENAPI_TAGS,
+        lifespan=lifespan,
     )
     from utils.vision.layout_store import LayoutStore, LayoutError
     from .layouts import layout_router
