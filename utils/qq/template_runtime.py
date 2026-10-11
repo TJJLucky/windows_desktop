@@ -151,11 +151,12 @@ def operation_scope(selected=None):
             completed = True
         finally:
             result = snapshot(session)
-            if result and not completed:
-                result.update(valid=False, staleReason="recognition_failed")
-            if result and _store:
+            if _store and (result or not completed):
                 try:
-                    _store.save_recognition(session["profileId"], result)
+                    if completed:
+                        _store.save_recognition(session["profileId"], result)
+                    else:
+                        _store.mark_recognition_stale(session["profileId"], "recognition_failed")
                 except Exception:
                     logging.getLogger(__name__).exception("layout.recognition.persist_failed")
             _session.reset(token)
@@ -190,10 +191,6 @@ def recognize(selected):
                           get_inputbox_region_and_image, get_copy_action_region)
     with operation_scope(selected) as session:
         session["force"] = True
-        # 本次准备/截图失败时，轮询不能把上次成功坐标重新当作有效结果。
-        if _store:
-            _store.save_recognition(selected, dict(profileId=selected, valid=False,
-                                                  staleReason="recognition_failed", templates=[], regions={}))
         # 与 /v1/capture:check 共用同一就绪入口。先恢复/整理 QQ 到约定位置，
         # 再取图；整个过程持有桌面操作锁，不与联系人/发送队列交叉。
         try:

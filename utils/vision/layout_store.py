@@ -173,6 +173,15 @@ class LayoutStore:
             self._profile(db, profile_id)
             db.execute("INSERT OR REPLACE INTO recognition VALUES (?,?)", (profile_id, json.dumps({**payload, "bootId": self.boot_id})))
 
+    def mark_recognition_stale(self, profile_id, reason):
+        """保留上一次坐标，只更新其状态；失败不能抹掉可供核对的历史定位。"""
+        with self.lock, closing(self.connect()) as db, db:
+            self._profile(db, profile_id)
+            row = db.execute("SELECT payload FROM recognition WHERE profile_id=?", (profile_id,)).fetchone()
+            payload = json.loads(row[0]) if row else dict(profileId=profile_id, templates=[], regions={})
+            payload.update(valid=False, staleReason=reason, bootId=self.boot_id)
+            db.execute("INSERT OR REPLACE INTO recognition VALUES (?,?)", (profile_id, json.dumps(payload)))
+
     def recognition(self, profile_id):
         with closing(self.connect()) as db:
             self._profile(db, profile_id)

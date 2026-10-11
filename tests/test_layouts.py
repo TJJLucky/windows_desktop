@@ -192,7 +192,7 @@ def test_recognition_prepares_window_before_capture_and_uses_new_geometry(runtim
 
 def test_failed_capture_check_never_uses_old_window(runtime, monkeypatch):
     rt, store, _, _ = runtime
-    rt.recognize(DEFAULT_ID)
+    previous = rt.recognize(DEFAULT_ID)
     assert rt.cached_recognition(store, DEFAULT_ID)["valid"]
     from utils.qq import window_ops
     def fail():
@@ -204,4 +204,10 @@ def test_failed_capture_check_never_uses_old_window(runtime, monkeypatch):
     cached = rt.cached_recognition(store, DEFAULT_ID)
     assert not cached["valid"]
     assert cached["staleReason"] == "recognition_failed"
-    assert cached["templates"] == []
+    assert any(item["status"] == "matched" for item in cached["templates"])
+    assert cached["window"] == previous["window"]
+    assert cached["templates"] == previous["templates"]
+    assert cached["capturedAt"] == previous["capturedAt"]
+    restarted = rt.cached_recognition(LayoutStore(store.path), DEFAULT_ID)
+    assert not restarted["valid"]
+    assert restarted["templates"] == previous["templates"]
