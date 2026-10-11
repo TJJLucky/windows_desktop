@@ -249,7 +249,7 @@ def click_at(x: int, y: int, delay: float = 0.05, restore: bool = True, smooth: 
     """
     # 先记住用户原来的鼠标位置；False 时不读取也不恢复，适用于后续动作需要保留焦点的场景。
     old = _cursor_position() if restore else None
-    (smooth_move_to if smooth else move_to)(x, y)
+    _move_before_click(x, y, smooth)
     _call("LmouseDown")
     time.sleep(delay)
     _call("LmouseUp")
@@ -266,20 +266,35 @@ def random_right_click(x: int, y: int, w: int, h: int, delay: float = 0.05, rest
     right_click_at(*random_point(x, y, w, h), delay=delay, restore=restore)
 
 
-def right_click_at(x: int, y: int, delay: float = 0.05, restore: bool = True) -> None:
-    """平滑移动到目标后执行一次右键点击；可选地恢复原鼠标位置。
+def right_click_at(x: int, y: int, delay: float = 0.05, restore: bool = True, smooth: bool = True) -> None:
+    """移动到目标后执行一次右键点击；smooth=False 直接定位，可选恢复原鼠标位置。
 
     C++ 调用顺序为：
 
     ``SmoothMousegoto -> Mousegoto -> RmouseDown -> 等待 delay -> RmouseUp``。
     """
     old = _cursor_position() if restore else None
-    smooth_move_to(x, y)
+    _move_before_click(x, y, smooth)
     _call("RmouseDown")
     time.sleep(delay)
     _call("RmouseUp")
     if old is not None:
-        smooth_move_to(*old)
+        (smooth_move_to if smooth else move_to)(*old)
+
+
+def _move_before_click(x: int, y: int, smooth: bool) -> None:
+    if smooth:
+        smooth_move_to(x, y)
+        return
+    move_to(x, y)
+    # SendInput 入队不代表系统光标已更新；确认到位后才按下，避免点旧位置。
+    deadline = time.monotonic() + 0.2
+    while time.monotonic() < deadline:
+        actual_x, actual_y = _cursor_position()
+        if abs(actual_x - x) <= 1 and abs(actual_y - y) <= 1:
+            return
+        time.sleep(0.005)
+    raise RuntimeError("MOUSE_POSITION_UNCONFIRMED")
 
 
 def drag(from_x: int, from_y: int, to_x: int, to_y: int, steps: int = 10, duration: float = 0.3) -> None:

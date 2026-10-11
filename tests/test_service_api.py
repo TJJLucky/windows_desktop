@@ -30,6 +30,11 @@ class FakeAutomation:
         # 截图可用性开关（测试可翻转为 False 模拟窗口不可用）
         self.capture_ready: bool = True
         self.contact_queries: list[str | None] = []
+        self.identified = 0
+
+    def identify_current_contact(self):
+        self.identified += 1
+        return {"qqNumber": "800888598"}
 
     def list_contacts(self, contact_name: str | None = None) -> dict[str, dict]:
         # 固定返回一个联系人
@@ -80,6 +85,44 @@ def client(app):
         transport=httpx.ASGITransport(app=app),
         base_url="http://qq-service.test",
     )
+
+
+@pytest.mark.asyncio
+async def test_identify_current_contract_rejects_external_parameters(service):
+    automation, app = service
+    async with client(app) as caller:
+        assert (await caller.post("/v1/contacts/current:identify")).json() == {"qqNumber": "800888598"}
+        assert (await caller.post("/v1/contacts/current:identify", json={})).status_code == 200
+        for payload in ({"x": 1}, {"url": "x"}, {"script": "x"}, {"path": "x"}, {"contactName": "x"}):
+            assert (await caller.post("/v1/contacts/current:identify", json=payload)).status_code == 422
+    assert automation.identified == 2
+    assert automation.contact_queries == [] and automation.sent == []
+
+
+@pytest.mark.asyncio
+async def test_identify_current_exposes_failure_without_retry(service):
+    automation, app = service
+    def fail():
+        automation.identified += 1
+        raise QqAutomationError("QQ_CONTACT_NUMBER_CLIPBOARD_UNCHANGED")
+    automation.identify_current_contact = fail
+    async with client(app) as caller:
+        response = await caller.post("/v1/contacts/current:identify", json={})
+    assert response.status_code == 503
+    assert response.json() == {"detail": "QQ_CONTACT_NUMBER_CLIPBOARD_UNCHANGED"}
+    assert automation.identified == 1
+
+
+@pytest.mark.asyncio
+async def test_identify_current_returns_explicit_skip(service):
+    automation, app = service
+    automation.identify_current_contact = lambda: {
+        "qqNumber": None, "skipped": True, "reason": "QQ_CONTACT_NUMBER_COPY_UNAVAILABLE"}
+    async with client(app) as caller:
+        response = await caller.post("/v1/contacts/current:identify", json={})
+    assert response.status_code == 200
+    assert response.json() == {"qqNumber": None, "skipped": True, "reason": "QQ_CONTACT_NUMBER_COPY_UNAVAILABLE"}
+    assert automation.sent == []
 
 
 @pytest.mark.asyncio

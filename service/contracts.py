@@ -217,3 +217,13 @@ class ChatHistoryResponse(StrictModel):
         title="自动更新结果",
         description="ok：查询前 QQ 复制更新成功；failed：复制或解析失败，返回旧数据。",
     )
+
+
+class IdentifyCurrentContactRequest(StrictModel):
+    """仅识别当前激活行，无外部操作参数。"""
+
+
+class IdentifyCurrentContactResponse(StrictModel):
+    skipped: bool = False
+    reason: str | None = None
+    qq_number: str | None = Field(alias="qqNumber", pattern=r"^[1-9][0-9]{4,19}$", title="QQ 号")

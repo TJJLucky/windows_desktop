@@ -48,3 +48,29 @@ def test_scroll_at_restores_cursor_on_input_failure(monkeypatch):
     with pytest.raises(RuntimeError, match="wheel failed"):
         mouse.scroll_at(300, 400, -120)
     assert moves == [(300, 400), (10, 20)]
+
+
+def test_direct_click_waits_for_actual_cursor_without_smooth_motion(monkeypatch):
+    calls = []
+    positions = iter([(10, 20), (300, 400)])
+    monkeypatch.setattr(mouse, "_cursor_position", lambda: next(positions))
+    monkeypatch.setattr(mouse, "move_to", lambda *args: calls.append(("move", args)))
+    monkeypatch.setattr(mouse, "smooth_move_to", lambda *args: (_ for _ in ()).throw(AssertionError("smooth")))
+    monkeypatch.setattr(mouse, "_call", lambda *args: calls.append(args))
+    monkeypatch.setattr(mouse.time, "sleep", lambda seconds: calls.append(("wait", seconds)))
+    mouse.right_click_at(300, 400, restore=False, smooth=False)
+    assert calls == [("move", (300, 400)), ("wait", .005), ("RmouseDown",), ("wait", .05), ("RmouseUp",)]
+
+
+def test_direct_click_does_not_press_when_cursor_never_arrives(monkeypatch):
+    import pytest
+    calls = []
+    times = iter([0, .01, .3])
+    monkeypatch.setattr(mouse.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(mouse.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(mouse, "_cursor_position", lambda: (10, 20))
+    monkeypatch.setattr(mouse, "move_to", lambda *args: None)
+    monkeypatch.setattr(mouse, "_call", lambda *args: calls.append(args))
+    with pytest.raises(RuntimeError, match="MOUSE_POSITION_UNCONFIRMED"):
+        mouse.click_at(300, 400, restore=False, smooth=False)
+    assert calls == []

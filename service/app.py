@@ -30,7 +30,7 @@ from .chat_history import ChatHistoryStore
 # CommandConflictError：相同 commandId 配不同消息体的冲突异常；CommandLedger：命令幂等账本
 from .command_ledger import CommandConflictError, CommandLedger
 # 全部 Pydantic 请求/响应契约模型（API 的输入输出 schema）
-from .contracts import API_VERSION, CaptureCheckResponse, ChatHistoryRequest, ChatHistoryResponse, CommandResponse, ListContactsRequest, ListContactsResponse, ReadMessagesRequest, ReadMessagesResponse, SendMessageRequest, ServiceHealthResponse
+from .contracts import IdentifyCurrentContactRequest, IdentifyCurrentContactResponse, API_VERSION, CaptureCheckResponse, ChatHistoryRequest, ChatHistoryResponse, CommandResponse, ListContactsRequest, ListContactsResponse, ReadMessagesRequest, ReadMessagesResponse, SendMessageRequest, ServiceHealthResponse
 # QqAutomationPort：自动化端口抽象（测试时可注入替身）；LegacyQqAutomationFacade：真实实现（视觉 RPA）；QqAutomationError：QQ 操作失败统一异常
 from .facade import LegacyQqAutomationFacade, QqAutomationError, QqAutomationPort, QqContactNotFoundError
 
@@ -201,6 +201,20 @@ def create_app(
             windowTitle=result.get("windowTitle"),
             error=result.get("error"),
         )
+
+    @app.post("/v1/contacts/current:identify", response_model=IdentifyCurrentContactResponse, response_model_exclude_unset=True,
+              summary="复制当前激活联系人的 QQ 号", tags=["联系人"])
+    def identify_current_contact(request: IdentifyCurrentContactRequest | None = None):
+        started = time.perf_counter()
+        try:
+            payload = IdentifyCurrentContactResponse.model_validate(facade.identify_current_contact())
+        except QqAutomationError as exc:
+            record_attempt("CONTACT_IDENTIFY", started, status="FAILED", failure_code=str(exc))
+            logger.warning("contacts.identify.failed code=%s", exc)
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        record_attempt("CONTACT_IDENTIFY", started, status="SKIPPED" if payload.skipped else "SUCCESS",
+                       details={"reason": payload.reason} if payload.skipped else None)
+        return payload
 
     # —— 读取联系人列表接口 ——
     @app.post(

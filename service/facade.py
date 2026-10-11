@@ -88,6 +88,10 @@ class QqAutomationPort(Protocol):
     三个操作全部是阻塞式（视觉识别 + 模拟点击），HTTP 层用 asyncio.to_thread 放进线程池。
     """
 
+    def identify_current_contact(self) -> dict:
+        """复制当前激活行的 QQ 号。"""
+        ...
+
     def list_contacts(self, contact_name: str | None = None) -> dict[str, dict]:
         """读取当前可见联系人列表，返回 联系人名 → 信息 dict。"""
         ...
@@ -123,6 +127,12 @@ class LegacyQqAutomationFacade:
             configure(self.layout_store)
 
         return Dispatcher()
+
+    def identify_current_contact(self) -> dict:
+        result, error = self._operator().identify_current_contact(timeout=30.0)
+        if error is not None:
+            raise QqAutomationError(_operation_error_code(error, "QQ_CONTACT_NUMBER_IDENTIFY_FAILED")) from error
+        return result
 
     def list_contacts(self, contact_name: str | None = None) -> dict[str, dict]:
         """读联系人列表：入队执行（最长等 60s），失败抛 QqAutomationError。"""

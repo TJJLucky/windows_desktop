@@ -19,6 +19,7 @@ TEMPLATES = {
     "search_bar_left": "搜索栏左侧", "search_bar_right": "搜索栏右侧",
     "inputbox_top_left": "输入区左上角", "inputbox_top_right1": "输入区右上角（样式一）",
     "inputbox_top_right2": "输入区右上角（样式二）", "messagebox_top": "消息区顶部",
+    "copy_qq_number": "复制 QQ 号",
     "copy_icon": "复制按钮", "switch_to_big": "切换经典模式",
     "switch_to_small": "切换效率模式", "QQ_NotifyIconOverflowWindow": "旧版托盘图标（未使用）",
 }
@@ -56,7 +57,7 @@ class LayoutStore:
         with closing(self.connect()) as db, db:
             db.execute("PRAGMA journal_mode=WAL")
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1):
+            if version not in (0, 1, 2):
                 raise LayoutError("LAYOUT_DATABASE_VERSION_UNSUPPORTED", 503)
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS profiles (
@@ -71,11 +72,19 @@ class LayoutStore:
                 CREATE TABLE IF NOT EXISTS recognition (
                     profile_id TEXT PRIMARY KEY REFERENCES profiles(id) ON DELETE CASCADE,
                     payload TEXT NOT NULL);
-                PRAGMA user_version=1;
+
             """)
             db.execute("INSERT OR IGNORE INTO profiles VALUES (?,?,?,?,?,?,?,?)", (
                 DEFAULT_ID, "极简白 · 9.9.35-52804（64 位）", "9.9.35-52804", "极简白", "x64", "内置默认版本", None, time.time()))
             db.execute("INSERT OR IGNORE INTO settings VALUES ('active',?)", (DEFAULT_ID,))
+            # 一次性补全新模板字段；已有用户图片不覆盖，执行时不回退默认模板。
+            if version < 2:
+                data = (self.template_dir / "copy_qq_number.png").read_bytes()
+                width, height = validate_png(data)
+                db.execute("""INSERT OR IGNORE INTO images
+                    SELECT id, ?, ?, ?, ?, ? FROM profiles WHERE id != ?""",
+                    ("copy_qq_number", data, width, height, hashlib.sha256(data).hexdigest(), DEFAULT_ID))
+                db.execute("PRAGMA user_version=2")
 
     def connect(self):
         db = sqlite3.connect(self.path, timeout=5)

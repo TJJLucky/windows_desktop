@@ -113,6 +113,7 @@ endpoint 文件记录动态 loopback URL 与本次启动的进程 pid（无 toke
 | --- | --- | --- |
 | `GET` | `/v1/health` | 服务和 API 版本状态 |
 | `POST` | `/v1/contacts:query` | 读取当前 QQ 联系人 |
+| `POST` | `/v1/contacts/current:identify` | 复制当前激活行的 QQ 号（不发送） |
 | `POST` | `/v1/commands/read` | 读取指定联系人的可见消息 |
 | `POST` | `/v1/commands/send` | 向指定联系人发送消息 |
 | `GET` | `/v1/commands/{commandId}` | 查询发送命令状态 |
@@ -215,3 +216,20 @@ messages, exc = op.read_message_list("华强电子", timeout=120.0)
 - **OCR 模型**：exe 打包后模型放 `<install>/ocr-models`（3 个 onnx），或设置 `RAPIDOCR_MODEL_PATH` 环境变量；包内 models 打包时会被清空。
 - **单例直调**：`UserList`/`InputBox`/`MessageList` 可在本地调试时直接使用，但正式流程必须经 `Dispatcher`，避免并发操作 QQ。
 - **补充资源**：`libs/wgc_capture.dll` 原生截获库；`debug/` 调试图片可随时清理。
+
+
+### 当前联系人号码识别（第一阶段）
+
+`POST /v1/contacts/current:identify` 接收空请求或 `{}`，拒绝坐标、URL、脚本和文件路径。
+成功返回 `{"qqNumber":"800888598"}`。菜单没有“复制 QQ 号”时返回 HTTP 200：
+`{"qqNumber":null,"skipped":true,"reason":"QQ_CONTACT_NUMBER_COPY_UNAVAILABLE"}`，关闭菜单并跳过此行。
+本接口只处理当前激活行，不主动选择下一行，不查找、滚动或发送。
+
+号码复制在单消费者队列内执行：QQ 窗口就绪 → 头像定位当前行 → 原生鼠标直接右键行左侧 →
+仅在用户列表截图中唯一匹配 `copy_qq_number` 版本模板 → 点击 → 校验新剪贴板序列、QQ 进程归属和纯号码。
+窗口/标题/行身份变化、菜单改变或歧义、剪贴板超时与非号码均返回明确 `QQ_CONTACT_NUMBER_*` 错误（HTTP 503），不自动重试，不回退昵称 OCR。
+菜单最多等待 2 秒，出现即继续；没有固定的拟人鼠标移动延迟。
+
+模板使用既有版本管理接口上传、持久化和读取图片；内置默认版本仍不可覆盖或删除。
+布局库升级时仅一次性补全旧自定义版本缺少的新模板字段，不覆盖用户已有图片；运行时缺图报错，不回退默认版本。
+操作日志记录耗时和失败/跳过原因，不记录号码；本轮保留原有发送链路不变。

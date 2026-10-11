@@ -14,7 +14,8 @@ from pathlib import Path
 from PIL import Image
 
 from ..vision.layout_store import DEFAULT_ID, TEMPLATES, LayoutError, LayoutStore
-from ..vision.matcher import find_template as _find_template
+from ..vision.matcher import (find_template as _find_template,
+                              find_unique_template as _find_unique_template, TemplateAmbiguousError)
 
 operation_lock = threading.RLock()
 _store: LayoutStore | None = None
@@ -102,6 +103,20 @@ def restore_observations(items):
 
 def find_template(big, small, threshold=0.8, use_mask=False, multiscale=True, *, origin=(0, 0)):
     result = _find_template(big, small, threshold, use_mask, multiscale)
+    _record_template(small, result, origin)
+    return result
+
+
+def find_unique_template(big, small, threshold=0.9, *, origin=(0, 0)):
+    try:
+        result = _find_unique_template(big, small, threshold)
+    except TemplateAmbiguousError as exc:
+        raise RuntimeError("QQ_CONTACT_NUMBER_MENU_AMBIGUOUS") from exc
+    _record_template(small, result, origin)
+    return result
+
+
+def _record_template(small, result, origin):
     session = _session.get()
     key = small.info.get("templateKey")
     if session is not None and key and session.get("window"):
@@ -112,7 +127,6 @@ def find_template(big, small, threshold=0.8, use_mask=False, multiscale=True, *,
                 rect = {k: int(result[k]) + origin[0 if k in ("left", "right") else 1] for k in ("left", "top", "right", "bottom")}
                 item.update(imageRect=rect, screenRect=to_screen(rect, session["window"]))
             session["templates"][key] = item
-    return result
 
 
 def to_screen(rect, window):

@@ -167,6 +167,7 @@ def test_find_non_resize_x_returns_none_without_normal_cursor(monkeypatch):
 def test_direct_click_skips_windmouse(monkeypatch):
     calls: list[tuple] = []
     monkeypatch.setattr(mouse, "_call", lambda name, *args: calls.append((name, *args)))
+    monkeypatch.setattr(mouse, "_cursor_position", lambda: (100, 200))
 
     mouse.click_at(100, 200, delay=0, restore=False, smooth=False)
 

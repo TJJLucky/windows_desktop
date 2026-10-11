@@ -267,3 +267,14 @@ def crop_region(image: Image.Image, region: dict) -> Image.Image:
     """根据 find_template 返回的 {left,top,right,bottom} 字典裁剪"""
     return image.crop((region["left"], region["top"],
                        region["right"], region["bottom"]))
+
+
+class TemplateAmbiguousError(RuntimeError):
+    """多个独立匹配，调用方必须停止点击。"""
+
+
+def find_unique_template(big, small, threshold=0.9, *, multiscale=True):
+    candidates = _DEFAULT_TEMPLATE_MATCHER.find_candidates(big, small, threshold, multiscale=multiscale)
+    if len(candidates) > 1:
+        raise TemplateAmbiguousError("TEMPLATE_AMBIGUOUS")
+    return candidates[0] if candidates else None

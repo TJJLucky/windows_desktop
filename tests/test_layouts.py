@@ -26,6 +26,27 @@ def png(image):
     return out.getvalue()
 
 
+def test_copy_number_template_persists_and_upgrade_does_not_overwrite(tmp_path):
+    path = tmp_path / "layouts.db"
+    store = LayoutStore(path)
+    data = png(Image.new("RGB", (40, 20), "blue"))
+    custom = new_profile(store, replacements={"copy_qq_number": base64.b64encode(data).decode()})
+    with store.connect() as db:
+        db.execute("PRAGMA user_version=1")
+    reopened = LayoutStore(path)
+    assert reopened.image(custom["id"], "copy_qq_number") == data
+    with reopened.connect() as db:
+        db.execute("DELETE FROM images WHERE profile_id=? AND key='copy_qq_number'", (custom["id"],))
+        db.execute("PRAGMA user_version=1")
+    upgraded = LayoutStore(path)
+    assert upgraded.image(custom["id"], "copy_qq_number") == upgraded.image(DEFAULT_ID, "copy_qq_number")
+    # 完成升级后缺图是错误，不靠重启自动修补。
+    with upgraded.connect() as db:
+        db.execute("DELETE FROM images WHERE profile_id=? AND key='copy_qq_number'", (custom["id"],))
+    with pytest.raises(LayoutError, match="LAYOUT_TEMPLATE_MISSING"):
+        LayoutStore(path).image(custom["id"], "copy_qq_number")
+
+
 def test_persistence_complete_copy_default_and_active_protection(tmp_path):
     store = LayoutStore(tmp_path / "layouts.db")
     original = store.image(DEFAULT_ID, "search_bar_left")

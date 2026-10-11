@@ -106,6 +106,11 @@ class Dispatcher:
                         result = self.read_message_list_impl(contact_name)
                     elif task_type == "get_contact_list":
                         result = self.get_contact_list_impl(*args)
+                    elif task_type == "identify_current_contact":
+                        from .contact_number import ContactNumberReader
+                        number = ContactNumberReader().identify_current()
+                        result = ({"qqNumber": number} if number is not None else
+                                  {"qqNumber": None, "skipped": True, "reason": "QQ_CONTACT_NUMBER_COPY_UNAVAILABLE"})
                     elif task_type == "check_capture_ready":
                         result = self.check_capture_ready_impl()
                     else:
@@ -128,6 +133,14 @@ class Dispatcher:
             self.worker_thread.join(timeout=3)
 
         # ========= 对外API：全部入队列，阻塞等待 =========
+
+    def identify_current_contact(self, timeout: float = 30.0) -> Tuple[dict, Optional[Exception]]:
+        res_q = queue.Queue(maxsize=1)
+        self.task_queue.put(("identify_current_contact", (), {}, res_q))
+        try:
+            return res_q.get(timeout=timeout)
+        except queue.Empty:
+            return {}, TimeoutError("QQ_CONTACT_NUMBER_QUEUE_TIMEOUT")
 
     def check_capture_ready(self, timeout: float = 30.0) -> Tuple[dict, Optional[Exception]]:
         """把截图能力检查也放入串行队列，避免与联系人/消息操作并发控制 QQ。"""
