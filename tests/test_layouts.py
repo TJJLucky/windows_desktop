@@ -170,6 +170,35 @@ def test_profile_is_fixed_for_operation_and_cache_isolated(runtime):
         assert get_region("test", window, image) is None
 
 
+def test_fixed_regions_reuse_matches_after_30_seconds_but_manual_recognition_is_fresh(runtime, monkeypatch):
+    rt, _, window, image = runtime
+    from utils.qq import region_cache, regions
+    now = region_cache.time.monotonic()
+    monkeypatch.setattr(region_cache.time, "monotonic", lambda: now)
+    first = rt.recognize(DEFAULT_ID)
+    calls = []
+    original = rt._find_template
+    def match(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(rt, "_find_template", match)
+    monkeypatch.setattr(region_cache.time, "monotonic", lambda: now + 3600)
+    updated = image.copy()
+    updated.paste("black", (80, image.height - 30, 150, image.height - 10))
+    with rt.operation_scope(DEFAULT_ID):
+        for name, fn in (("userlist", regions.get_userList_region_and_image),
+                         ("inputbox", regions.get_inputbox_region_and_image),
+                         ("messagebox", regions.get_message_box_region_and_image)):
+            result = fn(window, updated)
+            assert result.image_region == first["regions"][name]["imageRect"]
+            assert result.full_image is updated
+        assert not calls
+    assert result.image.tobytes() == updated.crop(tuple(result.image_region[k] for k in
+                                                       ("left", "top", "right", "bottom"))).tobytes()
+    rt.recognize(DEFAULT_ID)
+    assert calls  # 手动检测仍按当前图像重新匹配，不用长缓存掩盖结果。
+
+
 def test_recognition_expiry_keeps_positions_and_ignores_retired_templates(runtime, monkeypatch):
     rt, store, _, _ = runtime
     previous = rt.recognize(DEFAULT_ID)

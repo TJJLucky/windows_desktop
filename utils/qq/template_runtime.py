@@ -32,6 +32,11 @@ def profile_id():
     return session["profileId"] if session else (_store.active_id() if _store else DEFAULT_ID)
 
 
+def profile_cache_key():
+    # 模板图片不可原地修改，新图片保存为新版本；同时隔离不同存储实例。
+    return (_store.boot_id if _store else None, profile_id())
+
+
 def load_image(filename):
     key = filename.removesuffix(".png")
     if key not in TEMPLATES:

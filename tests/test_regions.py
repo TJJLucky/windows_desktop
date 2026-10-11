@@ -4,12 +4,21 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from PIL import Image
+import pytest
 
 from utils.qq.region_cache import clear_region_cache
+from utils.qq import template_runtime
 from utils.qq.regions import (
     get_inputbox_region_and_image, get_message_box_region_and_image,
     get_userList_region_and_image,
 )
+
+
+@pytest.fixture(autouse=True)
+def fake_window_signature(monkeypatch):
+    monkeypatch.setattr(template_runtime, "window_signature", lambda window: dict(
+        hwnd=window._hWnd, pid=88, dpi=96, left=window.left, top=window.top,
+        right=window.right, bottom=window.bottom))
 
 
 def _debug_image(name: str) -> Image.Image:

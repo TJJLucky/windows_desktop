@@ -28,7 +28,7 @@ from .template_runtime import (find_template, load_image, record_frame, record_r
 from ..core.timing import timer
 # get_qq_window_image / get_qq_windows：窗口截图与窗口列表
 from .window_ops import get_qq_window_image, get_qq_windows
-# 区域定位结果短期缓存
+# 区域定位结果缓存（按窗口状态和模板版本失效）
 from .region_cache import get_region, save_region
 
 
