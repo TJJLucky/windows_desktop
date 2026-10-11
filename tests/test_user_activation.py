@@ -29,7 +29,7 @@ class _DummyCaptureCtx:
 def test_user_list_cache_ttl_is_three_seconds():
     assert USER_LIST_CACHE_TTL_SECONDS == 3.0
 
-def test_active_user_converts_full_image_circle_to_screen_coordinates(monkeypatch):
+def test_active_user_clicks_current_row_avatar_without_redetecting(monkeypatch):
     user_list = UserList()
     user_list.hwnd = 123
     user_list.userList_region = RegionResult(
@@ -43,19 +43,30 @@ def test_active_user_converts_full_image_circle_to_screen_coordinates(monkeypatc
         avatar=(20, 30, 15),
         rect=(0, 15, 390, 45),
     )
-    clicks: list[tuple[int, int, int, int]] = []
+    clicks: list[tuple[int, int]] = []
 
     monkeypatch.setattr(
         UserList,
         "detect_avatar_circles",
-        staticmethod(lambda image: [(350, 80, 15), (430, 80, 15)]),
+        staticmethod(lambda image: pytest.fail("must use the identified row avatar")),
     )
     monkeypatch.setattr(user_list_module, "WindowCaptureCtx", _DummyCaptureCtx)
-    monkeypatch.setattr(user_list_module, "random_click", lambda x, y, w, h: clicks.append((x, y, w, h)))
+    monkeypatch.setattr(user_list_module, "click_at", lambda x, y: clicks.append((x, y)))
 
     assert user_list.active_user(user) is True
-    # 窗口原点为 (100, 100)；选中 x=350 的列表圆，并排除 x=430 的右面板圆。
-    assert clicks == [(470, 177, 28, 6)]
+    # 列表屏幕原点 (110, 150) + 行头像圆心 (20, 30)。
+    assert clicks == [(130, 180)]
+
+
+def test_active_user_rejects_avatar_outside_identified_row(monkeypatch):
+    user_list = UserList()
+    user_list.hwnd = 123
+    user_list.userList_region = RegionResult(
+        screen_region={"left": 110, "top": 150}, image_region={"left": 10, "top": 50},
+        image=Image.new("RGB", (390, 500)), full_image=Image.new("RGB", (500, 700)))
+    monkeypatch.setattr(user_list_module, "click_at", lambda *args: pytest.fail("invalid avatar clicked"))
+    with pytest.raises(RuntimeError, match="QQ_CONTACT_AVATAR_OUT_OF_BOUNDS"):
+        user_list.active_user(User(name="TJJ", avatar=(20, 80, 15), rect=(0, 15, 390, 45)))
 
 
 def test_promote_user_name_replaces_truncated_key(monkeypatch):

@@ -63,11 +63,11 @@ def copy_flow(monkeypatch):
     return state, lambda: cn.ContactNumberReader().copy_row(SimpleNamespace(_hWnd=1), region, row)
 
 
-def test_copy_uses_direct_left_side_click_and_current_menu_position(copy_flow):
+def test_copy_right_clicks_avatar_center_and_left_clicks_current_menu(copy_flow):
     state, copy = copy_flow
     assert copy() == "800888598"
     assert [c[0] for c in state.clicks] == ["right", "mark", "left"]
-    assert state.clicks[0][1:3] == (30, 75)
+    assert state.clicks[0][1:3] == (50, 95)
     assert state.clicks[2][1:3] == (65, 140)
     assert all(c[-1]["smooth"] is False for c in (state.clicks[0], state.clicks[2]))
 

@@ -240,12 +240,13 @@ def random_click(x: int, y: int, w: int, h: int, delay: float = 0.05, restore: b
     click_at(*random_point(x, y, w, h), delay=delay, restore=restore)
 
 
-def click_at(x: int, y: int, delay: float = 0.05, restore: bool = True, smooth: bool = True) -> None:
-    """平滑移动到目标后点击；按原有约定可选地恢复鼠标位置。
+def click_at(x: int, y: int, delay: float = 0.05, restore: bool = True, smooth: bool = False) -> None:
+    """默认直接移动、确认到位后点击；可选恢复鼠标位置或使用平滑轨迹。
 
     对应的 C++ 调用顺序为：
 
-    ``SmoothMousegoto -> Mousegoto -> LmouseDown -> 等待 delay -> LmouseUp``。
+    ``Mousegoto -> 确认光标到位 -> LmouseDown -> 等待 delay -> LmouseUp``。
+    显式传入 ``smooth=True`` 时才生成 WindMouse 轨迹。
     """
     # 先记住用户原来的鼠标位置；False 时不读取也不恢复，适用于后续动作需要保留焦点的场景。
     old = _cursor_position() if restore else None
@@ -266,12 +267,12 @@ def random_right_click(x: int, y: int, w: int, h: int, delay: float = 0.05, rest
     right_click_at(*random_point(x, y, w, h), delay=delay, restore=restore)
 
 
-def right_click_at(x: int, y: int, delay: float = 0.05, restore: bool = True, smooth: bool = True) -> None:
-    """移动到目标后执行一次右键点击；smooth=False 直接定位，可选恢复原鼠标位置。
+def right_click_at(x: int, y: int, delay: float = 0.05, restore: bool = True, smooth: bool = False) -> None:
+    """默认直接定位、确认到位后右键点击，可选平滑轨迹和恢复原鼠标位置。
 
     C++ 调用顺序为：
 
-    ``SmoothMousegoto -> Mousegoto -> RmouseDown -> 等待 delay -> RmouseUp``。
+    ``Mousegoto -> 确认光标到位 -> RmouseDown -> 等待 delay -> RmouseUp``。
     """
     old = _cursor_position() if restore else None
     _move_before_click(x, y, smooth)

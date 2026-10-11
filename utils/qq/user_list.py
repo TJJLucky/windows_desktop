@@ -36,8 +36,8 @@ from ..core.timing import timed_stage, timer
 from ..vision.ocr import OCREngine
 # 拼图 OCR：多行文字区拼接一次识别 + 按 y 边界切分文本（性能优化）
 from ..vision.compose import compose_bubbles_to_one, split_ocr_by_bubble
-# 随机点击（激活会话时点用户行）
-from ..core.mouse import random_click
+# 直接点击当前识别行的头像圆心。
+from ..core.mouse import click_at
 from .contact_scan import ContactNotFoundError, ContactScanner
 
 
@@ -305,33 +305,16 @@ class UserList:
         region = self.userList_region
         if region.full_image is None:
             raise RuntimeError("缺少整窗截图（full_image）")
-        image_region = region.image_region
         screen_region = region.screen_region
-        # 截图坐标 -> 屏幕坐标：加上截图时窗口在屏幕上的原点。
-        origin_x = int(screen_region["left"] - image_region["left"])
-        origin_y = int(screen_region["top"] - image_region["top"])
-        circles = UserList.detect_avatar_circles(region.full_image)
-        list_circles = [
-            circle
-            for circle in circles
-            if image_region["left"] <= circle[0] < image_region["right"]
-            and circle[1] >= image_region["top"]
-        ]
-        if not list_circles:
-            raise RuntimeError("整窗截图中未检测到列表头像圆")
-        # 用户行坐标相对列表区域图；转换成整窗截图坐标后匹配同一行的头像圆。
-        target_y = image_region["top"] + user.avatar[1]
-        circle = min(list_circles, key=lambda item: abs(item[1] - target_y))
-        tolerance = max(10, user.avatar[2])
-        if abs(circle[1] - target_y) > tolerance:
-            raise RuntimeError(f"未找到用户行对应的整窗头像圆: {user.name}")
-        cx, cy, radius = circle
-        click_left = origin_x + cx + radius + 5
-        click_y = origin_y + cy
-        click_width = max(20, min(120, origin_x + image_region["right"] - click_left - 2))
+        # 头像坐标相对当前列表截图，直接转换；不再在整窗另选一个圆。
+        cx, cy, radius = user.avatar
+        left, top, right, bottom = user.rect
+        if (radius <= 0 or not (0 <= left <= cx < right <= region.image.width) or
+                not (0 <= top < cy < bottom <= region.image.height)):
+            raise RuntimeError("QQ_CONTACT_AVATAR_OUT_OF_BOUNDS")
         # 保留置顶：无激活置顶只改 Z 序，不移动窗口、不抢焦点。
         with WindowCaptureCtx(self.hwnd):
-            random_click(click_left, click_y - 3, click_width, 6)
+            click_at(int(screen_region["left"] + cx), int(screen_region["top"] + cy))
         return True
 
     def find_user(self, contact_name: str) -> "User | None":

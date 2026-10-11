@@ -145,7 +145,7 @@ class InputBox:
         region = self.input_region.screen_region
         # 置顶 + 整理窗口形态（不抢焦点），保证输入框完整在屏内
         with WindowCaptureCtx(self.hwnd, layout=True):
-            # 区域内随机取点点击（模拟人工点击）
+            # 区域内随机取点，直接移动并确认到位后点击。
             random_click(region["x"], region["y"], region["w"], region["h"])
 
     def clear_text(self):

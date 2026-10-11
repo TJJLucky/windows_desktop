@@ -134,9 +134,10 @@ class ContactNumberReader:
                 except (LayoutError, OSError) as exc:
                     raise RuntimeError("QQ_CONTACT_NUMBER_TEMPLATE_UNAVAILABLE") from exc
                 checked_frame()
-                click_x = region.screen_region["left"] + max(5, x - radius - 5)
-                click_y = region.screen_region["top"] + row.rect[1] + 5
-                if click_x >= region.screen_region["right"] or not (row.rect[1] < row.rect[3]):
+                click_x = region.screen_region["left"] + x
+                click_y = region.screen_region["top"] + y
+                if (radius <= 0 or not (0 <= x < region.image.width) or
+                        not (0 <= row.rect[1] < y < row.rect[3] <= region.image.height)):
                     raise RuntimeError("QQ_CONTACT_NUMBER_ROW_CHANGED")
                 menu_open = True
                 right_click_at(click_x, click_y, restore=False, smooth=False)
