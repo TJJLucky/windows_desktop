@@ -17,6 +17,7 @@ from PIL import ImageChops, ImageStat
 from typing import Any
 
 from .copied_messages import parse_copied_messages
+from .hotkeys import send_hotkey
 from .regions import (
     get_copy_action_region,
     get_copy_action_region_by_text,
@@ -58,9 +59,10 @@ _SELECTION_GUTTER_WIDTH = 56
 _SELECTION_BLANK_SCAN_STEP = 2
 _SELECTION_BLANK_RUN = 4
 
-# 拖拽后等待多选工具栏出现的超时与轮询间隔。
+# 拖拽后等待多选工具栏出现的超时与轮询间隔；退出多选态后的稳定等待。
 _SELECTION_COPY_WAIT_SECONDS = 2.0
 _SELECTION_COPY_POLL_INTERVAL = 0.15
+_SELECTION_CLEAR_WAIT_SECONDS = 0.35
 
 
 def _read_unicode_clipboard(sentinel: str, retries: int = 10, delay: float = 0.1) -> str:
@@ -287,6 +289,17 @@ def _drag_until_copy_action(main_window: Any, start: tuple[int, int], end: tuple
     return after, window, copy_action
 
 
+def _clear_message_selection(main_window: Any) -> None:
+    """退出 QQ 的多选态。
+
+    框选成功后 QQ 会一直停留在多选态，底部工具栏顶掉输入框锚点；残留状态下再读取
+    会定位不到消息区（真机诊断出现过 left_bottom=False right_bottom=False），也会
+    把陈旧选区当成当前会话内容，因此每次读取结束都必须退出多选态。
+    """
+    send_hotkey(("esc",))
+    time.sleep(_SELECTION_CLEAR_WAIT_SECONDS)
+
+
 class MessageList:
     """QQ 消息读取单例：会话激活、框选复制和剪贴板解析的唯一入口。"""
 
@@ -309,7 +322,13 @@ class MessageList:
 
         此处截图只用于模板定位消息区域，不进行气泡检测、图像拼接或 OCR。
         """
-        result = get_message_box_region_and_image(main_window)
+        try:
+            result = get_message_box_region_and_image(main_window)
+        except Exception:
+            # 多选态的底部工具栏会顶掉输入框锚点，导致消息区定位失败（真机诊断出现
+            # 过 left_bottom=False right_bottom=False）：退出多选态后重试一次。
+            _clear_message_selection(main_window)
+            result = get_message_box_region_and_image(main_window)
         self.message_screen_region = result.screen_region
         self.hwnd = main_window._hWnd
         return result.screen_region
@@ -330,6 +349,14 @@ class MessageList:
                     raise RuntimeError("QQ_COPY_CAPTURE_FAILED")
                 copy_action = get_copy_action_region(window, before, threshold=0.88)
                 copy_action_source = "template"
+                if copy_action is not None:
+                    # 上一次读取或被人工框选留下的多选态：先退出，保证本次重新框选整段
+                    # 可见消息，而不是把一段陈旧选区当成当前会话的消息返回。
+                    _clear_message_selection(main_window)
+                    before, window = get_qq_window_image(main_window)
+                    if before is None:
+                        raise RuntimeError("QQ_COPY_CAPTURE_FAILED")
+                    copy_action = None
                 if copy_action is None:
                     region = self._refresh_message_region(main_window)
                     selection_end = (
@@ -372,6 +399,7 @@ class MessageList:
                         # 反而把“已进框选、只是没找到按钮”误报成“未进入框选态”。
                         if copy_action is not None or _selection_ui_changed(before, after):
                             break
+                        _clear_message_selection(main_window)
                     if copy_action is None:
                         # 部分临时会话/特殊聊天使用纯文字工具栏，没有 copy_icon.png。
                         # 只在模板等待失败后做一次 OCR，避免普通路径承担额外耗时。
@@ -396,6 +424,9 @@ class MessageList:
                     copy_action["top"] + copy_action["h"] // 2,
                     restore=False, smooth=False,
                 )
+                # 复制完成后立刻退出多选态：残留的工具栏会顶掉输入框锚点，使下一次读取
+                # 定位不到消息区。
+                _clear_message_selection(main_window)
             copied = _read_unicode_clipboard(sentinel)
             if not copied.strip():
                 raise RuntimeError("QQ_COPY_TEXT_EMPTY")
