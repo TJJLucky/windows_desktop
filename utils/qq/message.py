@@ -7,13 +7,15 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
-from PIL import ImageChops, ImageStat
+from PIL import Image, ImageChops, ImageStat
 from typing import Any
 
 from .copied_messages import parse_copied_messages
@@ -34,35 +36,80 @@ from ..core.window import WindowCaptureCtx
 # 偶发只触发普通点击，因此保留一条很短的线性轨迹。
 _MESSAGE_SELECTION_DRAG_DURATION = 0.2
 
-# 空会话没有消息气泡，聊天画布保持 QQ 的浅灰背景。只检查消息区左侧固定宽度，
-# 避免将右侧联系人资料栏或群成员栏误纳入判断。
+# 空会话没有消息气泡，聊天画布保持 QQ 的浅灰背景（仅作为取不到真实底色时的兜底）。
+# 只检查消息区左侧固定宽度，避免将右侧联系人资料栏或群成员栏误纳入判断。
 _EMPTY_CHAT_BACKGROUND = (245, 245, 245)
 _EMPTY_CHAT_SAMPLE_WIDTH = 384
 _EMPTY_CHAT_BACKGROUND_RATIO = 0.995
 
-# 拖拽矩形相对消息区域向内收缩的像素数（四边基础值）。区域左边界压在消息区与
+# 框选几何的基准像素值是在 120 DPI（125% 缩放）机器上真机标定的；其它电脑按窗口
+# 所在显示器的实际 DPI 与基准的比值等比缩放。QQ 的分隔条/系统边框命中区、粘性
+# 日期栏和气泡左边距都随 DPI 缩放，写死物理像素会在别的缩放比例上把按下点或终点
+# 放进这些命中区，从而进不了框选态。
+_SELECTION_DPI_BASELINE = 120
+
+# 拖拽矩形相对消息区域向内收缩的像素数（四边基准值）。区域左边界压在消息区与
 # 联系人列表之间的分隔条命中区上、下边界压着输入框上边线，私聊没有右侧栏时右边
 # 界等于窗口右边界（落在系统尺寸调整边框里）：起点或终点落在这些边界上时 QQ 不会
-# 进入消息框选态。真机实测（会话 110001335 / 2885099490 / 2885512390，各重复 2 次）
-# 左边界需让开 3px 才能按下，右、下边界让开 0~8px 都能成功，统一取 8px 留余量。
-_SELECTION_INSET = 8
+# 进入消息框选态。基准机上实测左边界需让开 3px 才能按下，右、下边界让开 0~8px
+# 都能成功，统一取 8px 留余量。
+_SELECTION_INSET_BASE = 8
 
-# 消息区最顶部是 QQ 粘性日期栏的命中区：真机实测该命中区约 20~21px 高，按下点落在
-# 其中时不会进入框选态（尚未滚动、顶部没有日期栏的会话则几乎立刻可以按下）。这里
-# 固定让开 22px；仍未进入框选态时按同一步长继续下移重试，最多再试 2 次。
-_SELECTION_TOP_DEAD_ZONE = 22
+# 消息区最顶部是 QQ 粘性日期栏的命中区：基准机上实测该命中区约 20~21px 高，按下点
+# 落在其中时不会进入框选态（尚未滚动、顶部没有日期栏的会话则几乎立刻可以按下）。
+# 这里固定让开一个日期栏高度；仍未进入框选态时按同一步长继续下移重试，最多再试 2 次。
+_SELECTION_TOP_DEAD_ZONE_BASE = 22
 _SELECTION_TOP_RETRY_LIMIT = 2
 
-# 起点优先落在气泡左侧的空白边距里：自上而下按 2px 步进逐行寻找一段连续画布底色，
+# 起点优先落在气泡左侧的空白边距里：自上而下按固定步进逐行寻找一段连续画布底色，
 # 横向只在边距宽度内搜索，避免按下点压到头像或气泡而只被当成普通点击。
-_SELECTION_GUTTER_WIDTH = 56
-_SELECTION_BLANK_SCAN_STEP = 2
-_SELECTION_BLANK_RUN = 4
+_SELECTION_GUTTER_WIDTH_BASE = 56
+_SELECTION_BLANK_SCAN_STEP_BASE = 2
+_SELECTION_BLANK_RUN_BASE = 4
 
 # 拖拽后等待多选工具栏出现的超时与轮询间隔；退出多选态后的稳定等待。
 _SELECTION_COPY_WAIT_SECONDS = 2.0
 _SELECTION_COPY_POLL_INTERVAL = 0.15
 _SELECTION_CLEAR_WAIT_SECONDS = 0.35
+
+
+@dataclass(frozen=True)
+class _SelectionGeometry:
+    """一次读取使用的框选几何（已按窗口 DPI 缩放为物理像素）。"""
+
+    inset: int
+    top_dead_zone: int
+    gutter_width: int
+    scan_step: int
+    blank_run: int
+
+
+def _window_dpi_scale(window: Any) -> float:
+    """窗口所在显示器的 DPI 缩放比（相对框选几何基准 120 DPI）。
+
+    ``GetDpiForWindow`` 对 per-monitor DPI 感知进程返回窗口所在显示器的实际 DPI；
+    取不到时退回 1.0（等于基准机），保证旧环境行为不变。
+    """
+    hwnd = getattr(window, "_hWnd", None)
+    try:
+        dpi = int(ctypes.windll.user32.GetDpiForWindow(int(hwnd)))
+    except Exception:
+        dpi = 0
+    if dpi <= 0:
+        return 1.0
+    return min(3.0, max(0.5, dpi / _SELECTION_DPI_BASELINE))
+
+
+def _selection_geometry(window: Any) -> _SelectionGeometry:
+    """按窗口 DPI 缩放框选几何基准值；低缩放下仍保底，避免收缩到 0。"""
+    scale = _window_dpi_scale(window)
+    return _SelectionGeometry(
+        inset=max(4, round(_SELECTION_INSET_BASE * scale)),
+        top_dead_zone=max(8, round(_SELECTION_TOP_DEAD_ZONE_BASE * scale)),
+        gutter_width=max(24, round(_SELECTION_GUTTER_WIDTH_BASE * scale)),
+        scan_step=max(1, round(_SELECTION_BLANK_SCAN_STEP_BASE * scale)),
+        blank_run=max(2, round(_SELECTION_BLANK_RUN_BASE * scale)),
+    )
 
 
 def _read_unicode_clipboard(sentinel: str, retries: int = 10, delay: float = 0.1) -> str:
@@ -155,34 +202,76 @@ def _selection_ui_changed(before, after) -> bool:
     return max(ImageStat.Stat(difference).mean) >= 1.0
 
 
-def _is_empty_message_region(window: Any, image, region: dict[str, int]) -> bool:
-    """判断消息区是否为无消息的纯 ``#f5f5f5`` 画布。
-
-    真实 QQ 空会话的聊天画布为纯 ``#f5f5f5``；右侧资料栏不属于消息正文区，
-    因此只采样消息区左侧固定宽度，并要求几乎全部像素都是该背景色。
-    """
+def _sample_crop(image, window: Any, region: dict[str, int], width: int):
+    """裁出消息区左侧宽度为 ``width`` 的采样条（截图内坐标），越界返回 None。"""
     if image is None:
-        return False
+        return None
     left = max(0, int(region["left"]) - int(window.left))
     top = max(0, int(region["top"]) - int(window.top))
-    right = min(
-        image.width,
-        int(region["right"]) - int(window.left),
-        left + _EMPTY_CHAT_SAMPLE_WIDTH,
-    )
+    right = min(image.width, int(region["right"]) - int(window.left), left + width)
     bottom = min(image.height, int(region["bottom"]) - int(window.top))
     if right <= left or bottom <= top:
-        return False
-
+        return None
     crop = image.crop((left, top, right, bottom))
     if crop.mode != "RGB":
         crop = crop.convert("RGB")
+    return crop
+
+
+def _dominant_color(crop) -> tuple[tuple[int, int, int], float]:
+    """返回裁剪图的主色与其占比。
+
+    缩略到最多 64×64 再统计（NEAREST 不改变原色），避免对整块区域逐像素计数。
+    """
+    width = max(1, min(64, crop.width))
+    height = max(1, min(64, crop.height))
+    thumb = crop.resize((width, height), Image.NEAREST)
+    counts: dict[tuple[int, int, int], int] = {}
+    for pixel in thumb.getdata():
+        key = tuple(pixel[:3])
+        counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        return _EMPTY_CHAT_BACKGROUND, 0.0
+    color = max(counts, key=counts.get)
+    return color, counts[color] / float(width * height)
+
+
+def _canvas_background(
+    image, window: Any, region: dict[str, int], geometry: _SelectionGeometry
+) -> tuple[int, int, int]:
+    """消息区画布底色：取气泡/头像之外的左侧边距主色。
+
+    浅色主题下是 ``#f5f5f5``，深色或自定义主题下是别的底色。不写死颜色，才能在
+    别的电脑/主题上继续区分“空白画布”和气泡；取不到时退回浅灰默认值。
+    """
+    crop = _sample_crop(image, window, region, geometry.inset + geometry.blank_run + 4)
+    if crop is None:
+        return _EMPTY_CHAT_BACKGROUND
+    color, ratio = _dominant_color(crop)
+    # 边距里偶尔有头像/气泡时占比会下降，此时不可信，退回默认底色。
+    return color if ratio >= 0.5 else _EMPTY_CHAT_BACKGROUND
+
+
+def _is_empty_message_region(
+    window: Any, image, region: dict[str, int], background: tuple[int, int, int]
+) -> bool:
+    """判断消息区是否为无消息的纯色画布。
+
+    真实 QQ 空会话的聊天画布为单一底色；右侧资料栏不属于消息正文区，因此只采样
+    消息区左侧固定宽度，并要求几乎全部像素都是该底色。底色按当前主题自适应
+    （见 ``_canvas_background``），不再写死浅灰。
+    """
+    crop = _sample_crop(image, window, region, _EMPTY_CHAT_SAMPLE_WIDTH)
+    if crop is None:
+        return False
     total = crop.width * crop.height
-    background = sum(1 for pixel in crop.getdata() if pixel == _EMPTY_CHAT_BACKGROUND)
-    return background / total >= _EMPTY_CHAT_BACKGROUND_RATIO
+    matches = sum(1 for pixel in crop.getdata() if tuple(pixel[:3]) == background)
+    return matches / total >= _EMPTY_CHAT_BACKGROUND_RATIO
 
 
-def _is_blank_canvas_run(image, x: int, y: int, run: int = _SELECTION_BLANK_RUN) -> bool:
+def _is_blank_canvas_run(
+    image, x: int, y: int, background: tuple[int, int, int], run: int
+) -> bool:
     """判断截图上从 (x, y) 开始的一段像素是否都是空白画布底色。"""
     if image is None:
         return False
@@ -190,14 +279,13 @@ def _is_blank_canvas_run(image, x: int, y: int, run: int = _SELECTION_BLANK_RUN)
         sample_x = x + offset
         if sample_x < 0 or sample_x >= image.width or y < 0 or y >= image.height:
             return False
-        pixel = image.getpixel((sample_x, y))
-        if tuple(pixel[:3]) != _EMPTY_CHAT_BACKGROUND:
+        if tuple(image.getpixel((sample_x, y))[:3]) != background:
             return False
     return True
 
 
 def _blank_canvas_run_x(
-    image, y: int, left: int, right: int, run: int = _SELECTION_BLANK_RUN
+    image, y: int, left: int, right: int, background: tuple[int, int, int], run: int
 ) -> int | None:
     """在截图第 y 行的 [left, right] 区间内寻找第一段连续画布底色的起始 x。
 
@@ -215,7 +303,7 @@ def _blank_canvas_run_x(
     if row.mode != "RGB":
         row = row.convert("RGB")
     data = row.tobytes()
-    needle = bytes(_EMPTY_CHAT_BACKGROUND) * run
+    needle = bytes(background) * run
     offset = 0
     while True:
         index = data.find(needle, offset)
@@ -227,7 +315,12 @@ def _blank_canvas_run_x(
 
 
 def _find_selection_start(
-    window: Any, image, region: dict[str, int], top_offset: int = _SELECTION_TOP_DEAD_ZONE
+    window: Any,
+    image,
+    region: dict[str, int],
+    geometry: _SelectionGeometry,
+    background: tuple[int, int, int],
+    top_offset: int,
 ) -> tuple[int, int, str]:
     """返回让 QQ 进入消息框选态的按下坐标（屏幕坐标）与起点来源。
 
@@ -238,18 +331,18 @@ def _find_selection_start(
     """
     window_left = int(window.left)
     window_top = int(window.top)
-    region_left = int(region["left"]) + _SELECTION_INSET
-    region_gutter_right = int(region["left"]) + _SELECTION_INSET + _SELECTION_GUTTER_WIDTH
+    region_left = int(region["left"]) + geometry.inset
+    region_gutter_right = int(region["left"]) + geometry.inset + geometry.gutter_width
     region_top = int(region["top"]) + top_offset
-    region_right = int(region["right"]) - 1 - _SELECTION_INSET
-    region_bottom = int(region["bottom"]) - 1 - _SELECTION_INSET
+    region_right = int(region["right"]) - 1 - geometry.inset
+    region_bottom = int(region["bottom"]) - 1 - geometry.inset
     if image is not None:
         left = max(0, region_left - window_left)
         gutter_right = min(image.width - 1, region_gutter_right - window_left)
         top = max(0, region_top - window_top)
         bottom = min(image.height - 1, region_bottom - window_top)
-        for y in range(top, bottom + 1, _SELECTION_BLANK_SCAN_STEP):
-            x = _blank_canvas_run_x(image, y, left, gutter_right)
+        for y in range(top, bottom + 1, geometry.scan_step):
+            x = _blank_canvas_run_x(image, y, left, gutter_right, background, geometry.blank_run)
             if x is None:
                 continue
             safe_x = find_non_resize_x(window_left + x, window_top + y, region_right)
@@ -258,7 +351,9 @@ def _find_selection_start(
             if safe_x == window_left + x:
                 return (safe_x, window_top + y, "blank-canvas")
             # 分隔条命中区把起点推开了：在推开后的横坐标上重新确认空白画布。
-            if _is_blank_canvas_run(image, safe_x - window_left, y):
+            if _is_blank_canvas_run(
+                image, safe_x - window_left, y, background, geometry.blank_run
+            ):
                 return (safe_x, window_top + y, "blank-canvas")
     # 兜底：截图上找不到空白画布时，沿用左上角收缩 + 避开尺寸调整命中区的旧策略。
     fallback_left = find_non_resize_x(region_left, region_top, region_right)
@@ -359,33 +454,37 @@ class MessageList:
                     copy_action = None
                 if copy_action is None:
                     region = self._refresh_message_region(main_window)
+                    geometry = _selection_geometry(main_window)
                     selection_end = (
-                        region["right"] - 1 - _SELECTION_INSET,
-                        region["bottom"] - 1 - _SELECTION_INSET,
+                        region["right"] - 1 - geometry.inset,
+                        region["bottom"] - 1 - geometry.inset,
                     )
                     # 区域锚点命中错误时，收缩后可能只剩一条缝：这种情况不再被当成空
                     # 会话静默返回 0 条消息，而是按区域不可用直接报错。
                     if (
-                        region["left"] + _SELECTION_INSET >= selection_end[0]
-                        or region["top"] + _SELECTION_TOP_DEAD_ZONE >= selection_end[1]
+                        region["left"] + geometry.inset >= selection_end[0]
+                        or region["top"] + geometry.top_dead_zone >= selection_end[1]
                     ):
                         raise RuntimeError("QQ_MESSAGE_REGION_TOO_SMALL")
-                    if _is_empty_message_region(main_window, before, region):
+                    background = _canvas_background(before, main_window, region, geometry)
+                    metadata["canvasBackground"] = list(background)
+                    metadata["dpiScale"] = round(_window_dpi_scale(main_window), 3)
+                    if _is_empty_message_region(main_window, before, region, background):
                         metadata["emptyConversation"] = True
                         return ""
                     after = window = None
                     copy_action = None
                     for attempt in range(_SELECTION_TOP_RETRY_LIMIT + 1):
-                        top_offset = _SELECTION_TOP_DEAD_ZONE * (attempt + 1)
+                        top_offset = geometry.top_dead_zone * (attempt + 1)
                         # 起点落在气泡左侧边距的空白画布上，并向下躲开顶部日期栏命中
                         # 区；仍未进入框选态时把起点整体下移一个守卫高度重试。
                         start_x, start_y, start_source = _find_selection_start(
-                            main_window, before, region, top_offset
+                            main_window, before, region, geometry, background, top_offset
                         )
                         selection_start = (start_x, start_y)
                         metadata.update(
                             messageRegion=region,
-                            dragInset=_SELECTION_INSET,
+                            dragInset=geometry.inset,
                             dragTopOffset=top_offset,
                             dragAttempt=attempt,
                             dragStartSource=start_source,
