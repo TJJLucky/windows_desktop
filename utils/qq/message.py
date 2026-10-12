@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import ctypes
 import json
 import os
 import time
@@ -28,6 +27,7 @@ from .regions import (
 from .user_list import UserList
 from .window_ops import ensure_qq_window_with_retry, get_qq_window_image
 from ..core.mouse import click_at, drag, find_non_resize_x
+from ..core.screenshot import window_dpi
 from ..core.timing import timer
 from ..core.window import WindowCaptureCtx
 
@@ -90,11 +90,7 @@ def _window_dpi_scale(window: Any) -> float:
     ``GetDpiForWindow`` 对 per-monitor DPI 感知进程返回窗口所在显示器的实际 DPI；
     取不到时退回 1.0（等于基准机），保证旧环境行为不变。
     """
-    hwnd = getattr(window, "_hWnd", None)
-    try:
-        dpi = int(ctypes.windll.user32.GetDpiForWindow(int(hwnd)))
-    except Exception:
-        dpi = 0
+    dpi = window_dpi(getattr(window, "_hWnd", 0))
     if dpi <= 0:
         return 1.0
     return min(3.0, max(0.5, dpi / _SELECTION_DPI_BASELINE))

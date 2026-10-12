@@ -76,6 +76,19 @@ def getDPI():
     return DPI  # 缩放比例
 
 
+def window_dpi(hwnd):
+    """窗口所在显示器的实际 DPI（``GetDpiForWindow``）；取不到返回 0。
+
+    进程已固定 per-monitor V2 DPI-aware，因此这就是该窗口当前物理像素与逻辑像素
+    之比（96=100%，120=125%，144=150%，168=175%，192=200%...）。跨电脑判断模板、
+    框选几何要不要按缩放比例放大时，以窗口自身所在显示器的 DPI 为准，而不是主屏。
+    """
+    try:
+        dpi = int(ctypes.windll.user32.GetDpiForWindow(int(hwnd)))
+    except Exception:
+        return 0
+    return dpi if dpi > 0 else 0
+
 
 def calc_buf_size(hwnd):
     """根据窗口逻辑尺寸 × 系统 DPI 缩放，计算 WGC 截图所需缓冲区字节数。
