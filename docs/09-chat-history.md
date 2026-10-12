@@ -2,8 +2,8 @@
 
 ## 联系人键
 
-聊天记录以用户列表中的原始名字作为 `contact_name` 分区键。请求方应使用
-`/v1/contacts:query` 返回的 key 原样传回。
+聊天记录以精确 QQ 号作为 `contact_name` 分区键（物理列名沿用历史 schema，值为 `/v1/contacts:query`
+返回的 `qqNumber` key）。请求方应把该 key 原样传回。
 
 ## 存储结构
 
@@ -17,7 +17,7 @@
 
 ## 窗口差异追加
 
-`append_visible(contact_name, messages)`：
+`append_visible(qq_number, messages)`：
 
 1. 读取上一次快照。
 2. 以 `timestamp + sender + text` 对齐上一次窗口和本次窗口。

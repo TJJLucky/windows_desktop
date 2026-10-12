@@ -277,18 +277,18 @@ class MessageList:
                 pass
             raise
 
-    def read_messages(self, contact_name: str) -> dict[str, Any]:
+    def read_messages(self, qq_number: str) -> dict[str, Any]:
         """读取指定会话的可见消息，返回完整复制文本与解析后的消息数组。
 
         返回消息仅包含 sender、timestamp、text 和 rawText；方向由外部智能体根据
         sender 自行判断，服务不从气泡位置推断收发方向。
         """
-        UserList().active_user_by_name(contact_name)
+        UserList().active_user_by_number(qq_number)
         copied_text = self.copy_visible_selection()
         if not copied_text:
             return {"copiedText": None, "messages": []}
         try:
-            messages = parse_copied_messages(copied_text, fallback_sender=contact_name)
+            messages = parse_copied_messages(copied_text, fallback_sender="")
         except Exception as exc:
             raise RuntimeError("QQ_COPY_PARSE_FAILED") from exc
         if not messages:

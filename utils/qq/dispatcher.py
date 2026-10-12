@@ -30,8 +30,8 @@ class Dispatcher:
     用法：
         op = Dispatcher()
         contacts, exc = op.get_contact_list(timeout=60.0)
-        ok, exc = op.send_message("联系人", "你好", timeout=60.0)
-        messages, exc = op.read_message_list("联系人", timeout=60.0)
+        ok, exc = op.send_message("123456789", "你好", timeout=60.0)
+        messages, exc = op.read_message_list("123456789", timeout=60.0)
     """
 
     # 类级单例实例
@@ -99,11 +99,11 @@ class Dispatcher:
                 with operation_scope():
                     # 全部在 worker 线程串行执行，固定本次操作的模板版本。
                     if task_type == "send_message":
-                        contact_name, text = args
-                        result = self.send_message_impl(contact_name, text)
+                        qq_number, text = args
+                        result = self.send_message_impl(qq_number, text)
                     elif task_type == "read_message_list":
-                        contact_name, = args
-                        result = self.read_message_list_impl(contact_name)
+                        qq_number, = args
+                        result = self.read_message_list_impl(qq_number)
                     elif task_type == "get_contact_list":
                         result = self.get_contact_list_impl(*args)
                     elif task_type == "identify_current_contact":
@@ -151,12 +151,12 @@ class Dispatcher:
         except queue.Empty:
             return {}, TimeoutError("check_capture_ready task timeout")
 
-    def get_contact_list(self, timeout: float = 120.0, contact_name: str | None = None) -> Tuple[dict[str, dict], Optional[Exception]]:
+    def get_contact_list(self, timeout: float = 120.0, qq_number: str | None = None) -> Tuple[dict[str, dict], Optional[Exception]]:
         """获取联系人列表，入队列串行执行，缓存过期会执行截图解析。"""
         # 结果队列（容量 1：只放一个 (result, exc)）
         res_q = queue.Queue(maxsize=1)
         # 入队
-        self.task_queue.put(("get_contact_list", (contact_name,), {}, res_q))
+        self.task_queue.put(("get_contact_list", (qq_number,), {}, res_q))
         try:
             # 阻塞等待结果（最长 timeout 秒）
             return res_q.get(timeout=timeout)
@@ -164,14 +164,14 @@ class Dispatcher:
             # 超时：返回空结果 + 超时异常（不保证任务未执行）
             return {}, TimeoutError("get_contact_list task timeout")
 
-    def send_message(self, contact_name: str, text: str, timeout: float = 120.0) -> Tuple[bool, Optional[Exception]]:
+    def send_message(self, qq_number: str, text: str, timeout: float = 120.0) -> Tuple[bool, Optional[Exception]]:
         """提交发送任务到队列，阻塞等待执行完成
         返回 (成功bool, 异常对象 or None)
         """
         # 结果队列
         res_q = queue.Queue(maxsize=1)
         # 入队（worker 串行执行）
-        self.task_queue.put(("send_message", (contact_name, text), {}, res_q))
+        self.task_queue.put(("send_message", (qq_number, text), {}, res_q))
         try:
             # 阻塞等待
             return res_q.get(timeout=timeout)
@@ -179,12 +179,12 @@ class Dispatcher:
             # 超时：返回失败 + 超时异常
             return False, TimeoutError("send_message task timeout")
 
-    def read_message_list(self, contact_name: str, timeout: float = 120.0) -> Tuple[dict, Optional[Exception]]:
+    def read_message_list(self, qq_number: str, timeout: float = 120.0) -> Tuple[dict, Optional[Exception]]:
         """提交读取消息任务到队列，阻塞等待执行完成。"""
         # 结果队列
         res_q = queue.Queue(maxsize=1)
         # 入队
-        self.task_queue.put(("read_message_list", (contact_name,), {}, res_q))
+        self.task_queue.put(("read_message_list", (qq_number,), {}, res_q))
         try:
             # 阻塞等待
             return res_q.get(timeout=timeout)
@@ -200,16 +200,16 @@ class Dispatcher:
         win = ensure_qq_window_with_retry()
         return {"ready": True, "windowTitle": getattr(win, "title", None)}
 
-    def get_contact_list_impl(self, contact_name: str | None = None) -> dict[str, dict]:
+    def get_contact_list_impl(self, qq_number: str | None = None) -> dict[str, dict]:
         """实际实现：读用户列表（内部 3s 缓存）。"""
-        return self.userList.get_user_list(contact_name)
+        return self.userList.get_user_list(qq_number)
 
-    def send_message_impl(self, contact_name: str, text: str) -> bool:
+    def send_message_impl(self, qq_number: str, text: str) -> bool:
         """实际实现：输入文本（内部自动激活会话）→ 快捷键发送。"""
         # 发送方法内部自动激活用户（点击列表行切换会话，已激活跳过）→ 聚焦输入框 → 粘贴 → Enter 发送
-        self.inputBox.send_text(contact_name, text)
+        self.inputBox.send_text(qq_number, text)
         return True
 
-    def read_message_list_impl(self, contact_name: str) -> dict:
+    def read_message_list_impl(self, qq_number: str) -> dict:
         """委托 MessageList 完成激活、框选复制和解析。"""
-        return self.messageList.read_messages(contact_name)
+        return self.messageList.read_messages(qq_number)

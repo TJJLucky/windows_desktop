@@ -104,5 +104,5 @@ conda run -n qq-desktop-service python -m service --endpoint-file <endpoint.json
 
 - 必须运行在 Windows 交互桌面。
 - 交付只复制 `dist-exe/qq-desktop-service.exe`；客户端使用前先同步资源。
-- 真实 QQ 验证重点检查：窗口置顶、列表滚动、右上角 OCR、点击坐标、右键菜单识别、剪贴板号码核对和消息读取重试。
+- 真实 QQ 验证重点检查：窗口置顶、列表滚动、激活行色带判定、点击坐标、右键菜单识别、剪贴板号码核对和消息读取重试。
 - 任何“通过”结论都必须来自真机证据；没有真机证据只能写“未验证”。

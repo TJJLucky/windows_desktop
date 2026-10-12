@@ -2,16 +2,16 @@
 
 ## 读取流程
 
-`MessageList.read_messages(contact_name)` 是消息读取的唯一入口：
+`MessageList.read_messages(qq_number)` 是消息读取的唯一入口：
 
-1. 通过 `UserList.active_user_by_name()` 激活目标会话；联系人定位仍会使用用户列表 OCR。
+1. 通过 `UserList.active_user_by_number()` 激活目标会话；联系人定位只按右键菜单复制的 QQ 号，不使用昵称 OCR。
 2. 通过消息区模板确定安全的框选范围。
 3. 从内缩后的左上按住左键拖到右下，进入 QQ 多选状态。
 4. 优先匹配 `templates/copy_icon.png`；工具栏图标模板不匹配时，回退到底部 ROI 的
    OCR 精确文字“复制”，再按文字标签定位其上方的图标点击区域。
 5. 读取 QQ 写入系统剪贴板的 Unicode 文本。
 6. 按 `发送人: MM-DD HH:MM:SS 正文` 解析为 `sender`、`timestamp`、`text`、`rawText`；
-   私聊/服务号仅复制正文时，用当前联系人 key 补 `sender`，`timestamp` 保持为空。
+   私聊/服务号仅复制正文时，`sender` 保持为空，由调用智能体按自身判断归属，`timestamp` 保持为空。
 
 消息正文不再使用气泡检测、拼图或 OCR，也不返回气泡坐标或方向。智能体应根据
 `sender` 与自身 QQ 名称自行判断消息归属。

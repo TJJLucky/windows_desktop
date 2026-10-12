@@ -184,11 +184,11 @@ class ChatHistoryStore:
             "CREATE INDEX IF NOT EXISTS idx_messages_contact_time ON messages (contact_name, created_at)"
         )
 
-    def append_visible(self, contact_name: str, messages: list[dict[str, Any]]) -> int:
+    def append_visible(self, qq_number: str, messages: list[dict[str, Any]]) -> int:
         """按可见窗口差异追加复制消息，返回本次新增数。"""
-        contact_name = str(contact_name or "")
+        contact_name = str(qq_number or "")
         if not contact_name:
-            raise ValueError("contact_name must not be empty")
+            raise ValueError("qq_number must not be empty")
         current = _normalise_visible(messages)
         if not current:
             return 0
@@ -240,7 +240,7 @@ class ChatHistoryStore:
             return len(new_messages)
 
     def record_operation(
-        self, *, request_id: str, operation: str, contact_name: str | None, status: str,
+        self, *, request_id: str, operation: str, qq_number: str | None, status: str,
         duration_ms: float, failure_code: str | None = None, details: dict[str, Any] | None = None,
     ) -> None:
         """记录不含消息正文的接口执行诊断。"""
@@ -249,7 +249,7 @@ class ChatHistoryStore:
                 "INSERT INTO operation_attempt("
                 "request_id, operation, contact_name, status, failure_code, duration_ms, details_json"
                 ") VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (request_id, operation, contact_name, status, failure_code, duration_ms,
+                (request_id, operation, qq_number, status, failure_code, duration_ms,
                  json.dumps(details, ensure_ascii=False, separators=(",", ":")) if details else None),
             )
 
@@ -264,17 +264,17 @@ class ChatHistoryStore:
                 (limit,),
             ).fetchall()
         return [
-            {"contactName": row[0], "lastTime": row[1], "total": row[2], "lastText": row[3]}
+            {"qqNumber": row[0], "lastTime": row[1], "total": row[2], "lastText": row[3]}
             for row in rows
         ]
 
-    def get_history(self, contact_name: str, limit: int = 100, offset: int = 0) -> list[dict]:
+    def get_history(self, qq_number: str, limit: int = 100, offset: int = 0) -> list[dict]:
         """返回最近一页历史，并按 seq 正序输出。"""
         with self._lock, closing(self._connect()) as connection:
             rows = connection.execute(
                 "SELECT id, sender, timestamp, text, raw_text, seq, created_at "
                 "FROM messages WHERE contact_name = ? ORDER BY seq DESC LIMIT ? OFFSET ?",
-                (contact_name, limit, offset),
+                (qq_number, limit, offset),
             ).fetchall()
         return [
             {
@@ -291,13 +291,13 @@ class ChatHistoryStore:
 
     @staticmethod
     def _tail_history(
-        connection: sqlite3.Connection, contact_name: str, limit: int = 100
+        connection: sqlite3.Connection, qq_number: str, limit: int = 100
     ) -> list[dict[str, str]]:
         """无快照时从历史尾部恢复一个可见窗口，用于兼容旧数据库。"""
         rows = connection.execute(
             "SELECT sender, timestamp, text, raw_text FROM messages "
             "WHERE contact_name = ? ORDER BY seq DESC LIMIT ?",
-            (contact_name, limit),
+            (qq_number, limit),
         ).fetchall()
         return [
             {

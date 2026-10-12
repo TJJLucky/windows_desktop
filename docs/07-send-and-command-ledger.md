@@ -5,7 +5,7 @@
 `POST /v1/commands/send` 请求包含：
 
 - `commandId`：调用方生成的稳定幂等键。
-- `contactName`：用户列表中的联系人名字。
+- `qqNumber`：目标 QQ 号（`/v1/contacts:query` 返回的 key）。
 - `text`：最多 5000 字符的消息文本。
 
 ## 命令账本状态

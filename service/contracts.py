@@ -1,7 +1,7 @@
 """本机 QQ Desktop Service v1 HTTP 契约。
 
 定义全部请求/响应模型（Pydantic）：
-- 字段使用 JSON 别名（如 contactName），与调用方（UniApp 前端）的命名约定一致；
+- 字段使用 JSON 别名（如 qqNumber），与调用方（UniApp 前端）的命名约定一致；
 - 全部模型继承 StrictModel：未知字段直接报错（extra="forbid"），保证前后端契约严格一致；
 - 字段提供中文 title/description/examples，作为 FastAPI OpenAPI 文档。
 """
@@ -41,9 +41,10 @@ class ServiceHealthResponse(StrictModel):
 class ListContactsRequest(StrictModel):
     """不指定目标时读当前屏幕；指定目标且不可见时滚动查找。"""
 
-    contact_name: str | None = Field(
-        alias="contactName", default=None, min_length=1, max_length=256,
-        title="待查找联系人", description="可选的已确认联系人名；当前屏幕找不到时才滚动截图。",
+    qq_number: str | None = Field(
+        alias="qqNumber", default=None, pattern=r"^[1-9][0-9]{4,19}$",
+        title="待查找 QQ 号", description="可选的 QQ 号；指定后按号码滚动精确查找，不使用昵称 OCR。",
+        examples=["10001"],
     )
 
 
@@ -52,7 +53,7 @@ class ListContactsResponse(StrictModel):
 
     contacts: dict[str, dict[str, Any]] = Field(
         title="联系人列表",
-        description="联系人名到联系人信息的映射，key 来自 QQ 用户列表。",
+        description="QQ 号到联系人信息的映射，key 为复制菜单读取的精确 QQ 号。",
     )
     count: int = Field(
         ge=0,
@@ -64,13 +65,12 @@ class ListContactsResponse(StrictModel):
 class ReadMessagesRequest(StrictModel):
     """读取指定联系人可见消息的请求。"""
 
-    contact_name: str = Field(
-        alias="contactName",
-        min_length=1,
-        max_length=256,
-        title="联系人名",
-        description="QQ 用户列表中的联系人名，必须使用 /v1/contacts:query 返回的 key。",
-        examples=["华强电子"],
+    qq_number: str = Field(
+        alias="qqNumber",
+        pattern=r"^[1-9][0-9]{4,19}$",
+        title="QQ 号",
+        description="目标 QQ 号，必须使用 /v1/contacts:query 返回的 key。",
+        examples=["10001"],
     )
 
 
@@ -107,13 +107,12 @@ class SendMessageRequest(StrictModel):
         description="调用方生成的稳定幂等键，同一 ID 不得用于不同消息体。",
         examples=["effect-key-0000001"],
     )
-    contact_name: str = Field(
-        alias="contactName",
-        min_length=1,
-        max_length=256,
-        title="联系人名",
-        description="QQ 用户列表中的联系人名，必须使用 /v1/contacts:query 返回的 key。",
-        examples=["华强电子"],
+    qq_number: str = Field(
+        alias="qqNumber",
+        pattern=r"^[1-9][0-9]{4,19}$",
+        title="QQ 号",
+        description="目标 QQ 号，必须使用 /v1/contacts:query 返回的 key。",
+        examples=["10001"],
     )
     text: str = Field(
         min_length=1,
@@ -184,23 +183,23 @@ class ChatHistoryItem(StrictModel):
 class ChatHistoryRequest(StrictModel):
     """查询聊天记录的请求。"""
 
-    contact_name: str = Field(
-        alias="contactName",
-        min_length=1,
-        max_length=256,
-        title="联系人名",
-        description="QQ 用户列表中的联系人名，必须使用 /v1/contacts:query 返回的 key。",
-        examples=["华强电子"],
+    qq_number: str = Field(
+        alias="qqNumber",
+        pattern=r"^[1-9][0-9]{4,19}$",
+        title="QQ 号",
+        description="目标 QQ 号，必须使用 /v1/contacts:query 返回的 key。",
+        examples=["10001"],
     )
 
 
 class ChatHistoryResponse(StrictModel):
     """查询聊天记录的响应。"""
 
-    contact_name: str = Field(
-        alias="contactName",
-        title="联系人名",
-        description="聊天记录所属的 QQ 用户列表联系人名。",
+    qq_number: str = Field(
+        alias="qqNumber",
+        pattern=r"^[1-9][0-9]{4,19}$",
+        title="QQ 号",
+        description="聊天记录所属的 QQ 号。",
     )
     count: int = Field(ge=0, title="消息数量", description="本次返回的历史消息数量。")
     copied_text: str | None = Field(

@@ -65,7 +65,6 @@ class LayoutDesktop:
             dispatcher = Dispatcher()
             self.store.activate(selected)
             clear_region_cache()
-            dispatcher.userList.clear_user_list_cache()
             dispatcher.userList.userList_region = None
             dispatcher.inputBox.input_region = None
             dispatcher.messageList.message_screen_region = None

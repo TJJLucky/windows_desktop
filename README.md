@@ -105,7 +105,7 @@ endpoint 文件记录动态 loopback URL 与本次启动的进程 pid（无 toke
 - 单个日志文件达到 5 MB 后轮转，保留 5 个历史文件。
 - endpoint 文件同时写入 `logDirectory`、`applicationLog`、`consoleLog`，调用方可直接定位。
 
-聊天记录以 `contactName` 为分区键；调用方应使用 `/v1/contacts:query` 返回的用户列表 key 原样传回。
+聊天记录以 `qqNumber` 为分区键；调用方应使用 `/v1/contacts:query` 返回的用户列表 key 原样传回。
 
 接口：
 
@@ -132,7 +132,7 @@ Content-Type: application/json
 
 {
   "commandId": "cloud-effect-key-or-caller-uuid",
-  "contactName": "华强电子",
+  "qqNumber": "2881734702",
   "text": "STM32F103C8T6，数量 100，请报价。"
 }
 ```
@@ -164,7 +164,6 @@ Content-Type: application/json
 | --- | --- |
 | `matcher.py` | `find_template`（TM_CCOEFF_NORMED） / `draw_box` / `crop_image` / `crop_region` |
 | `ocr.py` | `OCREngine` 单例（RapidOCR + ONNX Runtime）；模型路径三级：`RAPIDOCR_MODEL_PATH` → `<install>/ocr-models` → 包内 models |
-| `compose.py` | 视觉编排：`compose_bubbles_to_one`（气泡垂直拼图 + 分隔线）、`split_ocr_by_bubble`（按 y 边界切分 OCR 行）——N 次气泡 OCR 合并为 1 次 |
 
 ### `utils/qq`
 
@@ -173,9 +172,9 @@ Content-Type: application/json
 | `window_ops.py` | QQ 进程/窗口枚举、快捷键唤起（Ctrl+Alt+X 打开/隐藏所有窗口，有进程无窗口时唤醒）、`get_main_window` / `ensure_qq_window_with_retry` |
 | `regions.py` | `RegionResult`；`get_userList_region_and_image` / `get_inputbox_region_and_image` / `get_message_box_region_and_image` / `get_input_buttom_region`；模板在 `templates/` |
 | `models.py` | 数据模型：`User`（`to_dict`） |
-| `user_list.py` | `UserList`（单例）：霍夫圆定位用户行 → **拼图一次 OCR 识别全部昵称** → 红点检测；`find_user`（包含匹配 + 中英文规范化）、`active_user_by_name`、`get_user_list`（1s 缓存） |
-| `input.py` | `InputBox`（单例）：`send_text(contact_name, text)` 内部自动激活会话→聚焦→剪贴板粘贴→Ctrl+V→按 Enter 快捷键发送 |
-| `message.py` | `MessageList`（单例）：`read_messages(contact_name)` 内部自动激活会话→左上到右下框选→定位并点击 `copy_icon.png`→读取剪贴板→解析 sender/timestamp/text/rawText |
+| `user_list.py` | `UserList`（单例）：霍夫圆定位用户行 → 逐行右键复制 QQ 号得到行身份 → 红点检测；`active_user_by_number`（滚动查找 + 精确激活 + 号码复核）、`get_user_list`（当前屏幕 QQ 号快照） |
+| `input.py` | `InputBox`（单例）：`send_text(qq_number, text)` 内部自动激活会话→聚焦→剪贴板粘贴→Ctrl+V→按 Enter 快捷键发送 |
+| `message.py` | `MessageList`（单例）：`read_messages(qq_number)` 内部自动激活会话→左上到右下框选→定位并点击 `copy_icon.png`→读取剪贴板→解析 sender/timestamp/text/rawText |
 | `hotkeys.py` | QQ 全局快捷键配置表（Ctrl+Alt+X 打开/隐藏所有窗口、Enter 发送）与 `send_hotkey` 发送原语 |
 | `dispatcher.py` | `Dispatcher` 单消费者任务队列（唯一入口）：`get_contact_list` / `send_message` / `read_message_list`（发送/读取内部自动激活用户） |
 
@@ -204,8 +203,8 @@ messages, exc = op.read_message_list("华强电子", timeout=120.0)
 | 工具 | 队列 API |
 | --- | --- |
 | `list_qq_contacts` | `get_contact_list()` |
-| `send_qq_message(contact_name, text)` | `send_message(contact_name, text)` |
-| `read_qq_messages(contact_name)` | `read_message_list(contact_name)` |
+| `send_qq_message(qq_number, text)` | `send_message(qq_number, text)` |
+| `read_qq_messages(qq_number)` | `read_message_list(qq_number)` |
 
 ---
 
@@ -233,3 +232,15 @@ messages, exc = op.read_message_list("华强电子", timeout=120.0)
 模板使用既有版本管理接口上传、持久化和读取图片；内置默认版本仍不可覆盖或删除。
 布局库升级时仅一次性补全旧自定义版本缺少的新模板字段，不覆盖用户已有图片；运行时缺图报错，不回退默认版本。
 操作日志记录耗时和失败/跳过原因，不记录号码；本轮保留原有发送链路不变。
+
+### 按 QQ 号滚动查找与激活（第二阶段）
+
+联系人身份完全由右键菜单「复制 QQ 号」决定，昵称 OCR 方案已移除：
+
+- `POST /v1/contacts:query` 可传 `{"qqNumber":"2881734702"}`：先读当前屏，未命中才逐屏滚动查找。
+- 扫描只在好友列表区域内滚动，不点击、不切换会话；用头像像素指纹判断真实滚动量，最多 20 屏 / 90 秒。
+- 目标行即当前激活行时跳过点击（点击已激活行会把激活高亮切掉）；否则点击行头像圆心并复核。
+- 激活判定以行背景绝对色带为准（浅色主题激活约 226 灰、未激活约 245 灰、悬停约 235 灰），不使用右上角标题 OCR，也不使用「相对离群」兜底。
+- 点击后 QQ 约 0.25s 重绘，因此在 4 秒内重试「复制当前激活行号码」，与目标号完全一致才算成功。
+- 行是群或菜单没有「复制 QQ 号」时返回跳过原因（`SKIPPED_COPY_UNAVAILABLE`），不猜坐标、不回退 OCR。
+- 菜单判定先在点击点附近的小 ROI 内做近白面板预筛，再单尺度匹配 `copy_qq_number` 模板（未命中回退多尺度）；无「复制 QQ 号」的菜单在 0.3 秒确认窗口内快速退出，不再空等满 2 秒。

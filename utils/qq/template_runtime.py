@@ -112,9 +112,11 @@ def find_template(big, small, threshold=0.8, use_mask=False, multiscale=True, *,
     return result
 
 
-def find_unique_template(big, small, threshold=0.9, *, origin=(0, 0)):
+def find_unique_template(big, small, threshold=0.9, *, origin=(0, 0), multiscale=True):
+    # multiscale=False 只按模板原始尺寸匹配：QQ 右键菜单与模板同尺寸时先走这个快路径，
+    # 未命中再回退多尺度，兼顾速度与 DPI/窗口缩放下的鲁棒性。
     try:
-        result = _find_unique_template(big, small, threshold)
+        result = _find_unique_template(big, small, threshold, multiscale=multiscale)
     except TemplateAmbiguousError as exc:
         raise RuntimeError("QQ_CONTACT_NUMBER_MENU_AMBIGUOUS") from exc
     _record_template(small, result, origin)

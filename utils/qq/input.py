@@ -195,14 +195,14 @@ class InputBox:
         # 等发送完成（消息上屏渲染，避免紧接着截图到旧画面）
         time.sleep(0.3)
 
-    def send_text(self, contact_name: str, text: str):
+    def send_text(self, qq_number: str, text: str):
         """便捷流程：内部激活目标会话 → 聚焦 → 输入文本 → 发送。
 
         发送前在方法内部自动激活该用户（点击列表行切换会话，已激活则跳过），
         调用方无需（也不应）先单独激活——发送本身自带激活语义。
         """
-        # 内部激活用户：根据名字点击列表行切换到目标会话（已激活则跳过点击）
-        UserList().active_user_by_name(contact_name)
+        # 内部按 QQ 号精确定位并激活会话；昵称 OCR 不参与目标身份。
+        UserList().active_user_by_number(qq_number)
         # 刷新定位（含聚焦）
         self.refresh()
         # 粘贴文本

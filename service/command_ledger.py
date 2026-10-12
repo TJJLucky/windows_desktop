@@ -2,7 +2,7 @@
 
 职责：保证「相同 commandId 只执行一次」的幂等语义。
 - 首次收到某 commandId → 记 RUNNING 并放行执行；
-- 再次收到相同 commandId + 相同消息体（联系人+文本的哈希一致）→ 幂等返回既有状态，不重发；
+- 再次收到相同 commandId + 相同消息体（QQ 号+文本的哈希一致）→ 幂等返回既有状态，不重发；
 - 相同 commandId + 不同消息体 → 抛 CommandConflictError（调用方转为 409）；
 - 服务重启时，把所有还挂着 RUNNING 的记录转为 EFFECT_UNKNOWN：表示"结果未知、不会自动重发"，
   由调用方决定是否重试。
@@ -72,7 +72,7 @@ class CommandLedger:
             if cursor.rowcount:
                 logger.warning("ledger.startup_migration running_to_effect_unknown count=%d", cursor.rowcount)
 
-    def begin(self, command_id: str, contact_name: str, text: str) -> tuple[bool, CommandStatus, dict[str, Any] | None]:
+    def begin(self, command_id: str, qq_number: str, text: str) -> tuple[bool, CommandStatus, dict[str, Any] | None]:
         """申请执行命令：决定「本次是否真正执行」。
 
         :return: (execute, status, result)
@@ -80,8 +80,8 @@ class CommandLedger:
                  execute=False → 幂等命中（同 ID 同消息体），返回既有状态与结果，不重发。
         :raises CommandConflictError: 同 ID 不同消息体
         """
-        # 计算消息体指纹：联系人 + 文本（JSON 规范化后 sha256）
-        payload_hash = _payload_hash(contact_name, text)
+        # 计算消息体指纹：QQ 号 + 文本（JSON 规范化后 sha256）
+        payload_hash = _payload_hash(qq_number, text)
         with self._lock, closing(self._connect()) as connection, connection:
             # 查既有记录
             row = connection.execute(
@@ -128,11 +128,11 @@ class CommandLedger:
         return sqlite3.connect(self._path)
 
 
-def _payload_hash(contact_name: str, text: str) -> str:
+def _payload_hash(qq_number: str, text: str) -> str:
     """计算发送消息体的规范化指纹：联系人 + 文本按固定键序 JSON 序列化后 sha256。"""
     # sort_keys=True 保证键序稳定（同内容必得同哈希）；separators 压缩体积
     material = json.dumps(
-        {"contactName": contact_name, "text": text},
+        {"qqNumber": qq_number, "text": text},
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
