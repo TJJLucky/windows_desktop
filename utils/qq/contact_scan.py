@@ -18,6 +18,10 @@ if TYPE_CHECKING:
 CONTACT_SCROLL_WAIT_SECONDS = 2.0
 CONTACT_SCAN_MAX_PAGES = 20
 CONTACT_SCAN_TIMEOUT_SECONDS = 90.0
+# 整页读取期间窗口若短暂出新帧或失去前台（WINDOW_CHANGED），重取基准帧整页重读，
+# 最多 CONTACT_PAGE_READ_ATTEMPTS 次；避免一次瞬时抖动让整轮滚动查找直接失败（真机实测偶发）。
+CONTACT_PAGE_READ_ATTEMPTS = 3
+CONTACT_PAGE_RETRY_WAIT_SECONDS = 0.2
 logger = logging.getLogger("qq_service.contact_scan")
 
 
@@ -64,8 +68,8 @@ class ContactScanner:
         return (self.user_list.hwnd, tuple(sorted(region.screen_region.items())),
                 tuple(sorted(region.image_region.items())), region.full_image.size)
 
-    def _read_page(self):
-        """截取当前页、逐行复制 QQ 号一次，并返回行指纹与激活行。"""
+    def _read_page_once(self):
+        """截取当前页一次、逐行复制 QQ 号，并返回行指纹与激活行。"""
         from .contact_number import ContactNumberReader, _active_row, visible_rows
         from .window_ops import ensure_qq_window_with_retry
 
@@ -92,6 +96,18 @@ class ContactScanner:
                 numbers.append((number, row))
         self._page = (numbers, fingerprints, region, active_row)
         return self._page
+
+    def _read_page(self):
+        """整页读取：瞬时窗口抖动（WINDOW_CHANGED）时重取基准帧整页重读，其余错误直接抛出。"""
+        for attempt in range(1, CONTACT_PAGE_READ_ATTEMPTS + 1):
+            try:
+                return self._read_page_once()
+            except RuntimeError as error:
+                if (str(error) != "QQ_CONTACT_NUMBER_WINDOW_CHANGED"
+                        or attempt == CONTACT_PAGE_READ_ATTEMPTS):
+                    raise
+                logger.warning("contacts.page.retry attempt=%d reason=%s", attempt, error)
+                time.sleep(CONTACT_PAGE_RETRY_WAIT_SECONDS)
 
     def read_visible(self) -> dict[str, dict]:
         """枚举当前可见联系人，返回以精确 QQ 号为 key 的快照；不滚动列表。

@@ -51,6 +51,11 @@ PARK_MARGIN_BOTTOM = 60
 PARK_JITTER = 4
 PARK_CONFIRM_SECONDS = 0.2
 PARK_SETTLE_SECONDS = 0.05
+# 读当前激活联系人时，QQ 偶发重建捕获面（WGC generation 跳变，实测 3->5），
+# 单次读取会以 WINDOW_CHANGED 失败；该读取幂等（开菜单->复制->关菜单），
+# 因此在有界窗口内重试，别把瞬时重建当成业务失败（真机实测约 1/11 次）。
+IDENTIFY_RETRY_ATTEMPTS = 3
+IDENTIFY_RETRY_WAIT_SECONDS = 0.25
 _park_offsets = itertools.cycle((0, PARK_JITTER))
 
 
@@ -173,12 +178,25 @@ class ContactNumberReader:
         image = self._capture(window)
         return get_userList_region_and_image(window, image)
 
-    def identify_current(self) -> str | None:
-        self._generation = None
-        window = ensure_qq_window_with_retry()
-        with WindowCaptureCtx(window._hWnd):
-            region = self.capture_region(window)
-            return self.copy_row(window, region, _active_row(region))
+    def identify_current(self, *, attempts: int = IDENTIFY_RETRY_ATTEMPTS) -> str | None:
+        """复制当前激活行的 QQ 号；窗口捕获面被重建（WINDOW_CHANGED）时整段重试。
+
+        读取本身无副作用且幂等，重试只会重新截取一帧再复制一次，因此只对瞬时
+        重建重试；联系人未激活/模板缺失等业务错误直接抛出，不重试。
+        """
+        for attempt in range(1, attempts + 1):
+            self._generation = None
+            window = ensure_qq_window_with_retry()
+            try:
+                with WindowCaptureCtx(window._hWnd):
+                    region = self.capture_region(window)
+                    return self.copy_row(window, region, _active_row(region))
+            except RuntimeError as error:
+                if (str(error) != "QQ_CONTACT_NUMBER_WINDOW_CHANGED"
+                        or attempt == attempts):
+                    raise
+                logger.warning("contacts.identify.retry attempt=%d reason=%s", attempt, error)
+                time.sleep(IDENTIFY_RETRY_WAIT_SECONDS)
 
     @staticmethod
     def _clock():
@@ -229,7 +247,11 @@ class ContactNumberReader:
             if not menu_open and not _same_avatar(avatar_image, frame.crop(avatar_box)):
                 logger.warning("contacts.number.identity_changed part=avatar")
                 raise RuntimeError("QQ_CONTACT_NUMBER_ROW_CHANGED")
-            if not _same_image(header_image, frame.crop(header_box)):
+            # 标题区（列表右上方的活跃会话标题/聊天区）会因对方发来消息或界面动画
+            # 随时重绘（真机实测偶发），与"这一行还是不是同一行"无关；枚举阶段（
+            # require_active=False）跳过该比对，行身份由窗口签名、头像掩膜与关闭菜单后
+            # 的几何核对保证。激活链路仍保留标题区核对以做最强一致性确认。
+            if require_active and not _same_image(header_image, frame.crop(header_box)):
                 logger.warning("contacts.number.identity_changed part=header")
                 raise RuntimeError("QQ_CONTACT_NUMBER_ROW_CHANGED")
             return frame
