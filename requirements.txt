@@ -4,8 +4,7 @@
 #   - 与 pyproject.toml [project.dependencies] 保持一致（单一来源，勿手改此处）
 #   - 安装方式：pip install -r requirements.txt
 #   - 推荐专用环境：conda create -n qq-desktop-service python=3.12
-#   - dev 依赖（pytest 等）见 pyproject.toml [project.optional-dependencies].dev，
-#     需要时执行：pip install -e ".[dev]"
+#   - 本项目不做单元测试；交付前按 docs/11-testing-and-operations.md 执行真机验收
 
 fastapi>=0.115,<1
 pydantic>=2.8,<3

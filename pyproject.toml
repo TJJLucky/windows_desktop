@@ -1,4 +1,4 @@
-# 仅用于开发依赖、测试配置与 exe 构建元数据；发行形态不包含 wheel 或 console script。
+# 仅用于开发依赖、exe 构建元数据与代码风格配置；发行形态不包含 wheel 或 console script。
 [project]
 name = "price-agent-windows-desktop"
 version = "0.1.0"
@@ -21,12 +21,6 @@ dependencies = [
   "rapidocr-onnxruntime>=1.4.4,<2",
 ]
 
-[project.optional-dependencies]
-dev = [
-  "pytest>=8.3,<9",
-  "pytest-asyncio>=0.24,<1",
-]
-
 [build-system]
 requires = ["hatchling>=1.25,<2"]
 build-backend = "hatchling.build"
@@ -40,10 +34,6 @@ packages = ["service", "utils"]
 "templates" = "templates"
 
 [tool.hatch.build.targets.wheel.hooks.custom]
-
-[tool.pytest.ini_options]
-asyncio_mode = "auto"
-testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 120

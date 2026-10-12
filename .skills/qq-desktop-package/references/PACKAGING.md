@@ -45,7 +45,7 @@ onefile 运行时 `__file__` 指向 `_MEIPASS/utils/qq/xxx.py`，代码 `parent.
 fastapi / pydantic / uvicorn / httpx / numpy / opencv-python / Pillow / pyautogui / **psutil** / pyperclip / pywin32(win32) / pywinauto / rapidocr-onnxruntime。
 注意：`psutil` 是 `window_ops.py` 的运行时依赖，曾漏声明，已补。
 
-pyproject.toml 仅保留项目元数据与 pytest/ruff 配置（无 build-system，wheel 不可构建，符合"唯一 exe 方案"）。
+pyproject.toml 仅保留项目元数据、依赖与 ruff 配置（无 pytest 依赖，wheel 不可构建，符合"唯一 exe 方案"）。
 
 ## conda 环境
 

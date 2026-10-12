@@ -4,7 +4,7 @@
 
 `utils/` 是实现层；`service/` 是对外接口层。所有 QQ 操作统一经由 `Dispatcher` 单消费者队列执行，保证全局不并发。
 
-发行形态仅支持 PyInstaller 生成的 exe；不提供 wheel、pip console script 或其他 Python 安装形态。源码运行仅用于开发和测试。
+发行形态仅支持 PyInstaller 生成的 exe；不提供 wheel、pip console script 或其他 Python 安装形态。源码运行仅用于开发和真机验收。
 
 ---
 
@@ -13,7 +13,7 @@
 ```text
 windows_desktop/
 ├── __init__.py          # 包入口说明
-├── pyproject.toml        # 开发依赖、测试配置与 exe 构建元数据
+├── pyproject.toml        # 依赖、代码风格与 exe 构建元数据
 ├── libs/wgc_capture.dll  # WGC 原生截获库
 ├── templates/*.png       # QQ 界面模板图（区域定位依赖）
 ├── service/              # 本机 HTTP API、命令账本、服务入口

@@ -59,4 +59,4 @@ struct WgcFrameInfo {
 
 ## 验证
 
-普通回归：`python -m pytest -q`。真实原生窗口检查：`python tests/live_wgc_contract.py`，只创建测试窗口、不发送消息。QQ 的真实 HTTP 复制、2 秒间隔采样及资源观察结果记录在 `docs/wgc-persistent-validation.md`。
+本项目不做单元测试。原生采集改动必须在真实窗口做真机验收：确认持续挂载复用会话、窗口恢复后重新建立、动作屏障拒绝旧帧、尺寸变化重建与失败码符合表内契约。QQ 的真实 HTTP 复制、2 秒间隔采样及资源观察结果记录在 `docs/wgc-persistent-validation.md`。
