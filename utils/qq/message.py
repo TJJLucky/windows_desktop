@@ -39,6 +39,29 @@ _EMPTY_CHAT_BACKGROUND = (245, 245, 245)
 _EMPTY_CHAT_SAMPLE_WIDTH = 384
 _EMPTY_CHAT_BACKGROUND_RATIO = 0.995
 
+# 拖拽矩形相对消息区域向内收缩的像素数（四边基础值）。区域左边界压在消息区与
+# 联系人列表之间的分隔条命中区上、下边界压着输入框上边线，私聊没有右侧栏时右边
+# 界等于窗口右边界（落在系统尺寸调整边框里）：起点或终点落在这些边界上时 QQ 不会
+# 进入消息框选态。真机实测（会话 110001335 / 2885099490 / 2885512390，各重复 2 次）
+# 左边界需让开 3px 才能按下，右、下边界让开 0~8px 都能成功，统一取 8px 留余量。
+_SELECTION_INSET = 8
+
+# 消息区最顶部是 QQ 粘性日期栏的命中区：真机实测该命中区约 20~21px 高，按下点落在
+# 其中时不会进入框选态（尚未滚动、顶部没有日期栏的会话则几乎立刻可以按下）。这里
+# 固定让开 22px；仍未进入框选态时按同一步长继续下移重试，最多再试 2 次。
+_SELECTION_TOP_DEAD_ZONE = 22
+_SELECTION_TOP_RETRY_LIMIT = 2
+
+# 起点优先落在气泡左侧的空白边距里：自上而下按 2px 步进逐行寻找一段连续画布底色，
+# 横向只在边距宽度内搜索，避免按下点压到头像或气泡而只被当成普通点击。
+_SELECTION_GUTTER_WIDTH = 56
+_SELECTION_BLANK_SCAN_STEP = 2
+_SELECTION_BLANK_RUN = 4
+
+# 拖拽后等待多选工具栏出现的超时与轮询间隔。
+_SELECTION_COPY_WAIT_SECONDS = 2.0
+_SELECTION_COPY_POLL_INTERVAL = 0.15
+
 
 def _read_unicode_clipboard(sentinel: str, retries: int = 10, delay: float = 0.1) -> str:
     """等待并读取 QQ 点击“复制”后写入的 Unicode 文本。"""
@@ -157,6 +180,113 @@ def _is_empty_message_region(window: Any, image, region: dict[str, int]) -> bool
     return background / total >= _EMPTY_CHAT_BACKGROUND_RATIO
 
 
+def _is_blank_canvas_run(image, x: int, y: int, run: int = _SELECTION_BLANK_RUN) -> bool:
+    """判断截图上从 (x, y) 开始的一段像素是否都是空白画布底色。"""
+    if image is None:
+        return False
+    for offset in range(run):
+        sample_x = x + offset
+        if sample_x < 0 or sample_x >= image.width or y < 0 or y >= image.height:
+            return False
+        pixel = image.getpixel((sample_x, y))
+        if tuple(pixel[:3]) != _EMPTY_CHAT_BACKGROUND:
+            return False
+    return True
+
+
+def _blank_canvas_run_x(
+    image, y: int, left: int, right: int, run: int = _SELECTION_BLANK_RUN
+) -> int | None:
+    """在截图第 y 行的 [left, right] 区间内寻找第一段连续画布底色的起始 x。
+
+    逐像素比较铺满整段消息区高度会明显拖慢一次读取，这里先把整行转成 RGB 字节串，
+    用 C 层的子串查找完成同样的判断；命中后还要校验像素对齐，避免把跨像素的巧合
+    匹配当成空白画布。
+    """
+    if image is None or y < 0 or y >= image.height:
+        return None
+    span_left = max(0, min(int(left), image.width))
+    span_right = max(0, min(int(right) + 1, image.width))
+    if span_right - span_left < run:
+        return None
+    row = image.crop((span_left, y, span_right, y + 1))
+    if row.mode != "RGB":
+        row = row.convert("RGB")
+    data = row.tobytes()
+    needle = bytes(_EMPTY_CHAT_BACKGROUND) * run
+    offset = 0
+    while True:
+        index = data.find(needle, offset)
+        if index < 0:
+            return None
+        if index % 3 == 0:
+            return span_left + index // 3
+        offset = index + 1
+
+
+def _find_selection_start(
+    window: Any, image, region: dict[str, int], top_offset: int = _SELECTION_TOP_DEAD_ZONE
+) -> tuple[int, int, str]:
+    """返回让 QQ 进入消息框选态的按下坐标（屏幕坐标）与起点来源。
+
+    按下点必须落在消息区域内的空白画布上：压在区域边界、分隔条命中区、头像或气泡
+    上的按下都不会进入多选态，区域顶部 ``top_offset`` 像素内也不行。QQ 的框选不要求
+    从左上角起手，但要求拖拽矩形至少覆盖到一条消息，因此这里从顶部命中区下方开始、
+    自上而下找第一处空白画布（优先气泡左侧的边距），再从那里向右下拖到右下角。
+    """
+    window_left = int(window.left)
+    window_top = int(window.top)
+    region_left = int(region["left"]) + _SELECTION_INSET
+    region_gutter_right = int(region["left"]) + _SELECTION_INSET + _SELECTION_GUTTER_WIDTH
+    region_top = int(region["top"]) + top_offset
+    region_right = int(region["right"]) - 1 - _SELECTION_INSET
+    region_bottom = int(region["bottom"]) - 1 - _SELECTION_INSET
+    if image is not None:
+        left = max(0, region_left - window_left)
+        gutter_right = min(image.width - 1, region_gutter_right - window_left)
+        top = max(0, region_top - window_top)
+        bottom = min(image.height - 1, region_bottom - window_top)
+        for y in range(top, bottom + 1, _SELECTION_BLANK_SCAN_STEP):
+            x = _blank_canvas_run_x(image, y, left, gutter_right)
+            if x is None:
+                continue
+            safe_x = find_non_resize_x(window_left + x, window_top + y, region_right)
+            if safe_x is None:
+                break
+            if safe_x == window_left + x:
+                return (safe_x, window_top + y, "blank-canvas")
+            # 分隔条命中区把起点推开了：在推开后的横坐标上重新确认空白画布。
+            if _is_blank_canvas_run(image, safe_x - window_left, y):
+                return (safe_x, window_top + y, "blank-canvas")
+    # 兜底：截图上找不到空白画布时，沿用左上角收缩 + 避开尺寸调整命中区的旧策略。
+    fallback_left = find_non_resize_x(region_left, region_top, region_right)
+    if fallback_left is None:
+        raise RuntimeError("QQ_MESSAGE_SELECTION_START_NOT_FOUND")
+    return (fallback_left, region_top, "inset-fallback")
+
+
+def _drag_until_copy_action(main_window: Any, start: tuple[int, int], end: tuple[int, int]):
+    """框选拖拽一次并轮询等待多选工具栏的复制按钮出现。
+
+    返回 ``(after, window, copy_action)``；超时未出现时 ``copy_action`` 为 ``None``。
+    """
+    drag(*start, *end, duration=_MESSAGE_SELECTION_DRAG_DURATION)
+    after = window = None
+    copy_action = None
+    deadline = time.perf_counter() + _SELECTION_COPY_WAIT_SECONDS
+    while time.perf_counter() < deadline:
+        time.sleep(_SELECTION_COPY_POLL_INTERVAL)
+        after, window = get_qq_window_image(main_window)
+        if after is None:
+            continue
+        copy_action = get_copy_action_region(window, after, threshold=0.88)
+        if copy_action is None:
+            copy_action = get_copy_action_region(window, after, threshold=0.80)
+        if copy_action is not None:
+            break
+    return after, window, copy_action
+
+
 class MessageList:
     """QQ 消息读取单例：会话激活、框选复制和剪贴板解析的唯一入口。"""
 
@@ -202,48 +332,53 @@ class MessageList:
                 copy_action_source = "template"
                 if copy_action is None:
                     region = self._refresh_message_region(main_window)
-                    # 区域上边是半开区间边界，+1 取真实内容第一像素；左边界则
-                    # 按当前光标命中区动态探测，不能使用固定内边距。QQ 的左侧
-                    # 分隔条命中区会把正常拖动变成调整布局。
-                    selection_top = region["top"] + 1
-                    selection_left = find_non_resize_x(
-                        region["left"],
-                        selection_top,
-                        region["right"] - 1,
+                    selection_end = (
+                        region["right"] - 1 - _SELECTION_INSET,
+                        region["bottom"] - 1 - _SELECTION_INSET,
                     )
-                    if selection_left is None:
-                        raise RuntimeError("QQ_MESSAGE_SELECTION_START_NOT_FOUND")
-                    selection_start = (selection_left, selection_top)
-                    selection_end = (region["right"] - 1, region["bottom"] - 1)
-                    metadata.update(
-                        messageRegion=region,
-                        dragHitStart=(region["left"], selection_top),
-                        dragFrom=selection_start,
-                        dragTo=selection_end,
-                    )
+                    # 区域锚点命中错误时，收缩后可能只剩一条缝：这种情况不再被当成空
+                    # 会话静默返回 0 条消息，而是按区域不可用直接报错。
+                    if (
+                        region["left"] + _SELECTION_INSET >= selection_end[0]
+                        or region["top"] + _SELECTION_TOP_DEAD_ZONE >= selection_end[1]
+                    ):
+                        raise RuntimeError("QQ_MESSAGE_REGION_TOO_SMALL")
                     if _is_empty_message_region(main_window, before, region):
                         metadata["emptyConversation"] = True
                         return ""
-                    if selection_start[0] >= selection_end[0] or selection_start[1] >= selection_end[1]:
-                        raise RuntimeError("QQ_MESSAGE_REGION_TOO_SMALL")
-                    drag(*selection_start, *selection_end, duration=_MESSAGE_SELECTION_DRAG_DURATION)
-                    deadline = time.perf_counter() + 2.0
-                    while time.perf_counter() < deadline:
-                        time.sleep(0.15)
-                        after, window = get_qq_window_image(main_window)
-                        if after is None:
-                            continue
-                        search_image = _copy_search_image(after)
-                        copy_action = get_copy_action_region(window, after, threshold=0.88)
-                        if copy_action is None:
-                            copy_action = get_copy_action_region(window, after, threshold=0.80)
-                        if copy_action is not None:
+                    after = window = None
+                    copy_action = None
+                    for attempt in range(_SELECTION_TOP_RETRY_LIMIT + 1):
+                        top_offset = _SELECTION_TOP_DEAD_ZONE * (attempt + 1)
+                        # 起点落在气泡左侧边距的空白画布上，并向下躲开顶部日期栏命中
+                        # 区；仍未进入框选态时把起点整体下移一个守卫高度重试。
+                        start_x, start_y, start_source = _find_selection_start(
+                            main_window, before, region, top_offset
+                        )
+                        selection_start = (start_x, start_y)
+                        metadata.update(
+                            messageRegion=region,
+                            dragInset=_SELECTION_INSET,
+                            dragTopOffset=top_offset,
+                            dragAttempt=attempt,
+                            dragStartSource=start_source,
+                            dragFrom=selection_start,
+                            dragTo=selection_end,
+                        )
+                        after, window, copy_action = _drag_until_copy_action(
+                            main_window, selection_start, selection_end
+                        )
+                        # 已进入框选态但没命中复制按钮时保留该截图：二次拖拽会清掉选区，
+                        # 反而把“已进框选、只是没找到按钮”误报成“未进入框选态”。
+                        if copy_action is not None or _selection_ui_changed(before, after):
                             break
                     if copy_action is None:
                         # 部分临时会话/特殊聊天使用纯文字工具栏，没有 copy_icon.png。
                         # 只在模板等待失败后做一次 OCR，避免普通路径承担额外耗时。
                         if after is None:
                             after, window = get_qq_window_image(main_window)
+                        if after is not None and search_image is None:
+                            search_image = _copy_search_image(after)
                         if after is not None:
                             copy_action = get_copy_action_region_by_text(window, after)
                             if copy_action is not None:
