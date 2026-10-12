@@ -228,14 +228,19 @@ def find_template(
         threshold=0.8,
         use_mask=False,
         multiscale=True,
+        *,
+        scales=None,
 ):
     """兼容旧调用：返回最佳 {x,y,left,top,right,bottom} 或 None。
 
     默认启用多尺度匹配以适配 DPI/窗口缩放；对性能敏感的调用可显式传入
-    ``multiscale=False`` 恢复固定尺寸匹配。
+    ``multiscale=False`` 恢复固定尺寸匹配，或传入 ``scales`` 只在给定尺度集合内
+    搜索（例如已知窗口 DPI，按 DPI 与模板基准的比例收窄到一个小范围）。
     """
-    # 用默认匹配器找全部候选
-    candidates = _DEFAULT_TEMPLATE_MATCHER.find_candidates(
+    # 显式给定尺度时新建匹配器，避免污染模块级默认匹配器
+    matcher = _DEFAULT_TEMPLATE_MATCHER if scales is None else TemplateMatcher(scales=tuple(scales))
+    # 找全部候选
+    candidates = matcher.find_candidates(
         big, small, threshold, use_mask, multiscale
     )
     # 无候选 → 未找到

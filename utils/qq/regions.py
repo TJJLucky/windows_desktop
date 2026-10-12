@@ -26,6 +26,8 @@ from .template_runtime import (find_template, load_image, record_frame, record_r
                               template_observations, restore_observations)
 # timer：给区域识别函数自动打耗时日志
 from ..core.timing import timer
+# window_dpi：读取窗口所在显示器的实际 DPI（模板尺寸随 DPI 变化时按比例缩放）
+from ..core.screenshot import window_dpi
 # get_qq_window_image / get_qq_windows：窗口截图与窗口列表
 from .window_ops import get_qq_window_image, get_qq_windows
 # 区域定位结果缓存（按窗口状态和模板版本失效）
@@ -59,6 +61,14 @@ class RegionResult:
 # copy_icon.png，既避免将聊天正文里的相似图形误识别为按钮，也避免对整窗做匹配。
 _COPY_ACTION_TOOLBAR_TOP_RATIO = 0.65
 _COPY_ICON_MATCH_THRESHOLD = 0.88
+
+# copy_icon.png 是在 120 DPI（125% 缩放）机器上截取的 40px 图标。其它电脑的物理
+# 像素尺寸 = 逻辑尺寸 × 显示器 DPI 缩放，所以匹配前要按窗口 DPI 与这个基准的比值
+# 缩放模板。真机复现：固定尺寸匹配只在 120 DPI 命中（分数 1.0），模拟 100%/150%/
+# 175%/200% 时分数掉到 ~0.47~0.53、低于阈值直接返回 None，读取静默失败。按 DPI
+# 缩放后各分辨率分数均 ≥0.93。允许 ±4% 余量覆盖 DPI 取整与渲染差异。
+_COPY_ICON_DPI_BASELINE = 120
+_COPY_ICON_DPI_SCALE_TOLERANCE = 0.04
 _COPY_TEXT = "复制"
 _COPY_TOOLBAR_COMPANION_TEXTS = frozenset({
     "逐条转发",
@@ -87,6 +97,20 @@ def _to_screen(window, region: dict) -> dict:
     }
 
 
+def _copy_icon_scales(window) -> tuple[float, ...] | None:
+    """按窗口所在显示器 DPI 生成 copy_icon 的候选尺度。
+
+    取不到 DPI 时返回 ``None``，交由 ``find_template`` 走默认的较宽多尺度集合，
+    保证异常环境仍有机会命中，而不是退回固定尺寸。
+    """
+    dpi = window_dpi(getattr(window, "_hWnd", 0))
+    if dpi <= 0:
+        return None
+    scale = min(3.0, max(0.5, dpi / _COPY_ICON_DPI_BASELINE))
+    offsets = (1 - _COPY_ICON_DPI_SCALE_TOLERANCE, 1.0, 1 + _COPY_ICON_DPI_SCALE_TOLERANCE)
+    return tuple(round(scale * offset, 4) for offset in offsets)
+
+
 @timer
 def get_copy_action_region(window, QQ_window_image=None, threshold: float | None = None) -> dict | None:
     """定位 QQ 多消息选择工具栏中的“复制”图标。
@@ -111,9 +135,9 @@ def get_copy_action_region(window, QQ_window_image=None, threshold: float | None
         toolbar_image,
         copy_icon,
         threshold=_COPY_ICON_MATCH_THRESHOLD if threshold is None else threshold,
-        # 模板与当前 QQ 截图均来自同一 DPI 下时，固定尺寸匹配更快；若后续支持多
-        # DPI 模板，可将这里改为 True，而无需改变调用层契约。
-        multiscale=False,
+        # 模板尺寸固定，但目标图标随显示器 DPI 缩放：按窗口 DPI 收窄候选尺度，
+        # 只在 DPI 期望值 ±4% 内搜索，兼顾跨电脑鲁棒性与匹配耗时。
+        scales=_copy_icon_scales(window),
         origin=(0, toolbar_top),
     )
     if matched is None:

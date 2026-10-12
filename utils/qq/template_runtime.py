@@ -106,8 +106,8 @@ def restore_observations(items):
         session["templates"].update(copy.deepcopy(items))
 
 
-def find_template(big, small, threshold=0.8, use_mask=False, multiscale=True, *, origin=(0, 0)):
-    result = _find_template(big, small, threshold, use_mask, multiscale)
+def find_template(big, small, threshold=0.8, use_mask=False, multiscale=True, *, origin=(0, 0), scales=None):
+    result = _find_template(big, small, threshold, use_mask, multiscale, scales=scales)
     _record_template(small, result, origin)
     return result
 
