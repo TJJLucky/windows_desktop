@@ -29,7 +29,8 @@ class Dispatcher:
 
     用法：
         op = Dispatcher()
-        contacts, exc = op.get_contact_list(timeout=60.0)
+        # payload = {"contacts": 会话名 → 行信息, "complete": 是否覆盖整张名单}
+        payload, exc = op.get_contact_list(timeout=60.0, all_contacts=False)
         ok, exc = op.send_message("DIsaac", "你好", timeout=60.0)
         messages, exc = op.read_message_list("DIsaac", timeout=60.0)
     """
@@ -151,12 +152,13 @@ class Dispatcher:
         except queue.Empty:
             return {}, TimeoutError("check_capture_ready task timeout")
 
-    def get_contact_list(self, timeout: float = 120.0, contact_name: str | None = None) -> Tuple[dict[str, dict], Optional[Exception]]:
-        """获取联系人列表，入队列串行执行，缓存过期会执行截图解析。"""
+    def get_contact_list(self, timeout: float = 120.0, contact_name: str | None = None,
+                         all_contacts: bool = False) -> Tuple[dict, Optional[Exception]]:
+        """获取联系人名单，入队列串行执行（all_contacts=True 时滚动扫掠整张名单）。"""
         # 结果队列（容量 1：只放一个 (result, exc)）
         res_q = queue.Queue(maxsize=1)
         # 入队
-        self.task_queue.put(("get_contact_list", (contact_name,), {}, res_q))
+        self.task_queue.put(("get_contact_list", (contact_name, all_contacts), {}, res_q))
         try:
             # 阻塞等待结果（最长 timeout 秒）
             return res_q.get(timeout=timeout)
@@ -200,9 +202,13 @@ class Dispatcher:
         win = ensure_qq_window_with_retry()
         return {"ready": True, "windowTitle": getattr(win, "title", None)}
 
-    def get_contact_list_impl(self, contact_name: str | None = None) -> dict[str, dict]:
-        """实际实现：读会话名单快照（无障碍树，昵称 → 行信息）。"""
-        return self.userList.get_user_list(contact_name)
+    def get_contact_list_impl(self, contact_name: str | None = None,
+                              all_contacts: bool = False) -> dict:
+        """实际实现：读会话名单（无障碍树，昵称 → 行信息）。
+
+        返回 ``{"contacts": ..., "complete": ...}``；all_contacts=True 时滚动扫掠整张名单。
+        """
+        return self.userList.get_user_list(contact_name, all_contacts)
 
     def send_message_impl(self, contact_name: str, text: str) -> bool:
         """实际实现：输入文本（内部自动激活会话）→ 快捷键发送。"""

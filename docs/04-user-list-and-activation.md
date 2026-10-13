@@ -13,22 +13,43 @@ HTTP 契约（`service/contracts.py`）与命令账本的目标口径统一为 `
 
 ## 名单读取
 
-`UserList.get_user_list(contact_name=None)` → `contact_lookup.list_contacts`：
-读无障碍树里的会话列表容器（`accessibility.pane`），返回
+`UserList.get_user_list(contact_name=None, all_contacts=False)`
+→ `contact_lookup.query_contacts`：读无障碍树里的会话列表容器（`accessibility.pane`），返回
 
 ```json
-{"汉艺材质包售后群": {"rect": [70, 275, 383, 355], "texts": [...],
-                     "active": true, "pinned": false,
-                     "copyable": true, "refused": false}}
+{"contacts": {"汉艺材质包售后群": {"rect": [70, 275, 383, 355], "texts": [...],
+                                "active": true, "pinned": false,
+                                "copyable": true, "refused": false,
+                                "unread": false, "unreadCount": null}},
+ "complete": true}
 ```
 
-含树里已渲染但滚出视口的行。两个注意点：
+`contacts` 含树里已渲染但滚出视口的行；`complete` 标注「这份名单是否覆盖了全部会话」，
+拿不准时一律 `false`，不谎报全量。三个注意点：
 
 - 元素树重建期会瞬时返回空名单，`read_pane` 等到「连续两次读到同一份名单」或 1.5s 超时才返回；
 - 默认筛掉两类读不了消息的会话（见下节的「不可复制会话过滤」），
-  `include_non_copyable=True` 时全部保留并用 `copyable=False` 标出（诊断用）。
+  `include_non_copyable=True` 时全部保留并用 `copyable=False` 标出（诊断用）；
+- 元素树只保留「视口附近约一屏半」的行，**默认只读当前一屏**（`complete` 由容器滚动能力与
+  「渲染行是否被视口边缘切断」判断）。
 
-指定 `contact_name` 时先按名字滚动定位，找不到抛 `QQ_CONTACT_NOT_FOUND`。
+### 整张名单（`all`）
+
+要一次拿到全部会话（不只当前一屏），用 `POST /v1/contacts:query {"all": true}`
+（服务层 `query_contacts(all_contacts=True)` → `scan_all_contacts`）：滚动扫掠每个段落再合并。
+
+- 容器发布 UIA `ScrollPattern` 时按百分比从顶到底逐段读，步长 = 已渲染行跨度 ×
+  `SCAN_SAFETY_RATIO`（0.5），相邻两段必然重叠；会话身份是昵称，重叠行按昵称去重（保留先读到的）。
+- 容器不发布该 Pattern 时退回滚轮：先上滚到名单不再变化（确认到顶），再逐段下滚累计到不再变化
+  （确认到底）。
+- 自检：相邻两段没有任何同行名 = 跳段 → 步长减半重扫（最多 `SCAN_GAP_RETRIES` 次）；
+  滚轮一次都没推动、且渲染行被视口边缘裁掉时同样报 `complete=false`。
+- 扫掠比一屏查询慢，服务层单独把超时从 120 s 放大到 180 s；扫掠结束后把列表滚回开始前的位置。
+- 真机实测（2026-10-13，hwnd=722622，10 个会话、列表不足一屏）：`all=true` 走滚轮兜底，
+  `rows=10 unique=7 complete=true`，热态约 1.0 s（同机默认一屏查询热态约 190 ms）。
+
+指定 `contact_name` 时先按名字滚动定位，找不到抛 `QQ_CONTACT_NOT_FOUND`；
+`all=true` 与 `contact_name` 同时给出时以全量扫掠为准（不做定位）。
 
 ## 按会话名定位与激活
 

@@ -105,8 +105,9 @@ class QqAutomationPort(Protocol):
         """复制当前激活行的 QQ 号。"""
         ...
 
-    def list_contacts(self, contact_name: str | None = None) -> dict[str, dict]:
-        """读取当前可见联系人列表，返回会话名 → 信息 dict。"""
+    def list_contacts(self, contact_name: str | None = None,
+                      all_contacts: bool = False) -> dict:
+        """读取联系人名单，返回 {"contacts": 会话名 → 信息 dict, "complete": 是否扫全}。"""
         ...
 
     def send_message(self, contact_name: str, text: str) -> dict:
@@ -157,15 +158,21 @@ class LegacyQqAutomationFacade:
             raise QqAutomationError(_operation_error_code(error, "QQ_CONTACT_NUMBER_IDENTIFY_FAILED")) from error
         return result
 
-    def list_contacts(self, contact_name: str | None = None) -> dict[str, dict]:
-        """读联系人列表：入队执行（最长等 60s），失败抛 QqAutomationError。"""
+    def list_contacts(self, contact_name: str | None = None,
+                      all_contacts: bool = False) -> dict:
+        """读联系人名单：入队执行，失败抛 QqAutomationError。
+
+        返回 ``{"contacts": 会话名 → 行信息, "complete": 是否覆盖整张名单}``；
+        ``all_contacts=True`` 时滚动扫掠全部会话（不只当前一屏），扫描更慢，因此单独放大超时。
+        """
         # Dispatcher 返回 (结果, 异常) 二元组：error 非空表示失败
-        contacts, error = (self._operator().get_contact_list(timeout=120.0, contact_name=contact_name)
-                           if contact_name else self._operator().get_contact_list(timeout=120.0))
+        timeout = 180.0 if all_contacts else 120.0
+        payload, error = self._operator().get_contact_list(
+            timeout=timeout, contact_name=contact_name, all_contacts=all_contacts)
         if error is not None:
             # 失败统一投影为业务错误（HTTP 层转 503），错误码带出失败阶段
             _raise_operation_error(error, contact_name or "", "QQ_CONTACTS_UNAVAILABLE")
-        return contacts
+        return payload
 
     def send_message(self, contact_name: str, text: str) -> dict:
         """发送消息：入队执行（最长等 60s），成功返回标准结果结构。"""

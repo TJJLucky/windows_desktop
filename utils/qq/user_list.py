@@ -7,7 +7,7 @@
 3. 激活 = 无障碍树里点中目标行 → 轮询聊天区标题确认（见 contact_lookup.activate）；
 4. 行区域裁切与激活态色带判定（is_active_bg）仍按图像做，供诊断接口使用。
 
-对外接口：activate（按会话名激活）、get_user_list（读会话名单快照）、
+对外接口：activate（按会话名激活）、get_user_list（读会话名单，all_contacts=True 时扫掠整张名单）、
 refresh_image（只刷新截图与区域）。
 """
 
@@ -34,7 +34,7 @@ class UserList:
     """QQ 会话列表管理器（单例）。
 
     持有会话列表截图与区域坐标（供未读红点/激活态等图像判定）；会话身份与定位
-    交给无障碍树：activate 按会话名激活，get_user_list 输出当前名单快照。
+    交给无障碍树：activate 按会话名激活，get_user_list 输出会话名单（默认当前一屏，all_contacts=True 时滚动扫掠整张名单）。
     """
 
     # 类级单例实例
@@ -260,12 +260,16 @@ class UserList:
         # 记录窗口句柄（激活用户时用）
         self.hwnd = main_window._hWnd
 
-    def get_user_list(self, contact_name: str | None = None):
-        """读取会话名单快照（无障碍树）：会话名 → {rect, texts, active, pinned, copyable, refused, unread, unreadCount}。
+    def get_user_list(self, contact_name: str | None = None, all_contacts: bool = False):
+        """读取会话名单（无障碍树）。
 
-        指定 contact_name 时先滚动确保目标在列表里（找不到抛 ContactNotFoundError）。
+        返回 ``{"contacts": 会话名 → {rect, texts, active, pinned, copyable, refused,
+        unread, unreadCount}, "complete": 是否覆盖整张名单}``。
+
+        指定 contact_name 时先滚动确保目标在列表里（找不到抛 ContactNotFoundError）；
+        all_contacts=True 时滚动扫掠整张名单，而不只是当前一屏。
         """
-        from .contact_lookup import list_contacts
+        from .contact_lookup import query_contacts
 
-        return list_contacts(contact_name)
+        return query_contacts(contact_name, all_contacts=all_contacts)
 

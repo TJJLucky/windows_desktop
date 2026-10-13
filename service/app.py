@@ -233,25 +233,33 @@ def create_app(
         "/v1/contacts:query",
         response_model=ListContactsResponse,
         summary="查询 QQ 联系人列表",
-        description="先读取当前屏幕的 QQ 用户列表；指定联系人或当前会话不可见时才滚动截图查找。返回的 contacts key 可原样用于消息读取、发送和聊天记录查询。",
+        description="默认读取当前一屏的 QQ 用户列表（all 缺省为 false，最快）；指定联系人或当前会话"
+                    "不可见时才滚动查找。all=true 时滚动扫掠整张会话名单，返回的 complete 标注是否"
+                    "确认扫全。返回的 contacts key 可原样用于消息读取、发送和聊天记录查询。",
         tags=["联系人"],
-        response_description="联系人列表和数量",
+        response_description="联系人列表、数量和是否完整",
     )
     def list_contacts(request: ListContactsRequest | None = None) -> ListContactsResponse:
         operation_started = time.perf_counter()
         try:
             # 同步端点：FastAPI 自动在（线程池）执行 QQ 视觉识别，事件循环不被阻塞
-            contacts = (facade.list_contacts(request.contact_name)
-                        if request and request.contact_name else facade.list_contacts())
-            logger.info("contacts.query.success count=%d", len(contacts))
+            payload = facade.list_contacts(
+                request.contact_name if request else None,
+                all_contacts=bool(request and request.all),
+            )
+            contacts = payload["contacts"]
+            logger.info("contacts.query.success count=%d complete=%s",
+                        len(contacts), payload["complete"])
         except QqAutomationError as exc:
             record_attempt("CONTACT_QUERY", operation_started, status="FAILED", failure_code=str(exc))
             logger.exception("contacts.query.error code=%s", exc)
             # QQ 操作失败（窗口不可用、识别失败等）统一返回 503，并把内部原因带给调用方
             raise HTTPException(status_code=503, detail=str(exc)) from exc
-        record_attempt("CONTACT_QUERY", operation_started, status="SUCCESS", details={"count": len(contacts)})
-        # 组装响应：联系人数组 + 数量
-        return ListContactsResponse(contacts=contacts, count=len(contacts))
+        record_attempt("CONTACT_QUERY", operation_started, status="SUCCESS",
+                       details={"count": len(contacts), "complete": payload["complete"]})
+        # 组装响应：联系人数组 + 数量 + 是否完整名单
+        return ListContactsResponse(
+            contacts=contacts, count=len(contacts), complete=payload["complete"])
 
     # —— 读取指定联系人的可见消息接口 ——
     @app.post(

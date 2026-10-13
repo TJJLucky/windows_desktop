@@ -18,7 +18,9 @@ FastAPI 只监听 `127.0.0.1` 的随机端口，endpoint 文件包含：
 
 - `GET /v1/health`：健康检查。
 - `POST /v1/capture:check`：检查 QQ 截图能力。
-- `POST /v1/contacts:query`：读取联系人列表。
+- `POST /v1/contacts:query`：读取联系人列表。请求体可选 `contactName`（先按名字滚动定位）
+  与 `all`（缺省 `false` = 只读当前一屏，最快；`true` = 滚动扫掠整张名单）；
+  响应为 `contacts` / `count` / `complete`，`complete=false` 表示这份名单没确认扫全。
 - `POST /v1/commands/read`：读取指定联系人可见消息。
 - `POST /v1/commands/send`：发送消息。
 - `GET /v1/commands/{commandId}`：查询命令状态。

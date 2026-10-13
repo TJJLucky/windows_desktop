@@ -117,7 +117,9 @@ pane rect (l,t,r,b) = (70, 115, 383, 1385)      行高 80px
 - **只给名字，不含 QQ 号**：号码只留一个诊断入口（`POST /v1/contacts/current:identify`,
   一次右键「复制 QQ 号」），业务链路不再碰号码（见
   [04-user-list-and-activation.md](04-user-list-and-activation.md)）；
-- 长列表仍要滚动：树里只保留「视口附近约一屏半」的行，更远的行不在树里；
+- 长列表仍要滚动（`/v1/contacts:query {"all":true}` 会扫掠整张名单，见
+  [04-user-list-and-activation.md](04-user-list-and-activation.md)）：树里只保留
+  「视口附近约一屏半」的行，更远的行不在树里；
   且名单**不足一屏时容器根本不发布 ScrollPattern**（真机实测 `IsScrollPatternAvailable=False`），
   百分比滚动定位不可用，此时自动回退滚轮扫掠；
 - 图片消息只有「图片」占位文字，拿不到本地文件路径（现网框选复制能给出 `<img src=...>`）；
@@ -152,7 +154,7 @@ POST /v1/commands/send   {"commandId":...,"contactName":"TJJ","text":"hi"} -> 42
   坑：外层名字会滞后 —— 真机实测出现过外层 `1条未读` 而内层文本 `3`
   （消息一直进、名字没刷），所以**条数以内层文本为准**；`99+` 只取第一段数字。
 - 对外字段：`/v1/contacts:query` 每行新增 `unread`（bool）与 `unreadCount`（int 或 null），
-  实现在 `utils/qq/contact_lookup.py:snapshot`（字段名沿用响应里的 camelCase 口径）。
+  实现在 `utils/qq/contact_lookup.py:_assemble`（字段名沿用响应里的 camelCase 口径）。
 
 真机实测（2026-10-13，`！` 会话 3 条未读）：
 
@@ -180,7 +182,7 @@ WARNING accessibility.scroll_state.retry attempt=2 reason=NULL COM pointer acces
 accessibility.connect hwnd=722622 previous=None      <- 这行之后进程就没了
 ```
 
-**定位**（`python -X faulthandler` 直接跑 `contact_lookup.list_contacts(name)`，可 100% 复现）：
+**定位**（`python -X faulthandler` 直接跑 `contact_lookup.query_contacts(name)`，可 100% 复现）：
 faulthandler 打出的原生栈是
 
 ```
@@ -224,8 +226,8 @@ window = cast(element, POINTER(UIA.IUIAutomationElement))   # ← 崩溃源
 
 | 项目 | 修前 | 修后 |
 | --- | --- | --- |
-| `list_contacts("不存在的名字")` ×3 | 第 3 轮进程 0xC0000005 退出 | 3 轮全部正常抛 `ContactNotFoundError` |
-| 80 轮 `snapshot` + `_reset()` + 强制 GC | — | 无崩溃 |
+| `query_contacts("不存在的名字")` ×3 | 第 3 轮进程 0xC0000005 退出 | 3 轮全部正常抛 `ContactNotFoundError` |
+| 80 轮 `_assemble`（原 `snapshot`）+ `_reset()` + 强制 GC | — | 无崩溃 |
 | `scroll_state`（名单不足一屏） | 6 次重连后报业务错误 | **10 ms** 内直接抛 `ScrollPatternUnsupported` |
 | 临时服务 `POST /v1/contacts:query` ×12 | 崩溃 | 12/12 存活（6 次空查询 200、6 次未知名 503 业务错误） |
 | `POST /v1/contacts/current:identify` ×3 | — | 3/3 200，返回 `3442859534`（717~1136 ms） |

@@ -46,6 +46,11 @@ class ListContactsRequest(StrictModel):
         title="待查找联系人", description="可选的已确认联系人名；无障碍树当前屏幕找不到时才滚动查找。",
         examples=["DIsaac"],
     )
+    all: bool = Field(
+        alias="all", default=False,
+        title="是否返回全部联系人",
+        description="true = 滚动扫掠整张 QQ 会话名单（不只当前一屏）；false（默认）= 只读当前一屏，最快。",
+    )
 
 
 class ListContactsResponse(StrictModel):
@@ -60,6 +65,11 @@ class ListContactsResponse(StrictModel):
         ge=0,
         title="联系人数量",
         description="本次返回的联系人数量。",
+    )
+    complete: bool = Field(
+        title="是否为完整名单",
+        description="true = 本次返回覆盖了整张会话名单；false = 只覆盖当前一屏，"
+                    "或全量扫掠未能确认扫全（列表容器能力不足 / 扫掠自检发现跳段）。",
     )
 
 

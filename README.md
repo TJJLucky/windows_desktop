@@ -112,7 +112,7 @@ endpoint 文件记录动态 loopback URL 与本次启动的进程 pid（无 toke
 | 方法 | 路径 | 作用 |
 | --- | --- | --- |
 | `GET` | `/v1/health` | 服务和 API 版本状态 |
-| `POST` | `/v1/contacts:query` | 读取当前 QQ 联系人 |
+| `POST` | `/v1/contacts:query` | 读取 QQ 会话名单（`{"all":true}` 滚动扫掠整张名单） |
 | `POST` | `/v1/contacts/current:identify` | 复制当前激活行的 QQ 号（诊断用，不发送） |
 | `POST` | `/v1/commands/read` | 读取指定联系人的可见消息 |
 | `POST` | `/v1/commands/send` | 向指定联系人发送消息 |
@@ -172,7 +172,7 @@ Content-Type: application/json
 | `window_ops.py` | QQ 进程/窗口枚举、快捷键唤起（Ctrl+Alt+X 打开/隐藏所有窗口，有进程无窗口时唤醒）、`get_main_window` / `ensure_qq_window_with_retry` |
 | `regions.py` | `RegionResult`；`get_userList_region_and_image` / `get_inputbox_region_and_image` / `get_message_box_region_and_image` / `get_input_buttom_region`；模板在 `templates/` |
 | `models.py` | 数据模型：`User`（`to_dict`） |
-| `user_list.py` | `UserList`（单例）：`activate`（按会话名激活，见 `contact_lookup`）、`get_user_list`（会话名单快照）、`refresh_image`（截图与区域，供红点/激活态图像判定） |
+| `user_list.py` | `UserList`（单例）：`activate`（按会话名激活，见 `contact_lookup`）、`get_user_list`（会话名单；`all_contacts=True` 扫掠整张名单）、`refresh_image`（截图与区域，供红点/激活态图像判定） |
 | `input.py` | `InputBox`（单例）：`send_text(contact_name, text)` 内部按会话名激活（无障碍树）→聚焦→剪贴板粘贴→Ctrl+V→按 Enter 快捷键发送 |
 | `message.py` | `MessageList`（单例）：`read_messages(contact_name)` 内部按会话名激活→判空（空白会话直接返回 0 条）→左上到右下框选→定位并点击 `copy_icon.png`→等剪贴板写入后退出多选→解析 sender/timestamp/text/rawText |
 | `hotkeys.py` | QQ 全局快捷键配置表（Ctrl+Alt+X 打开/隐藏所有窗口、Enter 发送）与 `send_hotkey` 发送原语 |
@@ -189,7 +189,9 @@ from utils.qq.dispatcher import Dispatcher
 
 op = Dispatcher()
 
-contacts, exc = op.get_contact_list(timeout=60.0)
+# payload = {"contacts": 会话名 → 行信息, "complete": 是否覆盖整张名单}
+# all_contacts=True 时滚动扫掠整张名单（不只当前一屏），更慢但更全
+payload, exc = op.get_contact_list(timeout=60.0)
 if exc is not None:
     raise exc
 
@@ -224,6 +226,7 @@ messages, exc = op.read_message_list("华强电子", timeout=120.0)
 无障碍树（`utils/qq/contact_lookup.py` + `utils/qq/accessibility.py`）：
 
 - `POST /v1/contacts:query` 可传 `{"contactName":"华强电子"}`：先读当前屏，未命中才在列表区滚动查找（优先 UIA `ScrollPattern` 按百分比定位，容器不发布该 Pattern 时退回滚轮逐段下滚）。
+- 要一次拿到**全部**会话用 `{"all": true}`：滚动扫掠每一段再按昵称合并，响应里的 `complete` 标注是否确认扫全（`false` = 没扫全，不要当全量用）。
 - 行自带屏幕物理像素矩形，命中行的中心点即点击坐标；已是当前会话时直接返回、不点击（点击已激活行会切掉激活高亮）。
 - 点击后在 4 秒窗口内轮询两个独立信号确认切换生效（聊天区标题 == 目标名，或目标行带上激活标记），两个信号每轮都判；同名多行报 `QQ_CONTACT_AMBIGUOUS`。
 - 名单快照默认筛掉 QQ 没给复制项的会话（`我的手机`、`QQ邮箱提醒` 等，判据见行结构），以及本机读过的“QQ 拒绝复制”会话（`QQ团队`、临时会话邀请卡片、只含系统占位消息的会话）。

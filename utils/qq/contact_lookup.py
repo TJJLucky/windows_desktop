@@ -16,6 +16,10 @@
    （真机实测："QQ团队"、临时会话的邀请卡片、只含系统占位消息的会话，见 record_refused_copy）；
    它们进不了可用名单，对它们发起消息读取时直接抛 ContactNotCopyableError，
    不再跑一遍十几秒的框选失败路径。
+6. ``query_contacts(all_contacts=True)`` 会滚动扫掠**整张名单**，不只当前一屏：
+   容器发布 UIA ScrollPattern 时按百分比从顶到底逐段读，未发布时退回滚轮；
+   相邻两段必须至少共享一行（重叠），一旦检测到跳段就把步长减半重扫，重扫仍跳段
+   时如实返回 ``complete=False``，不谎报"已拿到全部"。
 
 滚动扫掠的步长按"树里已渲染行的跨度 × SWEEP_SAFETY_RATIO"推出，因此相邻两段必然
 重叠、不会漏行；列表不足一屏（ScrollPattern 报不可滚动）时根本不进入扫掠。
@@ -67,6 +71,16 @@ SWEEP_SAFETY_RATIO = 0.8
 SWEEP_MIN_STEP_PERCENT = 5.0
 SWEEP_MAX_STEP_PERCENT = 50.0
 SWEEP_MAX_STEPS = 40
+
+# 全量名单扫掠（/v1/contacts:query 的 all=true）步长 = 已渲染行跨度 × 该比例。
+# 比查找单个联系人的 SWEEP_SAFETY_RATIO 更保守：漏读的行会静默消失在名单里，
+# 所以相邻两段至少重叠一半；上下限避免退化，步数上限兜底。
+SCAN_SAFETY_RATIO = 0.5
+SCAN_MIN_STEP_PERCENT = 1.0
+SCAN_MAX_STEP_PERCENT = 50.0
+SCAN_MAX_STEPS = 200
+# 相邻两段没有任何同行名 = 跳段：步长减半重扫，最多重扫 SCAN_GAP_RETRIES 次
+SCAN_GAP_RETRIES = 2
 
 # 滚轮回退：一次注入的滚轮量与最多注入次数（QQ 的滚轮滚动是带动画的，实测每次
 # 注入位移不稳定，因此回退路径按"名单不再变化"判定到底，而不是估算步长）
@@ -259,6 +273,17 @@ def _pane_signature(pane: AccessibilityPane) -> tuple:
     return tuple((row.name, row.rect) for row in pane.rows)
 
 
+def _rows_fit_pane(pane: AccessibilityPane) -> bool:
+    """树里渲染出的行是否整块落在列表区内（没有被视口上/下边缘切断）。
+
+    QQ 的元素树只保留视口附近的若干行：名单长于一屏时，首行或末行会被列表区边缘
+    裁掉，据此可判断"这一屏 != 整张名单"。名单为空时视为放得下。
+    """
+    if not pane.rows:
+        return True
+    return pane.rows[0].rect[1] >= pane.rect[1] and pane.rows[-1].rect[3] <= pane.rect[3]
+
+
 def read_pane(hwnd: int) -> AccessibilityPane:
     """读一屏名单，等到元素树稳定（连续两次读到同一份名单）再返回。"""
     deadline = time.monotonic() + SETTLE_TIMEOUT_SECONDS
@@ -303,20 +328,35 @@ def _selected_name(hwnd: int) -> str:
     return selected[0].name if len(selected) == 1 else ""
 
 
-def snapshot(hwnd: int, include_non_copyable: bool = False) -> dict[str, dict]:
-    """当前名单快照（昵称 → 行信息）；含树里已渲染但滚出视口的行。
+def _row_info(row: AccessibilityRow, refused: dict[str, dict]) -> dict:
+    """把一行翻成对外行信息（客户端直接消费的结构）。"""
+    return {
+        "rect": list(row.rect),
+        "texts": list(row.texts),
+        "active": row.selected,
+        "pinned": row.pinned,
+        "copyable": row.copyable,
+        "refused": row.name in refused,
+        "unread": row.unread,
+        "unreadCount": row.unread_count,
+    }
 
-    默认筛掉 QQ 没提供框选复制的服务/系统会话（"我的手机""QQ邮箱提醒"这类）：
-    它们读不了消息，留在名单里只会让调用方（和真机测试）走到 4 秒的失败路径。
-    ``include_non_copyable=True`` 时全部保留，并用行信息里的 ``copyable=False``
+
+def _assemble(rows, refused: dict[str, dict],
+              include_non_copyable: bool) -> dict[str, dict]:
+    """把（可能跨多段、段落间有重叠的）行序列合并成 昵称 → 行信息 映射。
+
+    会话身份就是昵称（与定位、激活、读消息的口径一致）；重叠段落里同一行会被读到多次，
+    按昵称去重、保留第一次读到的那个。默认筛掉 QQ 没提供框选复制的服务/系统会话
+    （"我的手机""QQ邮箱提醒"这类）：它们读不了消息，留在名单里只会让调用方走到 4 秒的
+    失败路径；``include_non_copyable=True`` 时全部保留，并用行信息里的 ``copyable=False``
     标出被筛掉的那些（诊断用）。
     """
-    pane = read_pane(hwnd)
-    refused = confirmed_refusals()
     contacts: dict[str, dict] = {}
     filtered: list[str] = []
     refused_in_view: list[str] = []
-    for row in pane.rows:
+    duplicates: list[str] = []
+    for row in rows:
         if not row.name:
             continue
         if not row.copyable and not include_non_copyable:
@@ -325,20 +365,20 @@ def snapshot(hwnd: int, include_non_copyable: bool = False) -> dict[str, dict]:
         if row.name in refused and not include_non_copyable:
             refused_in_view.append(row.name)
             continue
-        contacts[row.name] = {
-            "rect": list(row.rect),
-            "texts": list(row.texts),
-            "active": row.selected,
-            "pinned": row.pinned,
-            "copyable": row.copyable,
-            "refused": row.name in refused,
-            "unread": row.unread,
-            "unreadCount": row.unread_count,
-        }
+        if row.name in contacts:
+            duplicates.append(row.name)
+            continue
+        contacts[row.name] = _row_info(row, refused)
+    # 重叠段落会把同一行读多次，日志按名字去重后再打，避免噪声
     if filtered:
-        logger.info("contacts.snapshot filtered_non_copyable names=%s", filtered)
+        logger.info("contacts.assemble filtered_non_copyable names=%s",
+                    list(dict.fromkeys(filtered)))
     if refused_in_view:
-        logger.info("contacts.snapshot filtered_refused names=%s", refused_in_view)
+        logger.info("contacts.assemble filtered_refused names=%s",
+                    list(dict.fromkeys(refused_in_view)))
+    if duplicates:
+        logger.debug("contacts.assemble overlap_duplicates names=%s",
+                     list(dict.fromkeys(duplicates)))
     return contacts
 
 
@@ -503,6 +543,150 @@ def _restore_position(hwnd: int, percent: float | None) -> None:
         return
 
 
+# ── 全量名单扫掠（/v1/contacts:query 的 all=true）─────────────────────
+# 树里只保留"视口附近约一屏半"的行，所以要让调用方拿到整张名单，必须滚动扫掠每一段
+# 再合并。两条路径：
+#   1. 容器发布 UIA ScrollPattern：按百分比从顶到底逐段读（SetScrollPercent 约 2~9ms，
+#      每段重读一屏约 40~150ms）；步长取"已渲染行跨度的一半"以内，相邻两段必然重叠；
+#   2. 容器不发布 ScrollPattern：退回滚轮，先上滚到名单不再变化（确认到顶），再逐段
+#      下滚累计，直到名单不再变化（确认到底）。
+# 自检：相邻两段必须至少共享一行名，检测到跳段就把步长减半重扫；重扫仍跳段时
+# ``complete=False``——宁可告诉调用方"没扫全"，也不谎报全量。
+def _scan_step_percent(state, pane: AccessibilityPane, ratio: float) -> float:
+    """扫掠步长：不超过"已渲染行跨度"的 ratio，保证相邻两段重叠。"""
+    viewport = float(max(1, pane.rect[3] - pane.rect[1]))
+    content = state.content_height(viewport)
+    if not pane.rows:
+        return SCAN_MIN_STEP_PERCENT
+    span = float(max(1, pane.rows[-1].rect[3] - pane.rows[0].rect[1]))
+    step = ratio * span / content * 100.0
+    return min(SCAN_MAX_STEP_PERCENT, max(SCAN_MIN_STEP_PERCENT, step))
+
+
+def _scan_by_percent(
+        hwnd: int, ratio: float) -> tuple[list[AccessibilityRow], bool, bool]:
+    """按 ScrollPattern 百分比从列表顶部扫到底部，逐段收行。
+
+    返回 ``(行, 是否扫全, 容器是否发布 ScrollPattern)``。跳段时"是否扫全"为 False，
+    由调用方加密步长重扫；容器不发布 ScrollPattern 时第三个值为 False，交给滚轮路径。
+    """
+    try:
+        state = accessibility_scroll_state(hwnd)
+    except AccessibilityUnavailableError:
+        return [], False, False
+    pane = read_pane(hwnd)
+    if not state.scrollable:
+        # 名单不足一屏：当前这一屏就是全部
+        return list(pane.rows), True, True
+    try:
+        state = accessibility_set_scroll_percent(hwnd, 0.0)
+    except AccessibilityUnavailableError:
+        return [], False, True
+    rows: list[AccessibilityRow] = []
+    previous_names: set[str] | None = None
+    step = 0.0
+    percent = 0.0
+    for _ in range(SCAN_MAX_STEPS):
+        pane = read_pane(hwnd)
+        names = {row.name for row in pane.rows if row.name}
+        # 相邻两段没有任何同行名 = 步长跨过了整段：报"未扫全"，由调用方加密重扫
+        if previous_names and names and not (previous_names & names):
+            logger.warning("contacts.scan.gap percent=%.2f step=%.2f", percent, step)
+            return rows, False, True
+        rows.extend(pane.rows)
+        previous_names = names
+        if percent >= 100.0:
+            return rows, True, True
+        step = _scan_step_percent(state, pane, ratio)
+        percent = min(100.0, percent + step)
+        try:
+            state = accessibility_set_scroll_percent(hwnd, percent)
+        except AccessibilityUnavailableError:
+            return rows, False, True
+    logger.warning("contacts.scan.step_limit steps=%d", SCAN_MAX_STEPS)
+    return rows, False, True
+
+
+def _scan_by_wheel(hwnd: int) -> tuple[list[AccessibilityRow], bool]:
+    """滚轮全量扫掠（容器不发布 ScrollPattern 时的回退）。
+
+    先上滚到名单不再变化（确认到顶），再逐段下滚累计，直到名单不再变化（确认到底）。
+    """
+    pane = read_pane(hwnd)
+    x = (pane.rect[0] + pane.rect[2]) // 2
+    y = (pane.rect[1] + pane.rect[3]) // 2
+    previous = _pane_signature(pane)
+    # 目标可能在视口上方：只向下滚会漏掉前面那些会话，先回到顶部
+    for _ in range(WHEEL_MAX_STEPS):
+        with WindowCaptureCtx(hwnd):
+            scroll_at(x, y, -WHEEL_DELTA)
+        pane = read_pane(hwnd)
+        signature = _pane_signature(pane)
+        if signature == previous:
+            break
+        previous = signature
+    rows: list[AccessibilityRow] = list(pane.rows)
+    complete = False
+    moved = False
+    for _ in range(WHEEL_MAX_STEPS):
+        with WindowCaptureCtx(hwnd):
+            scroll_at(x, y, WHEEL_DELTA)
+        pane = read_pane(hwnd)
+        signature = _pane_signature(pane)
+        if signature == previous:
+            # 名单不再变化 = 滚到底；但只有"确实滚动过"或"这一屏本身没被视口边缘切断"
+            # 时才敢说扫全：滚轮被吞（一次都没动）且行被裁掉时，名单多半还有没读到的
+            # 段落，此时如实报 complete=False，不谎报全量。
+            complete = moved or _rows_fit_pane(pane)
+            break
+        rows.extend(pane.rows)
+        previous = signature
+        moved = True
+    return rows, complete
+
+
+def _screen_is_complete(hwnd: int, pane: AccessibilityPane) -> bool:
+    """当前这一屏是否就等于整张名单。
+
+    判据：容器明确报"不可滚动"，或树里渲染出的行整块都完整落在列表区内（没有被视口
+    边缘切断）——后者覆盖容器不发布 ScrollPattern、读不到滚动状态的机器。不确定时不谎报。
+    """
+    try:
+        if not accessibility_scroll_state(hwnd).scrollable:
+            return True
+    except AccessibilityUnavailableError:
+        pass
+    return _rows_fit_pane(pane)
+
+
+def scan_all_contacts(hwnd: int,
+                      include_non_copyable: bool = False) -> tuple[dict[str, dict], bool]:
+    """读整张会话名单：滚动扫掠全部段落，返回 ``(昵称 → 行信息, 是否确认扫全)``。
+
+    扫掠结束后把列表滚回开始前的位置（未扫全也一样），不把用户的名单留在别处。
+    """
+    started = time.monotonic()
+    home = _scroll_percent(hwnd)
+    ratio = 1.0
+    rows: list[AccessibilityRow] = []
+    complete = False
+    published = True
+    for attempt in range(SCAN_GAP_RETRIES + 1):
+        rows, complete, published = _scan_by_percent(hwnd, ratio)
+        if complete or not published:
+            break
+        # 跳段：步长减半重扫（重扫一定从列表顶部开始）
+        ratio /= 2.0
+        logger.info("contacts.scan.retry attempt=%d ratio=%.3f", attempt + 1, ratio)
+    if not published:
+        rows, complete = _scan_by_wheel(hwnd)
+    _restore_position(hwnd, home)
+    contacts = _assemble(rows, confirmed_refusals(), include_non_copyable)
+    logger.info("contacts.scan rows=%d unique=%d complete=%s duration_ms=%.1f",
+                len(rows), len(contacts), complete, (time.monotonic() - started) * 1000)
+    return contacts, complete
+
+
 # ── 对外操作 ────────────────────────────────────────────────────────
 def activate(contact_name: str, hwnd: int | None = None) -> str:
     """按昵称定位并激活会话，返回昵称（不切换到别的会话）。
@@ -546,16 +730,27 @@ def activate(contact_name: str, hwnd: int | None = None) -> str:
         time.sleep(ACTIVATE_CONFIRM_INTERVAL_SECONDS)
 
 
-def list_contacts(contact_name: str | None = None,
-                  include_non_copyable: bool = False) -> dict[str, dict]:
-    """读会话名单快照；指定昵称时先按昵称滚动定位（未找到抛 ContactNotFoundError）。
+def query_contacts(contact_name: str | None = None,
+                   include_non_copyable: bool = False,
+                   all_contacts: bool = False) -> dict:
+    """服务层入口：返回 ``{"contacts": 昵称 → 行信息, "complete": 是否覆盖整张名单}``。
 
-    默认只返回能读消息的会话（见 snapshot）；``include_non_copyable=True`` 用于诊断。
+    默认只读当前一屏；``all_contacts=True`` 时滚动扫掠整张名单（不只当前一屏）。
+    指定 ``contact_name`` 时先按昵称滚动定位（未找到抛 ContactNotFoundError）。
+    ``complete`` 如实标注"这份名单是否覆盖了全部会话"：容器能力或扫掠自检不能确认时
+    返回 False，绝不谎报全量。
     """
     hwnd = ensure_qq_window_with_retry()._hWnd
+    if all_contacts:
+        contacts, complete = scan_all_contacts(hwnd, include_non_copyable)
+        return {"contacts": contacts, "complete": complete}
     if contact_name:
         locate(contact_name, hwnd=hwnd)
-    return snapshot(hwnd, include_non_copyable=include_non_copyable)
+    pane = read_pane(hwnd)
+    return {
+        "contacts": _assemble(pane.rows, confirmed_refusals(), include_non_copyable),
+        "complete": _screen_is_complete(hwnd, pane),
+    }
 
 
 def ensure_message_copy_supported(contact_name: str, hwnd: int | None = None) -> None:
