@@ -108,12 +108,12 @@ def create_app(
     )
 
     def record_attempt(
-        operation: str, started: float, *, qq_number: str | None = None,
+        operation: str, started: float, *, contact_name: str | None = None,
         status: str, failure_code: str | None = None, details: dict | None = None,
     ) -> None:
         try:
             chat_history.record_operation(
-                request_id=_request_id_var.get(), operation=operation, qq_number=qq_number,
+                request_id=_request_id_var.get(), operation=operation, contact_name=contact_name,
                 status=status, failure_code=failure_code,
                 duration_ms=(time.perf_counter() - started) * 1000, details=details,
             )
@@ -241,8 +241,8 @@ def create_app(
         operation_started = time.perf_counter()
         try:
             # 同步端点：FastAPI 自动在（线程池）执行 QQ 视觉识别，事件循环不被阻塞
-            contacts = (facade.list_contacts(request.qq_number)
-                        if request and request.qq_number else facade.list_contacts())
+            contacts = (facade.list_contacts(request.contact_name)
+                        if request and request.contact_name else facade.list_contacts())
             logger.info("contacts.query.success count=%d", len(contacts))
         except QqAutomationError as exc:
             record_attempt("CONTACT_QUERY", operation_started, status="FAILED", failure_code=str(exc))
@@ -266,25 +266,25 @@ def create_app(
         operation_started = time.perf_counter()
         try:
             # 同步端点：FastAPI 自动在线程池执行 QQ 原生框选复制与文本解析
-            payload = facade.read_messages(request.qq_number)
+            payload = facade.read_messages(request.contact_name)
             logger.info(
                 "messages.read.success contact=%s count=%d",
-                request.qq_number,
+                request.contact_name,
                 len(payload.get("messages", [])),
             )
         except QqContactNotFoundError as exc:
-            record_attempt("READ", operation_started, qq_number=request.qq_number, status="FAILED", failure_code="QQ_CONTACT_NOT_FOUND")
-            logger.info("messages.read.contact_not_found contact=%s", request.qq_number)
+            record_attempt("READ", operation_started, contact_name=request.contact_name, status="FAILED", failure_code="QQ_CONTACT_NOT_FOUND")
+            logger.info("messages.read.contact_not_found contact=%s", request.contact_name)
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except QqAutomationError as exc:
-            record_attempt("READ", operation_started, qq_number=request.qq_number, status="FAILED", failure_code=str(exc))
-            logger.exception("messages.read.error contact=%s code=%s", request.qq_number, exc)
+            record_attempt("READ", operation_started, contact_name=request.contact_name, status="FAILED", failure_code=str(exc))
+            logger.exception("messages.read.error contact=%s code=%s", request.contact_name, exc)
             # QQ 操作失败 → 503（不会把读取结果落库，因为根本没读到）
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         # 读到的可见消息自动落库（供聊天记录查询），失败仅告警不阻断
-        _record_payload(chat_history, request.qq_number, payload)
+        _record_payload(chat_history, request.contact_name, payload)
         record_attempt(
-            "READ", operation_started, qq_number=request.qq_number, status="SUCCESS",
+            "READ", operation_started, contact_name=request.contact_name, status="SUCCESS",
             details={"count": len(payload.get("messages", []))},
         )
         # 校验并返回读取结果（payload 是 dict，用模型校验后返回，保证 schema 一致性）
@@ -305,17 +305,17 @@ def create_app(
         logger.info(
             "message.send.begin command_id=%s contact=%s text_length=%d",
             request.command_id,
-            request.qq_number,
+            request.contact_name,
             len(request.text),
         )
         try:
             # 先向账本申请执行：begin 返回 (是否真正执行, 当前状态, 已有结果)。
             # 相同 commandId 相同消息体 → 幂等返回已有结果不重发；相同 ID 不同消息体 → 抛 409
             execute, current_status, result = ledger.begin(
-                request.command_id, request.qq_number, request.text
+                request.command_id, request.contact_name, request.text
             )
         except CommandConflictError as exc:
-            record_attempt("SEND", operation_started, qq_number=request.qq_number, status="FAILED", failure_code=str(exc))
+            record_attempt("SEND", operation_started, contact_name=request.contact_name, status="FAILED", failure_code=str(exc))
             logger.warning("message.send.conflict command_id=%s", request.command_id)
             # 冲突（同一 commandId 配不同消息体）→ 409，明确告知调用方
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -329,19 +329,19 @@ def create_app(
             return CommandResponse(commandId=request.command_id, status=current_status, result=result)
         try:
             # 真正执行发送：FastAPI 线程池里跑视觉定位输入框 + 粘贴 + 快捷键发送
-            result = facade.send_message(request.qq_number, request.text)
+            result = facade.send_message(request.contact_name, request.text)
         except QqAutomationError as exc:
             logger.exception("message.send.failed command_id=%s", request.command_id)
             # 发送失败：构造失败结果并让账本落 FAILED 终态（不会留下悬空的 RUNNING）
             result = {"ok": False, "sent": False, "textLength": len(request.text), "error": str(exc)}
-            record_attempt("SEND", operation_started, qq_number=request.qq_number, status="FAILED", failure_code=str(exc))
+            record_attempt("SEND", operation_started, contact_name=request.contact_name, status="FAILED", failure_code=str(exc))
             ledger.resolve(request.command_id, "FAILED", result)
             # 返回 FAILED 状态给调用方
             return CommandResponse(commandId=request.command_id, status="FAILED", result=result)
         # 发送成功：账本落 SUCCEEDED 终态。聊天历史以后续 QQ 原生复制结果为准；
         # 服务不按正文猜测哪个复制记录对应这次发送。
         ledger.resolve(request.command_id, "SUCCEEDED", result)
-        record_attempt("SEND", operation_started, qq_number=request.qq_number, status="SUCCESS")
+        record_attempt("SEND", operation_started, contact_name=request.contact_name, status="SUCCESS")
         logger.info("message.send.success command_id=%s", request.command_id)
         # 返回 SUCCEEDED 状态 + 实际执行结果
         return CommandResponse(commandId=request.command_id, status="SUCCEEDED", result=result)
@@ -382,26 +382,26 @@ def create_app(
     def query_chat_history(request: ChatHistoryRequest) -> ChatHistoryResponse:
         # 每次查询先做一次 QQ 原生复制（拉到最新消息），再返回历史，保证数据新鲜
         try:
-            payload = facade.read_messages(request.qq_number)
+            payload = facade.read_messages(request.contact_name)
         except QqAutomationError:
             # QQ 复制或文本解析失败：不阻断历史查询，只把更新标记为 failed 告知调用方
-            logger.warning("chat.history.update_failed contact=%s", request.qq_number)
+            logger.warning("chat.history.update_failed contact=%s", request.contact_name)
             update = "failed"  # 自动更新失败不阻断历史查询
         else:
             # 读取成功：把新消息落库，更新标记为 ok
-            _record_payload(chat_history, request.qq_number, payload)
+            _record_payload(chat_history, request.contact_name, payload)
             logger.info(
                 "chat.history.update_ok contact=%s visible_count=%d",
-                request.qq_number,
+                request.contact_name,
                 len(payload.get("messages", [])),
             )
             update = "ok"
         # 从存储中取出该联系人的历史消息（按 seq 升序）
-        messages = chat_history.get_history(request.qq_number)
-        logger.info("chat.history.query contact=%s update=%s count=%d", request.qq_number, update, len(messages))
+        messages = chat_history.get_history(request.contact_name)
+        logger.info("chat.history.query contact=%s update=%s count=%d", request.contact_name, update, len(messages))
         # 返回 QQ 号、消息条数、消息列表与本次更新状态
         return ChatHistoryResponse(
-            qqNumber=request.qq_number,
+            contactName=request.contact_name,
             count=len(messages),
             messages=messages,
             copiedText=payload.get("copiedText") if update == "ok" else None,
@@ -412,10 +412,10 @@ def create_app(
     return app
 
 
-def _record_payload(chat_history: ChatHistoryStore, qq_number: str, payload: dict) -> None:
+def _record_payload(chat_history: ChatHistoryStore, contact_name: str, payload: dict) -> None:
     """把一次复制解析结果作为可见窗口差异写入聊天记录存储。"""
     try:
-        inserted = chat_history.append_visible(qq_number, payload["messages"])
-        logger.info("chat.history.append qq=%s inserted=%d", qq_number, inserted)
+        inserted = chat_history.append_visible(contact_name, payload["messages"])
+        logger.info("chat.history.append contact=%s inserted=%d", contact_name, inserted)
     except Exception:
-        logger.exception("chat.history.append_failed qq=%s", qq_number)
+        logger.exception("chat.history.append_failed contact=%s", contact_name)

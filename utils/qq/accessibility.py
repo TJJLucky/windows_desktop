@@ -12,14 +12,14 @@ QQ NT 基于 Chromium，默认向 Windows 发布 UI Automation 无障碍树（�
 - 行 ClassName 带标记：recent-contact-item--selected 是当前打开的会话，
   recent-contact-item--top 是置顶。
 
-聊天区同样被完整暴露，因此"读消息"也不必再框选复制+OCR（真机实测 1280x1390）：
+聊天区也暴露了会话名与消息区矩形，本模块只用这两样（真机实测 1280x1390）：
 
-- chat-header__contact-name 直接给出当前会话名，不必对会话列表做 OCR 复核；
-- chat-msg-area__vlist（Name="消息列表"）下每条 message 元素含
-  message__timestamp / avatar-span / msg-content-container，
-  即时间、发送人、正文（@ 原样保留，图片与表情为"图片"/"表情"占位）；
-- 一次读取约 90ms（热读 74ms），对比现网框选复制同内容 1770ms；
-- 树里同样保留已滚出视口的消息（rect 为负），按消息区矩形求交集即得"当前可见"。
+- chat-header__contact-name 直接给出当前会话名，激活目标会话后用它复核，
+  不必再对会话列表做 OCR 复核；
+- chat-msg-area__vlist（Name="消息列表"）的容器矩形，作为消息区定位失败的兜底锚点。
+
+消息正文按最终口径仍走 QQ 原生框选复制（见 utils/qq/message.py），不用无障碍树读正文；
+两种读法的实测对比与取舍见 docs/13-accessibility-tree.md。
 
 已知边界（调用方要兜住）：
 - 只给名字，不含 QQ 号 —— 号码仍要靠右击菜单"复制 QQ 号"取得；
@@ -46,10 +46,8 @@ import comtypes
 from comtypes import POINTER, cast
 # UIA：IUIAutomationClient 类型与属性/控件类型常量
 import comtypes.gen.UIAutomationClient as UIA
-# Application：按窗口句柄连接进程
-from pywinauto.application import Application
-# IUIA：pywinauto 持有的 IUIAutomation 单例（避免自建 COM 对象）
-from pywinauto.uia_defines import IUIA
+# Application / IUIA 一律延迟导入（见下方 _uia_client）：导入即创建 COM 单例，
+# 必须发生在真正使用它的线程里。
 
 
 logger = logging.getLogger("qq_service.accessibility")
@@ -64,6 +62,8 @@ MENU_CLASS_MARKER = "menu"
 ROW_SELECTED_MARKER = "--selected"
 # 行 ClassName 里表示"置顶"的标记
 ROW_PINNED_MARKER = "--top"
+# 行内"内容块"的 ClassName 关键字：会话行的头像/文本子元素都挂在它下面
+ROW_CONTENT_CLASS_MARKER = "item__content"
 
 # 消息区容器的 Name 属性（QQ 自报的本地化名字）
 MESSAGE_AREA_NAME = "消息列表"
@@ -84,6 +84,8 @@ MESSAGE_TIP_CLASS_MARKER = "gray-tip"
 # 当前会话名元素的 ClassName
 CHAT_NAME_CLASS_MARKER = "chat-header__contact-name"
 
+# UIA ScrollPattern 的"不改变该方向"取值（SetScrollPercent 的水平参数）
+NO_SCROLL_PERCENT = -1.0
 # 连接句柄的超时（秒）；超时通常是窗口不属于当前进程或 QQ 刚重启
 CONNECT_TIMEOUT_SECONDS = 2.0
 # 枚举失败（多为窗口捕获面/元素树瞬时重建）的重试次数与间隔
@@ -113,6 +115,43 @@ def is_transient_error(error: BaseException) -> bool:
     return isinstance(error, ValueError) and "COM pointer" in str(error)
 
 
+# pywinauto 的 IUIAutomation 客户端是进程级单例，COM 单元归属于"创建它的那个
+# 线程"：在 A 线程创建、B 线程使用时，COM 要把调用封送回 A 线程的单元，而 A 线程
+# 通常正阻塞在 Dispatcher 的任务队列等待上 → 调用永久挂死（真机复现：服务主线程
+# 导入本模块后，worker 线程首次读元素属性就卡死，120s 后才由队列超时兜底）。
+# 因此 pywinauto 延迟到"第一次真正执行 UIA 调用"的线程里导入，并固定归属线程；
+# 之后从别的线程调用立刻抛 AccessibilityUnavailableError（可回退、可重试），
+# 而不是无声挂死。
+_UIA_CLIENT_LOCK = threading.Lock()
+_UIA_OWNER_THREAD: int | None = None
+
+
+def _uia_client():
+    """按需导入 pywinauto 的 UIA 客户端，并把归属线程固定为当前线程。
+
+    返回 ``(Application, IUIA)``；非归属线程调用直接抛业务错误，不进入 COM。
+    """
+    global _UIA_OWNER_THREAD
+    ident = threading.get_ident()
+    if _UIA_OWNER_THREAD is None:
+        with _UIA_CLIENT_LOCK:
+            if _UIA_OWNER_THREAD is None:
+                _UIA_OWNER_THREAD = ident
+    elif _UIA_OWNER_THREAD != ident:
+        raise AccessibilityUnavailableError(
+            "UIA client belongs to thread {owner}, called from thread {current}".format(
+                owner=_UIA_OWNER_THREAD, current=ident))
+    # 延迟导入：导入即创建 IUIA 单例，必须发生在归属线程里
+    from pywinauto.application import Application
+    from pywinauto.uia_defines import IUIA
+    return Application, IUIA
+
+
+def _iuia():
+    """当前线程的 IUIAutomation 客户端对象（首次调用时在本线程创建单例）。"""
+    return _uia_client()[1]().iuia
+
+
 @dataclass(frozen=True)
 class AccessibilityRow:
     """无障碍树里的一行会话。坐标是屏幕物理像素（UI Automation 直接给出）。"""
@@ -127,6 +166,9 @@ class AccessibilityRow:
     selected: bool
     # 是否为置顶会话（ClassName 带 --top）
     pinned: bool
+    # 该会话是否支持聊天区框选复制；False = QQ 没给复制项（"我的手机""QQ邮箱提醒"
+    # 这类服务/系统会话，真机实测复制按钮呈斜杠禁用态、剪贴板不变）
+    copyable: bool
 
     @property
     def center(self) -> tuple[int, int]:
@@ -168,6 +210,58 @@ class AccessibilityPane:
     def rows_named(self, name: str) -> tuple[AccessibilityRow, ...]:
         """按昵称精确匹配的行（同名多行时全部返回，由调用方判歧义）。"""
         return tuple(row for row in self.rows if row.name == name)
+
+
+@dataclass(frozen=True)
+class AccessibilityScroll:
+    """会话列表容器的 UIA 滚动状态（ScrollPattern 直读）。
+
+    Chromium 的滚动容器都发布 ScrollPattern：``view_size_percent`` 是"视口高度占
+    内容总高度的百分比"，因此内容总高度 = 列表高度 / (view_size/100)；把目标位置
+    换算成百分比后用 SetScrollPercent 一步到位，不必估算滚轮步长（真机实测
+    SetScrollPercent 约 2~9ms，重读一屏行约 40~65ms）。
+    """
+
+    # 视口高度占内容高度的百分比（100 表示内容不足一屏，无需滚动）
+    view_size_percent: float
+    # 当前垂直滚动位置（0~100）
+    position_percent: float
+    # 容器当前是否可垂直滚动
+    scrollable: bool
+
+    def content_height(self, viewport_height: float) -> float:
+        """由视口百分比换算内容总高度（像素）。"""
+        if self.view_size_percent <= 0:
+            return float(viewport_height)
+        return float(viewport_height) * 100.0 / min(100.0, self.view_size_percent)
+
+
+def _row_copyable(iuia, element) -> bool:
+    """判断一行会话在聊天区是否还留着框选复制（QQ 的复制项）。
+
+    QQ 的服务/系统会话（真机实测："我的手机""QQ邮箱提醒"）行内"内容块"
+    （ClassName 含 item__content）下直接挂着一个无类名、无名字的 Image —— 它们的头像是
+    <img> 元素；普通好友/群的行内没有任何 Image 子元素（真机实测 26 行名单里只有这两行
+    命中）。这几类会话在聊天区被 QQ 禁用了框选复制（进入多选态后复制按钮变斜杠禁用态、
+    剪贴板不变），因此提前标注出来，由 contact_lookup 把它们筛出可用名单。
+
+    只认"无类名、无名字、直属于内容块"的 Image：免打扰/未读角标这类图标是带类名的
+    Group（或其子节点），不会误命中；判据是 DOM 结构，与 DPI、窗口尺寸无关。
+    """
+    children = element.FindAll(UIA.TreeScope_Children, iuia.CreateTrueCondition())
+    for index in range(children.Length):
+        child = children.GetElement(index)
+        if ROW_CONTENT_CLASS_MARKER not in (child.CurrentClassName or ""):
+            continue
+        inner = child.FindAll(UIA.TreeScope_Children, iuia.CreateTrueCondition())
+        for inner_index in range(inner.Length):
+            grandchild = inner.GetElement(inner_index)
+            if grandchild.CurrentControlType != UIA.UIA_ImageControlTypeId:
+                continue
+            if (grandchild.CurrentClassName or "") or (grandchild.CurrentName or ""):
+                continue
+            return False
+    return True
 
 
 def _element_rect(element) -> tuple[int, int, int, int]:
@@ -296,7 +390,8 @@ class ContactListAccessibility:
     def _connect(self, hwnd: int):
         """按句柄连接 QQ 进程并取窗口元素。"""
         try:
-            app = Application(backend="uia").connect(handle=hwnd, timeout=CONNECT_TIMEOUT_SECONDS)
+            application, _ = _uia_client()
+            app = application(backend="uia").connect(handle=hwnd, timeout=CONNECT_TIMEOUT_SECONDS)
             element = app.window(handle=hwnd).element_info.element
             window = cast(element, POINTER(UIA.IUIAutomationElement))
             # 触发一次属性读取，确认元素真的可用（只 cast 不会暴露失效）
@@ -318,6 +413,52 @@ class ContactListAccessibility:
             return self._connect(hwnd)
         return self._window
 
+    # ── 列表元素与滚动 ──────────────────────────────────────────
+    def _pane_element(self, hwnd: int):
+        """取会话列表容器元素本身（不枚举行）；滚动能力挂在它上面。"""
+        iuia = _iuia()
+        window = self._window_element(hwnd)
+        element = window.FindFirst(
+            UIA.TreeScope_Descendants,
+            iuia.CreatePropertyCondition(UIA.UIA_NamePropertyId, LIST_PANE_NAME),
+        )
+        if element is None:
+            raise AccessibilityUnavailableError("pane {name!r} not found".format(name=LIST_PANE_NAME))
+        return element
+
+    def _scroll_pattern(self, hwnd: int):
+        """取会话列表的 ScrollPattern 接口。"""
+        element = self._pane_element(hwnd)
+        return element.GetCurrentPattern(
+            UIA.UIA_ScrollPatternId).QueryInterface(UIA.IUIAutomationScrollPattern)
+
+    def scroll_state(self, hwnd: int) -> AccessibilityScroll:
+        """读取列表滚动状态；容器不发布 ScrollPattern 时抛业务错误。"""
+        return self._run_with_retry(hwnd, "scroll_state", self._scroll_state_once)
+
+    def _scroll_state_once(self, hwnd: int) -> AccessibilityScroll:
+        """单次读取实现（不做重试）。"""
+        pattern = self._scroll_pattern(hwnd)
+        return AccessibilityScroll(
+            view_size_percent=float(pattern.CurrentVerticalViewSize),
+            position_percent=float(pattern.CurrentVerticalScrollPercent),
+            scrollable=bool(pattern.CurrentVerticallyScrollable),
+        )
+
+    def set_scroll_percent(self, hwnd: int, percent: float) -> AccessibilityScroll:
+        """把列表垂直滚动位置设为百分比（0~100），返回设置后的状态。"""
+        return self._run_with_retry(hwnd, "set_scroll", lambda target: self._set_scroll_once(target, percent))
+
+    def _set_scroll_once(self, hwnd: int, percent: float) -> AccessibilityScroll:
+        """单次设置实现（不做重试）。"""
+        pattern = self._scroll_pattern(hwnd)
+        pattern.SetScrollPercent(NO_SCROLL_PERCENT, float(percent))
+        return AccessibilityScroll(
+            view_size_percent=float(pattern.CurrentVerticalViewSize),
+            position_percent=float(pattern.CurrentVerticalScrollPercent),
+            scrollable=bool(pattern.CurrentVerticallyScrollable),
+        )
+
     # ── 枚举 ────────────────────────────────────────────────────
     def pane(self, hwnd: int) -> AccessibilityPane:
         """枚举会话列表：返回列表区矩形与全部已渲染行。
@@ -333,6 +474,28 @@ class ContactListAccessibility:
         AccessibilityUnavailableError 供调用方回退到截图链路。
         """
         return self._run_with_retry(hwnd, "chat", self._chat_once)
+
+    def message_area(self, hwnd: int) -> tuple[int, int, int, int]:
+        """读取消息区容器的屏幕矩形 (left, top, right, bottom)。
+
+        与 chat() 共用同一套重连重试语义，但只取容器矩形、不枚举消息：供框选
+        复制在模板锚点缺失时兜底定位消息区（真机实测"我的手机"、服务号、部分
+        群聊的聊天头部没有 messagebox_top 图标，模板法会误报区域找不到）。
+        """
+        return self._run_with_retry(hwnd, "message_area", self._message_area_once)
+
+    def _message_area_once(self, hwnd: int) -> tuple[int, int, int, int]:
+        """单次读取消息区容器矩形（不做重试）。"""
+        iuia = _iuia()
+        window = self._window_element(hwnd)
+        element = window.FindFirst(
+            UIA.TreeScope_Descendants,
+            iuia.CreatePropertyCondition(UIA.UIA_NamePropertyId, MESSAGE_AREA_NAME),
+        )
+        if element is None:
+            raise AccessibilityUnavailableError(
+                "message area {name!r} not found".format(name=MESSAGE_AREA_NAME))
+        return _element_rect(element)
 
     def _run_with_retry(self, hwnd: int, label: str, builder):
         """元素树瞬时重建时断开重连重试；非瞬态错误直接抛出。"""
@@ -359,7 +522,7 @@ class ContactListAccessibility:
     def _pane_once(self, hwnd: int) -> AccessibilityPane:
         """单次枚举实现（不做重试）。"""
         started = time.perf_counter()
-        iuia = IUIA().iuia
+        iuia = _iuia()
         window = self._window_element(hwnd)
         descendants = UIA.TreeScope_Descendants
         # 会话列表容器：按 Name 精确查找
@@ -395,18 +558,20 @@ class ContactListAccessibility:
                     rect=rect,
                     selected=ROW_SELECTED_MARKER in class_name,
                     pinned=ROW_PINNED_MARKER in class_name,
+                    copyable=_row_copyable(iuia, element),
                 )
             )
         elapsed_ms = (time.perf_counter() - started) * 1000
-        logger.info("accessibility.enumerate rows=%d visible=%d elapsed_ms=%.2f",
-                    len(rows), sum(1 for row in rows if row.visible_in(pane)), elapsed_ms)
+        non_copyable = sum(1 for row in rows if not row.copyable)
+        logger.info("accessibility.enumerate rows=%d visible=%d non_copyable=%d elapsed_ms=%.2f",
+                    len(rows), sum(1 for row in rows if row.visible_in(pane)), non_copyable, elapsed_ms)
         return AccessibilityPane(rect=pane, rows=tuple(rows), elapsed_ms=elapsed_ms)
 
     # ── 聊天区枚举 ──────────────────────────────────────────────
     def _chat_once(self, hwnd: int) -> AccessibilityChat:
         """单次聊天区读取（不做重试）。"""
         started = time.perf_counter()
-        iuia = IUIA().iuia
+        iuia = _iuia()
         window = self._window_element(hwnd)
         descendants = UIA.TreeScope_Descendants
         # 消息区容器：QQ 给它自报 Name="消息列表"，比多段拼接的 ClassName 更稳
@@ -508,6 +673,21 @@ def _parse_message(iuia, element) -> AccessibilityMessage:
 def accessibility_chat(hwnd: int) -> AccessibilityChat:
     """模块级便捷入口：读取当前会话的消息（无障碍树）。"""
     return ContactListAccessibility().chat(hwnd)
+
+
+def accessibility_message_area(hwnd: int) -> tuple[int, int, int, int]:
+    """模块级便捷入口：读取消息区容器矩形（屏幕物理像素）。"""
+    return ContactListAccessibility().message_area(hwnd)
+
+
+def accessibility_scroll_state(hwnd: int) -> AccessibilityScroll:
+    """模块级便捷入口：读取会话列表滚动状态。"""
+    return ContactListAccessibility().scroll_state(hwnd)
+
+
+def accessibility_set_scroll_percent(hwnd: int, percent: float) -> AccessibilityScroll:
+    """模块级便捷入口：设置会话列表垂直滚动位置（0~100）。"""
+    return ContactListAccessibility().set_scroll_percent(hwnd, percent)
 
 
 def accessibility_pane(hwnd: int) -> AccessibilityPane:

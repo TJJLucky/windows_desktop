@@ -72,7 +72,7 @@ class CommandLedger:
             if cursor.rowcount:
                 logger.warning("ledger.startup_migration running_to_effect_unknown count=%d", cursor.rowcount)
 
-    def begin(self, command_id: str, qq_number: str, text: str) -> tuple[bool, CommandStatus, dict[str, Any] | None]:
+    def begin(self, command_id: str, contact_name: str, text: str) -> tuple[bool, CommandStatus, dict[str, Any] | None]:
         """申请执行命令：决定「本次是否真正执行」。
 
         :return: (execute, status, result)
@@ -81,7 +81,7 @@ class CommandLedger:
         :raises CommandConflictError: 同 ID 不同消息体
         """
         # 计算消息体指纹：QQ 号 + 文本（JSON 规范化后 sha256）
-        payload_hash = _payload_hash(qq_number, text)
+        payload_hash = _payload_hash(contact_name, text)
         with self._lock, closing(self._connect()) as connection, connection:
             # 查既有记录
             row = connection.execute(
@@ -128,11 +128,11 @@ class CommandLedger:
         return sqlite3.connect(self._path)
 
 
-def _payload_hash(qq_number: str, text: str) -> str:
+def _payload_hash(contact_name: str, text: str) -> str:
     """计算发送消息体的规范化指纹：联系人 + 文本按固定键序 JSON 序列化后 sha256。"""
     # sort_keys=True 保证键序稳定（同内容必得同哈希）；separators 压缩体积
     material = json.dumps(
-        {"qqNumber": qq_number, "text": text},
+        {"contactName": contact_name, "text": text},
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),

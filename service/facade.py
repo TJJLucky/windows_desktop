@@ -30,15 +30,18 @@ class QqAutomationError(RuntimeError):
 class QqContactNotFoundError(QqAutomationError):
     """滚动查找后仍没有请求的联系人。"""
 
-    def __init__(self, qq_number: str) -> None:
-        self.qq_number = qq_number
-        super().__init__(f"QQ_CONTACT_NOT_FOUND: QQ 用户列表滚动查找后未找到 QQ 号「{qq_number}」")
+    def __init__(self, contact_name: str) -> None:
+        self.contact_name = contact_name
+        super().__init__(f"QQ_CONTACT_NOT_FOUND: QQ 会话列表滚动查找后未找到联系人「{contact_name}」")
 
 
 _ERROR_CODE_PREFIXES = (
     "QQ_CONTACT_SCAN_LIMIT",
-    "QQ_CONTACT_SCAN_CHANGED",
     "QQ_CONTACT_NOT_FOUND",
+    "QQ_CONTACT_NAME_INVALID",
+    "QQ_CONTACT_AMBIGUOUS",
+    "QQ_CONTACT_ACTIVATION_FAILED",
+    "QQ_CONTACT_NOT_COPYABLE",
     "QQ_CONTACT_NUMBER_INVALID",
     "QQ_CONTACT_NUMBER_ACTIVE_NOT_FOUND",
     "QQ_CONTACT_NUMBER_ACTIVE_AMBIGUOUS",
@@ -66,6 +69,8 @@ def _operation_error_code(error: Exception, fallback_code: str) -> str:
     detail = str(error).strip()
     if error.__class__.__name__ == "QQWindowNotReadyError":
         return "QQ_WINDOW_NOT_READY"
+    if getattr(error, "code", None) == "QQ_ACCESSIBILITY_UNAVAILABLE":
+        return "QQ_ACCESSIBILITY_UNAVAILABLE"
     if "get_message_box_region_and_image" in detail:
         return "QQ_MESSAGE_REGION_NOT_FOUND"
     if "get_inputbox_region_and_image" in detail:
@@ -80,13 +85,13 @@ def _operation_error_code(error: Exception, fallback_code: str) -> str:
     return fallback_code
 
 
-def _raise_operation_error(error: Exception, qq_number: str, fallback_code: str) -> None:
+def _raise_operation_error(error: Exception, contact_name: str, fallback_code: str) -> None:
     """把底层的联系人缺失异常保留为 HTTP 可辨识的业务错误。"""
-    # 延迟导入：保持 facade 在没有 Windows GUI 依赖的测试环境中仍可加载。
-    from utils.qq.contact_scan import ContactNotFoundError
+    # 延迟导入：保持 facade 在没有 Windows GUI 依赖的环境里仍可加载。
+    from utils.qq.contact_lookup import ContactNotFoundError
 
     if isinstance(error, ContactNotFoundError):
-        raise QqContactNotFoundError(qq_number) from error
+        raise QqContactNotFoundError(contact_name) from error
     raise QqAutomationError(_operation_error_code(error, fallback_code)) from error
 
 
@@ -100,16 +105,16 @@ class QqAutomationPort(Protocol):
         """复制当前激活行的 QQ 号。"""
         ...
 
-    def list_contacts(self, qq_number: str | None = None) -> dict[str, dict]:
-        """读取当前可见联系人列表，返回 QQ 号 → 信息 dict。"""
+    def list_contacts(self, contact_name: str | None = None) -> dict[str, dict]:
+        """读取当前可见联系人列表，返回会话名 → 信息 dict。"""
         ...
 
-    def send_message(self, qq_number: str, text: str) -> dict:
-        """向指定 QQ 号发送文本，返回结果 dict。"""
+    def send_message(self, contact_name: str, text: str) -> dict:
+        """向指定联系人的会话发送文本，返回结果 dict。"""
         ...
 
-    def read_messages(self, qq_number: str) -> dict:
-        """读取指定 QQ 号的可见消息，返回含 messages 列表的 dict。"""
+    def read_messages(self, contact_name: str) -> dict:
+        """读取指定联系人会话的可见消息，返回含 messages 列表的 dict。"""
         ...
 
     def check_capture_ready(self) -> dict:
@@ -152,31 +157,31 @@ class LegacyQqAutomationFacade:
             raise QqAutomationError(_operation_error_code(error, "QQ_CONTACT_NUMBER_IDENTIFY_FAILED")) from error
         return result
 
-    def list_contacts(self, qq_number: str | None = None) -> dict[str, dict]:
+    def list_contacts(self, contact_name: str | None = None) -> dict[str, dict]:
         """读联系人列表：入队执行（最长等 60s），失败抛 QqAutomationError。"""
         # Dispatcher 返回 (结果, 异常) 二元组：error 非空表示失败
-        contacts, error = (self._operator().get_contact_list(timeout=120.0, qq_number=qq_number)
-                           if qq_number else self._operator().get_contact_list(timeout=120.0))
+        contacts, error = (self._operator().get_contact_list(timeout=120.0, contact_name=contact_name)
+                           if contact_name else self._operator().get_contact_list(timeout=120.0))
         if error is not None:
             # 失败统一投影为业务错误（HTTP 层转 503），错误码带出失败阶段
-            _raise_operation_error(error, qq_number or "", "QQ_CONTACTS_UNAVAILABLE")
+            _raise_operation_error(error, contact_name or "", "QQ_CONTACTS_UNAVAILABLE")
         return contacts
 
-    def send_message(self, qq_number: str, text: str) -> dict:
+    def send_message(self, contact_name: str, text: str) -> dict:
         """发送消息：入队执行（最长等 60s），成功返回标准结果结构。"""
         # 入队发送；error 非空表示失败（如窗口不可用、识别失败）
-        sent, error = self._operator().send_message(qq_number, text, timeout=60.0)
+        sent, error = self._operator().send_message(contact_name, text, timeout=60.0)
         if error is not None:
-            _raise_operation_error(error, qq_number, "QQ_SEND_FAILED")
+            _raise_operation_error(error, contact_name, "QQ_SEND_FAILED")
         # 规范化的成功结果：ok/sent 同值、消息长度、无错误
         return {"ok": bool(sent), "sent": bool(sent), "textLength": len(text), "error": None}
 
-    def read_messages(self, qq_number: str) -> dict:
+    def read_messages(self, contact_name: str) -> dict:
         """读取可见消息：入队执行（最长等 60s），翻译成 Service 层消息结构。"""
         # 入队读取；error 非空表示失败
-        result, error = self._operator().read_message_list(qq_number, timeout=60.0)
+        result, error = self._operator().read_message_list(contact_name, timeout=60.0)
         if error is not None:
-            _raise_operation_error(error, qq_number, "QQ_MESSAGES_UNAVAILABLE")
+            _raise_operation_error(error, contact_name, "QQ_MESSAGES_UNAVAILABLE")
         # 把 QQ 原生复制解析结果翻译为 HTTP 契约结构。
         # sender/timestamp/text/rawText 是权威字段，消息归属由外部智能体按 sender 判断。
         payload = [

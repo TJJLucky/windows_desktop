@@ -1,21 +1,18 @@
-"""QQ 用户列表模块：头像行检测、行区域裁切、激活行色带判定与列表快照。
+"""QQ 会话列表模块：会话行定位/激活、行区域与激活态判定、列表快照。
 
-核心流程（只认 QQ 号）：
-1. 确保 QQ 主窗口就绪并截图，识别"好友列表区域"；
-2. 霍夫圆检测列表里的圆形头像 → 每个头像即一个用户行；
-3. 以头像为中心裁出行区域（排除头像，保留文字与红点区）；
-4. 行身份由右击菜单"复制 QQ 号"得到（见 contact_number / contact_scan），
-   本模块不再做昵称 OCR，也不维护 name → User 映射；
-5. RGB 颜色检测未读红点；当前激活行按绝对色带判定（见 is_active_bg）。
+核心流程（身份是会话名，不是 QQ 号）：
+1. 确保 QQ 主窗口就绪并截图，识别"好友列表区域"（截图与区域仍供未读红点等图像判定用）；
+2. 会话行的枚举、滚动查找与定位交给无障碍树（见 contact_lookup / accessibility）：
+   行名由 UI Automation 直接报出，不截图、不做昵称 OCR；
+3. 激活 = 无障碍树里点中目标行 → 轮询聊天区标题确认（见 contact_lookup.activate）；
+4. 行区域裁切与激活态色带判定（is_active_bg）仍按图像做，供诊断接口使用。
 
-对外接口：active_user_by_number（按号码激活）、get_user_list（读当前屏快照）、
+对外接口：activate（按会话名激活）、get_user_list（读会话名单快照）、
 refresh_image（只刷新截图与区域）。
 """
 
-# time：激活确认等待、区域稳定等待
+# time：区域稳定等待
 import time
-# re：QQ 号位数与首字符校验
-import re
 
 # cv2：头像圆检测（霍夫圆）
 import cv2
@@ -24,33 +21,20 @@ import numpy as np
 # PIL.Image：图像裁切/尺寸
 from PIL import Image
 
-# User 数据模型（链式 setter 组装）
-from .models import User
 # 列表区域识别（截图 + 锚点定位）
 from .regions import get_userList_region_and_image, RegionResult
 # 窗口就绪保证（重试）
 from .window_ops import ensure_qq_window_with_retry
-# 无焦点置顶上下文（激活用户时短暂置顶窗口）
-from ..core.window import WindowCaptureCtx
 # 计时装饰器
 from ..core.timing import timed_stage, timer
-# 直接点击当前识别行的头像圆心。
-from ..core.mouse import click_at
-from .contact_scan import ContactScanner
-
-
-# 点击会话后 QQ 需要重绘才会把激活行画进色带：点击已生效但首帧仍是旧画面时，
-# 在确认环节做有界等待+重试，避免把"来不及重绘"误判为定位失败（真机实测约 0.25s 生效）。
-ACTIVATE_CONFIRM_TIMEOUT_SECONDS = 4.0
-ACTIVATE_CONFIRM_INTERVAL_SECONDS = 0.25
 
 
 # ── 用户列表管理器 ──────────────────────────────────────────────────
 class UserList:
-    """QQ 好友列表管理器（单例）。
+    """QQ 会话列表管理器（单例）。
 
-    持有好友列表截图与区域坐标；行的身份由右击菜单复制到的 QQ 号决定，
-    本模块只负责按号码激活会话与输出当前屏幕的快照。
+    持有会话列表截图与区域坐标（供未读红点/激活态等图像判定）；会话身份与定位
+    交给无障碍树：activate 按会话名激活，get_user_list 输出当前名单快照。
     """
 
     # 类级单例实例
@@ -240,76 +224,17 @@ class UserList:
         return rects
 
     @timer
-    def active_user(self, user: User) -> bool:
-        """激活指定用户，返回本次是否执行了点击。"""
-        if user.active:
-            return False
-        if self.userList_region is None or self.hwnd == 0:
-            raise RuntimeError("需要先执行 refresh_image()")
-        region = self.userList_region
-        if region.full_image is None:
-            raise RuntimeError("缺少整窗截图（full_image）")
-        screen_region = region.screen_region
-        # 头像坐标相对当前列表截图，直接转换；不再在整窗另选一个圆。
-        cx, cy, radius = user.avatar
-        left, top, right, bottom = user.rect
-        if (radius <= 0 or not (0 <= left <= cx < right <= region.image.width) or
-                not (0 <= top < cy < bottom <= region.image.height)):
-            raise RuntimeError("QQ_CONTACT_AVATAR_OUT_OF_BOUNDS")
-        # 保留置顶：无激活置顶只改 Z 序，不移动窗口、不抢焦点。
-        with WindowCaptureCtx(self.hwnd):
-            click_at(int(screen_region["left"] + cx), int(screen_region["top"] + cy))
-        return True
+    def activate(self, contact_name: str) -> str:
+        """按会话名激活会话（无障碍树定位 → 点击 → 聊天区标题复核）。
 
-    @timer
-    def active_user_by_number(self, qq_number: str) -> str:
-        """按 QQ 号精确激活：滚动扫描 -> 点击 -> 复制当前激活行号码复核。
-
-        昵称 OCR 不参与目标身份判断；点击后必须复制当前激活行的 QQ 号并与
-        请求号码完全相等，否则视为定位失败。点击到 QQ 画出激活色带之间有一段
-        重绘延迟，因此确认环节在 ACTIVATE_CONFIRM_TIMEOUT_SECONDS 内重试。
+        身份是会话行在无障碍树里自报的名字，不走 QQ 号、也不做昵称 OCR。
+        目标不在视口时由 contact_lookup 滚动查找；已经是当前会话时直接返回、不点击
+        （真机实测点击已激活的行会切掉激活高亮）。
         """
-        if not re.fullmatch(r"^[1-9][0-9]{4,19}$", qq_number or ""):
-            raise RuntimeError("QQ_CONTACT_NUMBER_INVALID")
-        # 只刷新列表区域与窗口句柄，不运行昵称 OCR。
-        self.refresh_image()
-        scanner = ContactScanner(self)
-        row = scanner.scan(qq_number)
-        from .contact_number import _same_row_geometry
-        page = scanner._page
-        # 真机实测：点击已经激活的会话行会把激活高亮切掉（226 灰 -> 245 灰），
-        # 反而让随后的确认读不到激活行。扫描页已标出当时的激活行，命中即免点击。
-        already_active = (page is not None and page[3] is not None
-                          and _same_row_geometry(row, page[3]))
-        if not already_active:
-            user = (
-                User(name="")
-                .setAvatar(row.avatar)
-                .setRect(row.rect)
-                .setActive(False)
-            )
-            self.active_user(user)
-        # 局部导入避免 user_list -> contact_number -> user_list 循环依赖。
-        from .contact_number import ContactNumberReader
-        reader = ContactNumberReader()
-        # 点击后 QQ 重绘有延迟：在确认窗口内重试，直到复制到的激活行号码等于目标号。
-        deadline = time.monotonic() + ACTIVATE_CONFIRM_TIMEOUT_SECONDS
-        while True:
-            try:
-                actual = reader.identify_current()
-            except RuntimeError:
-                # 首帧仍是旧画面（尚未画出激活色带）或读取期间窗口又出新帧：等待后重试。
-                if time.monotonic() >= deadline:
-                    raise
-                time.sleep(ACTIVATE_CONFIRM_INTERVAL_SECONDS)
-                continue
-            if actual == qq_number:
-                return qq_number
-            if time.monotonic() >= deadline:
-                if actual is None:
-                    raise RuntimeError("QQ_CONTACT_NUMBER_COPY_UNAVAILABLE")
-                raise RuntimeError("QQ_CONTACT_NUMBER_ROW_CHANGED")
-            time.sleep(ACTIVATE_CONFIRM_INTERVAL_SECONDS)
+        # 延迟导入：contact_lookup 依赖 accessibility（UIA/COM），保证本模块可独立加载。
+        from .contact_lookup import activate
+
+        return activate(contact_name)
 
     # ── 刷新 ────────────────────────────────────────────────────
     # 刷新前要调用
@@ -335,16 +260,12 @@ class UserList:
         # 记录窗口句柄（激活用户时用）
         self.hwnd = main_window._hWnd
 
-    def get_user_list(self, qq_number: str | None = None):
-        """读取联系人列表：指定 QQ 号时先滚动精确查找，再返回当前页 QQ 号快照。
+    def get_user_list(self, contact_name: str | None = None):
+        """读取会话名单快照（无障碍树）：会话名 → {rect, texts, active, pinned}。
 
-        全链路只按复制菜单得到的 QQ 号定位，不再使用昵称 OCR 作为身份键。
+        指定 contact_name 时先滚动确保目标在列表里（找不到抛 ContactNotFoundError）。
         """
-        scanner = ContactScanner(self)
-        if qq_number:
-            if not re.fullmatch(r"^[1-9][0-9]{4,19}$", qq_number or ""):
-                raise RuntimeError("QQ_CONTACT_NUMBER_INVALID")
-            # 只刷新列表区域与窗口句柄，不运行昵称 OCR。
-            self.refresh_image()
-            scanner.scan(qq_number)
-        return scanner.read_visible()
+        from .contact_lookup import list_contacts
+
+        return list_contacts(contact_name)
+

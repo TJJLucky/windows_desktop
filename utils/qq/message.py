@@ -538,18 +538,34 @@ class MessageList:
                 pass
             raise
 
-    def read_messages(self, qq_number: str) -> dict[str, Any]:
+    def read_messages(self, contact_name: str) -> dict[str, Any]:
         """读取指定会话的可见消息，返回完整复制文本与解析后的消息数组。
 
-        返回消息仅包含 sender、timestamp、text 和 rawText；方向由外部智能体根据
-        sender 自行判断，服务不从气泡位置推断收发方向。
+        读取仍走 QQ 原生框选复制：先按会话名在无障碍树里激活目标会话，再框选消息区
+        并点击复制按钮。返回消息仅包含 sender、timestamp、text 和 rawText；
+        方向由外部智能体根据 sender 自行判断，服务不从气泡位置推断收发方向。
+
+        激活后先确认目标会话有复制项：QQ 对"我的手机""QQ邮箱提醒"这类服务/系统会话
+        禁用了框选复制（真机实测复制按钮呈斜杠禁用态、剪贴板不变），这类会话已在会话
+        名单里被筛掉；这里再挡一次，把 4 秒的框选失败变成毫秒级的 QQ_CONTACT_NOT_COPYABLE。
         """
-        UserList().active_user_by_number(qq_number)
-        copied_text = self.copy_visible_selection()
+        # 延迟导入：contact_lookup 依赖无障碍树（UIA/COM），保证本模块可独立加载
+        from .contact_lookup import ensure_message_copy_supported, record_refused_copy
+
+        UserList().activate(contact_name)
+        ensure_message_copy_supported(contact_name)
+        try:
+            copied_text = self.copy_visible_selection()
+        except RuntimeError as exc:
+            # QQ 明确拒绝复制的会话（框选进不了多选态、剪贴板始终不变等）：按昵称记进
+            # state 目录，之后从名单里筛掉并直接报 QQ_CONTACT_NOT_COPYABLE，不再重跑
+            # 这条十几秒的失败路径。原错误照常抛给调用方。
+            record_refused_copy(contact_name, str(exc))
+            raise
         if not copied_text:
             return {"copiedText": None, "messages": []}
         try:
-            messages = parse_copied_messages(copied_text, fallback_sender="")
+            messages = parse_copied_messages(copied_text, fallback_sender=contact_name)
         except Exception as exc:
             raise RuntimeError("QQ_COPY_PARSE_FAILED") from exc
         if not messages:
