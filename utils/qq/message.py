@@ -18,6 +18,7 @@ from PIL import Image, ImageChops, ImageStat
 from typing import Any
 
 from .copied_messages import parse_copied_messages
+from .accessibility import accessibility_message_area
 from .hotkeys import send_hotkey
 from .regions import (
     get_copy_action_region,
@@ -37,10 +38,41 @@ from ..core.window import WindowCaptureCtx
 _MESSAGE_SELECTION_DRAG_DURATION = 0.2
 
 # 空会话没有消息气泡，聊天画布保持 QQ 的浅灰背景（仅作为取不到真实底色时的兜底）。
-# 只检查消息区左侧固定宽度，避免将右侧联系人资料栏或群成员栏误纳入判断。
+# 采样条分别取消息区左右两侧固定宽度：左侧躲开联系人资料栏/群成员栏，右侧躲开滚动条。
+# 只采样左侧会把"可见消息全部由本机发出"的会话（气泡全在右侧，例如还没收到回复的
+# 陌生人会话、"我的手机"）误判成空会话而返回 0 条消息。
 _EMPTY_CHAT_BACKGROUND = (245, 245, 245)
 _EMPTY_CHAT_SAMPLE_WIDTH = 384
+# 右侧采样条要让开的滚动条/窗口边框宽度。
+_EMPTY_CHAT_RIGHT_MARGIN = 16
 _EMPTY_CHAT_BACKGROUND_RATIO = 0.995
+
+# 空会话判定用的消息视口宽度下限与左界容差：无障碍树的“消息列表”容器与模板区域
+# 左界相差超过容差、或视口过窄时视为不可信，退回模板区域（行为与改动前一致）。
+_EMPTY_VIEWPORT_MIN_WIDTH = 120
+_EMPTY_VIEWPORT_LEFT_TOLERANCE = 40
+
+# QQ 的提示浮层（"复制成功""文件不存在"等）会在窗口里停留约 2 秒。连续读取会话时，
+# 上一轮复制弹出的浮层正好压在本轮消息区截图上，把空白会话误判成"有消息"（真机复现：
+# 云科盛科技、！ 这两个空白会话因此走了框选并报失败）。
+#
+# 判据只用浮层自身的观感，不假设它落在窗口正中：真机实测同一个浮层的中心随窗口/显示器
+# 偏移（"文件不存在" 中心在窗口坐标 (692,711)，"复制成功" 在 (765,797)，窗口中心却是
+# (640,695)），旧的"窗口正中一个小方框"假设会漏检，偏偏漏检的正是要判空的那种情况。
+# 现在改为：非底色像素的包围盒很小且不贴视口边缘，且以一个较暗的实色为主（浮层是深灰底
+# + 白字/白图标；真实消息的底色以浅色气泡为主）。命中只表示"等它淡出后再判一次空会话"，
+# 误判的代价仅是稍慢，不会漏掉真实消息。
+_COPY_TOAST_DOWNSCALE = 4
+# 包围盒相对消息视口的最大占比（"文件不存在" 实测 22%x8%，"复制成功" 实测 19%x23%）。
+_COPY_TOAST_MAX_WIDTH_RATIO = 0.35
+_COPY_TOAST_MAX_HEIGHT_RATIO = 0.30
+# 浮层非底色像素占视口的面积上限：超过它一定不是浮层，用于尽快放弃往下统计。
+_COPY_TOAST_MAX_AREA_RATIO = 0.20
+# 主色亮度上限：浮层底色是深灰（"复制成功" #626262、"文件不存在" #626262）。
+_COPY_TOAST_MAX_BRIGHTNESS = 170.0
+_COPY_TOAST_MIN_SOLID_RATIO = 0.45
+_COPY_TOAST_SETTLE_SECONDS = 2.6
+_COPY_TOAST_SETTLE_INTERVAL = 0.4
 
 # 框选几何的基准像素值是在 120 DPI（125% 缩放）机器上真机标定的；其它电脑按窗口
 # 所在显示器的实际 DPI 与基准的比值等比缩放。QQ 的分隔条/系统边框命中区、粘性
@@ -198,14 +230,30 @@ def _selection_ui_changed(before, after) -> bool:
     return max(ImageStat.Stat(difference).mean) >= 1.0
 
 
-def _sample_crop(image, window: Any, region: dict[str, int], width: int):
-    """裁出消息区左侧宽度为 ``width`` 的采样条（截图内坐标），越界返回 None。"""
+def _sample_crop(
+    image,
+    window: Any,
+    region: dict[str, int],
+    width: int,
+    *,
+    from_right: bool = False,
+    right_margin: int = 0,
+):
+    """裁出消息区宽度为 ``width`` 的采样条（截图内坐标），越界返回 None。
+
+    ``from_right=True`` 时从消息区右边界（先让开 ``right_margin`` 像素的滚动条/边框）
+    往左取一条，用来识别"气泡全在右侧"的会话；默认取左侧边距一条。
+    """
     if image is None:
         return None
-    left = max(0, int(region["left"]) - int(window.left))
     top = max(0, int(region["top"]) - int(window.top))
-    right = min(image.width, int(region["right"]) - int(window.left), left + width)
     bottom = min(image.height, int(region["bottom"]) - int(window.top))
+    if from_right:
+        right = min(image.width, int(region["right"]) - int(window.left) - right_margin)
+        left = max(0, right - width)
+    else:
+        left = max(0, int(region["left"]) - int(window.left))
+        right = min(image.width, int(region["right"]) - int(window.left), left + width)
     if right <= left or bottom <= top:
         return None
     crop = image.crop((left, top, right, bottom))
@@ -248,21 +296,151 @@ def _canvas_background(
     return color if ratio >= 0.5 else _EMPTY_CHAT_BACKGROUND
 
 
+def _is_blank_canvas_crop(crop, background: tuple[int, int, int]) -> bool:
+    """采样条里是否几乎全是画布底色。"""
+    total = crop.width * crop.height
+    matches = sum(1 for pixel in crop.getdata() if tuple(pixel[:3]) == background)
+    return matches / total >= _EMPTY_CHAT_BACKGROUND_RATIO
+
+
 def _is_empty_message_region(
     window: Any, image, region: dict[str, int], background: tuple[int, int, int]
 ) -> bool:
     """判断消息区是否为无消息的纯色画布。
 
-    真实 QQ 空会话的聊天画布为单一底色；右侧资料栏不属于消息正文区，因此只采样
-    消息区左侧固定宽度，并要求几乎全部像素都是该底色。底色按当前主题自适应
-    （见 ``_canvas_background``），不再写死浅灰。
+    真实 QQ 空会话的聊天画布为单一底色。左右两条采样都必须几乎全是底色才算空：
+    只看左侧会把气泡全在右侧的会话（对方没回过话、或"我的手机"这类只显示本机消息
+    的会话）误判成空会话；只看右侧则会把群成员栏/资料栏算进来。底色按当前主题
+    自适应（见 ``_canvas_background``），不再写死浅灰。
     """
-    crop = _sample_crop(image, window, region, _EMPTY_CHAT_SAMPLE_WIDTH)
+    left_crop = _sample_crop(image, window, region, _EMPTY_CHAT_SAMPLE_WIDTH)
+    if left_crop is None:
+        return False
+    if not _is_blank_canvas_crop(left_crop, background):
+        return False
+    right_crop = _sample_crop(
+        image, window, region, _EMPTY_CHAT_SAMPLE_WIDTH,
+        from_right=True, right_margin=_EMPTY_CHAT_RIGHT_MARGIN,
+    )
+    if right_crop is None:
+        return True
+    return _is_blank_canvas_crop(right_crop, background)
+
+
+def _empty_check_region(main_window: Any, region: dict[str, int]) -> dict[str, int]:
+    """空会话判定使用的消息视口：把模板区域右界收紧到无障碍树的“消息列表”容器。
+
+    模板法拿聊天头部最右侧图标的右边缘当消息区右界；群聊/带资料栏的会话里这个边界
+    落在右侧成员栏之内（真机实测：模板 right=1180，成员栏从 1050 开始），右侧采样条
+    于是永远采到成员名单，把空白群聊误判成“有消息”而去框选（真机复现：概率统计周二班
+    无任何消息，却报 QQ_SELECTION_NOT_ENTERED）。无障碍树的消息列表容器恰好是真正的
+    消息视口（真机 right=1050，与成员栏分隔线重合）。取得到且比模板区域更窄时按它收紧；
+    取不到或结果不可信时原样返回。框选拖拽仍用模板区域，不改动已验证的拖拽范围。
+    """
+    try:
+        left, _top, right, _bottom = accessibility_message_area(main_window._hWnd)
+    except Exception:
+        return region
+    region_left = int(region["left"])
+    region_right = int(region["right"])
+    right = int(right)
+    if right >= region_right or right <= 0:
+        return region
+    if right - region_left < _EMPTY_VIEWPORT_MIN_WIDTH:
+        return region
+    if abs(int(left) - region_left) > _EMPTY_VIEWPORT_LEFT_TOLERANCE:
+        return region
+    clamped = dict(region)
+    clamped["right"] = right
+    clamped["w"] = max(0, right - region_left)
+    return clamped
+
+
+def _region_crop(image, window: Any, region: dict[str, int]):
+    """裁出整个消息区（截图内坐标）；越界返回 None。"""
+    top = max(0, int(region["top"]) - int(window.top))
+    bottom = min(image.height, int(region["bottom"]) - int(window.top))
+    left = max(0, int(region["left"]) - int(window.left))
+    right = min(image.width, int(region["right"]) - int(window.left))
+    if right <= left or bottom <= top:
+        return None
+    crop = image.crop((left, top, right, bottom))
+    return crop if crop.mode == "RGB" else crop.convert("RGB")
+
+
+def _looks_like_copy_toast(
+    image, window: Any, region: dict[str, int], background: tuple[int, int, int]
+) -> bool:
+    """消息视口里仅有的非空白是否只是一个提示浮层（QQ 的"复制成功"等）。
+
+    只在"消息区非空白"成立后才调用：用来区分"空白会话 + 提示浮层"和"真的有消息"。
+    判据见 ``_COPY_TOAST_*`` 常量说明：包围盒小、不贴边、以较暗实色为主。为控制耗时
+    先把消息区按 ``_COPY_TOAST_DOWNSCALE`` 抽样（NEAREST 不改变颜色），非底色像素占比
+    超过 ``_COPY_TOAST_MAX_AREA_RATIO`` 时立刻放弃统计。
+    """
+    crop = _region_crop(image, window, region)
     if crop is None:
         return False
-    total = crop.width * crop.height
-    matches = sum(1 for pixel in crop.getdata() if tuple(pixel[:3]) == background)
-    return matches / total >= _EMPTY_CHAT_BACKGROUND_RATIO
+    step = max(1, _COPY_TOAST_DOWNSCALE)
+    small = crop.resize(
+        (max(1, crop.width // step), max(1, crop.height // step)), Image.NEAREST
+    )
+    background = tuple(background)
+    pixels = small.load()
+    width, height = small.size
+    budget = max(1, int(width * height * _COPY_TOAST_MAX_AREA_RATIO))
+    counts: dict[tuple[int, int, int], int] = {}
+    non_background = 0
+    min_x, min_y, max_x, max_y = width, height, -1, -1
+    for y in range(height):
+        for x in range(width):
+            color = tuple(pixels[x, y][:3])
+            if color == background:
+                continue
+            counts[color] = counts.get(color, 0) + 1
+            non_background += 1
+            if non_background > budget:
+                return False
+            if x < min_x:
+                min_x = x
+            if x > max_x:
+                max_x = x
+            if y < min_y:
+                min_y = y
+            if y > max_y:
+                max_y = y
+    if max_x < 0:
+        return False
+    # 浮层四周都是画布：非底色像素贴到视口边缘就不是浮层。
+    if min_x == 0 or min_y == 0 or max_x == width - 1 or max_y == height - 1:
+        return False
+    if (max_x - min_x + 1) > width * _COPY_TOAST_MAX_WIDTH_RATIO:
+        return False
+    if (max_y - min_y + 1) > height * _COPY_TOAST_MAX_HEIGHT_RATIO:
+        return False
+    dominant, dominant_count = max(counts.items(), key=lambda item: item[1])
+    if sum(dominant) / 3.0 >= _COPY_TOAST_MAX_BRIGHTNESS:
+        return False
+    return dominant_count / non_background >= _COPY_TOAST_MIN_SOLID_RATIO
+
+
+def _settle_copy_toast(
+    main_window: Any, image, window: Any,
+    region: dict[str, int], background: tuple[int, int, int],
+):
+    """等窗口正中的提示浮层淡出，返回 ``(最新截图, 窗口, 是否为空白会话)``。"""
+    deadline = time.perf_counter() + _COPY_TOAST_SETTLE_SECONDS
+    while time.perf_counter() < deadline:
+        time.sleep(_COPY_TOAST_SETTLE_INTERVAL)
+        fresh, fresh_window = get_qq_window_image(main_window)
+        if fresh is None:
+            continue
+        image, window = fresh, fresh_window
+        if _is_empty_message_region(main_window, image, region, background):
+            return image, window, True
+        if not _looks_like_copy_toast(image, window, region, background):
+            break
+    return image, window, False
 
 
 def _is_blank_canvas_run(
@@ -308,6 +486,19 @@ def _blank_canvas_run_x(
         if index % 3 == 0:
             return span_left + index // 3
         offset = index + 1
+
+
+def _accessibility_message_region(main_window: Any) -> dict[str, int]:
+    """模板锚点缺失时，用无障碍树的"消息列表"容器矩形兜底消息区。
+
+    与模板法给出的 screen_region 同构（屏幕绝对坐标、right/bottom 为开区间），
+    因此下游的收缩、空白画布探测和框选几何无需改动。
+    """
+    left, top, right, bottom = accessibility_message_area(main_window._hWnd)
+    return {
+        "x": left, "y": top, "w": max(0, right - left), "h": max(0, bottom - top),
+        "left": left, "top": top, "right": right, "bottom": bottom,
+    }
 
 
 def _find_selection_start(
@@ -412,6 +603,10 @@ class MessageList:
         """取得当前消息区域的屏幕坐标，仅服务于框选范围计算。
 
         此处截图只用于模板定位消息区域，不进行气泡检测、图像拼接或 OCR。
+        模板锚点取自聊天头部图标：真机实测"我的手机"（头部是"导入手机相册"）、
+        服务号、部分群聊没有该图标，模板法会误报 QQ_MESSAGE_REGION_NOT_FOUND；
+        两次模板尝试都失败时退回无障碍树里始终存在的"消息列表"容器矩形，框选
+        复制流程本身不变。
         """
         try:
             result = get_message_box_region_and_image(main_window)
@@ -419,7 +614,13 @@ class MessageList:
             # 多选态的底部工具栏会顶掉输入框锚点，导致消息区定位失败（真机诊断出现
             # 过 left_bottom=False right_bottom=False）：退出多选态后重试一次。
             _clear_message_selection(main_window)
-            result = get_message_box_region_and_image(main_window)
+            try:
+                result = get_message_box_region_and_image(main_window)
+            except Exception:
+                region = _accessibility_message_region(main_window)
+                self.message_screen_region = region
+                self.hwnd = main_window._hWnd
+                return region
         self.message_screen_region = result.screen_region
         self.hwnd = main_window._hWnd
         return result.screen_region
@@ -462,12 +663,26 @@ class MessageList:
                         or region["top"] + geometry.top_dead_zone >= selection_end[1]
                     ):
                         raise RuntimeError("QQ_MESSAGE_REGION_TOO_SMALL")
-                    background = _canvas_background(before, main_window, region, geometry)
+                    # 空白判定只在真正的消息视口内做（避开右侧成员栏）；框选几何仍用
+                    # 模板区域，拖拽范围不变。
+                    empty_region = _empty_check_region(main_window, region)
+                    background = _canvas_background(before, main_window, empty_region, geometry)
                     metadata["canvasBackground"] = list(background)
+                    metadata["messageViewport"] = empty_region
                     metadata["dpiScale"] = round(_window_dpi_scale(main_window), 3)
-                    if _is_empty_message_region(main_window, before, region, background):
+                    if _is_empty_message_region(main_window, before, empty_region, background):
                         metadata["emptyConversation"] = True
                         return ""
+                    if _looks_like_copy_toast(before, window, empty_region, background):
+                        # 非空白部分只有窗口正中的一个紧凑浮层：先等它淡出再判一次空
+                        # 会话，避免把带提示浮层的空白会话当成"有消息"去框选。
+                        before, window, empty = _settle_copy_toast(
+                            main_window, before, window, empty_region, background
+                        )
+                        metadata["copyToastSettled"] = True
+                        if empty:
+                            metadata["emptyConversation"] = True
+                            return ""
                     after = window = None
                     copy_action = None
                     for attempt in range(_SELECTION_TOP_RETRY_LIMIT + 1):
@@ -508,6 +723,19 @@ class MessageList:
                                 copy_action_source = "ocr-text"
                         if copy_action is None:
                             if not _selection_ui_changed(before, after):
+                                # 兜底：没能进入框选态时再取一张新截图，若消息视口此刻是纯色
+                                # 画布，说明这就是一个没有消息的空白会话（先前的非空白多半是
+                                # 上一轮复制残留的提示浮层），按 0 条消息返回。只有亲眼确认
+                                # 画布空白才降级，绝不把“没选中”直接当成空会话。
+                                if after is None:
+                                    after, window = get_qq_window_image(main_window)
+                                if after is not None and _is_empty_message_region(
+                                    main_window, after, empty_region,
+                                    _canvas_background(after, main_window, empty_region, geometry),
+                                ):
+                                    metadata["emptyConversation"] = True
+                                    metadata["emptyVerifiedAfterDeselection"] = True
+                                    return ""
                                 raise RuntimeError("QQ_SELECTION_NOT_ENTERED")
                             raise RuntimeError("QQ_COPY_ACTION_NOT_FOUND")
                 metadata["copyAction"] = copy_action
@@ -519,10 +747,15 @@ class MessageList:
                     copy_action["top"] + copy_action["h"] // 2,
                     restore=False, smooth=False,
                 )
-                # 复制完成后立刻退出多选态：残留的工具栏会顶掉输入框锚点，使下一次读取
-                # 定位不到消息区。
-                _clear_message_selection(main_window)
-            copied = _read_unicode_clipboard(sentinel)
+                # QQ 的"复制"是异步的：点击之后渲染进程才把选中消息序列化进剪贴板。
+                # 点完立刻按 Esc 退出多选态会在写剪贴板之前取消这次复制（真机复现：
+                # 选区、工具栏、复制按钮全部命中，剪贴板却始终停在哨兵值）。因此先等
+                # 剪贴板出现新内容，再退出多选态——成功与否都要退出，残留工具栏会顶掉
+                # 输入框锚点，使下一次读取定位不到消息区。
+                try:
+                    copied = _read_unicode_clipboard(sentinel)
+                finally:
+                    _clear_message_selection(main_window)
             if not copied.strip():
                 raise RuntimeError("QQ_COPY_TEXT_EMPTY")
             return copied
