@@ -37,6 +37,8 @@ import logging
 import threading
 # time：枚举耗时统计与重试等待
 import time
+# re：解析未读角标里的条数
+import re
 # dataclass：行/面板的只读数据结构
 from dataclasses import dataclass
 
@@ -64,6 +66,11 @@ ROW_SELECTED_MARKER = "--selected"
 ROW_PINNED_MARKER = "--top"
 # 行内"内容块"的 ClassName 关键字：会话行的头像/文本子元素都挂在它下面
 ROW_CONTENT_CLASS_MARKER = "item__content"
+
+# 行内未读角标的名字关键字：QQ 给未读角标起的无障碍名字形如「3条未读」
+UNREAD_BADGE_NAME_MARKER = "未读"
+# 未读角标里的条数（"99+" 这类后缀只取第一段数字）
+UNREAD_COUNT_RE = re.compile(r"(\d+)")
 
 # 消息区容器的 Name 属性（QQ 自报的本地化名字）
 MESSAGE_AREA_NAME = "消息列表"
@@ -169,6 +176,10 @@ class AccessibilityRow:
     # 该会话是否支持聊天区框选复制；False = QQ 没给复制项（"我的手机""QQ邮箱提醒"
     # 这类服务/系统会话，真机实测复制按钮呈斜杠禁用态、剪贴板不变）
     copyable: bool
+    # 是否有未读消息：行内存在未读角标（名字含「未读」）
+    unread: bool = False
+    # 未读条数：角标里的数字；纯圆点角标无数字时为 None
+    unread_count: int | None = None
 
     @property
     def center(self) -> tuple[int, int]:
@@ -236,18 +247,39 @@ class AccessibilityScroll:
         return float(viewport_height) * 100.0 / min(100.0, self.view_size_percent)
 
 
-def _row_copyable(iuia, element) -> bool:
-    """判断一行会话在聊天区是否还留着框选复制（QQ 的复制项）。
+def _row_unread_count(iuia, badge) -> int | None:
+    """未读角标里的实际条数：优先取角标内层数字文本，退回角标自身名字里的数字。
 
-    QQ 的服务/系统会话（真机实测："我的手机""QQ邮箱提醒"）行内"内容块"
-    （ClassName 含 item__content）下直接挂着一个无类名、无名字的 Image —— 它们的头像是
-    <img> 元素；普通好友/群的行内没有任何 Image 子元素（真机实测 26 行名单里只有这两行
-    命中）。这几类会话在聊天区被 QQ 禁用了框选复制（进入多选态后复制按钮变斜杠禁用态、
-    剪贴板不变），因此提前标注出来，由 contact_lookup 把它们筛出可用名单。
-
-    只认"无类名、无名字、直属于内容块"的 Image：免打扰/未读角标这类图标是带类名的
-    Group（或其子节点），不会误命中；判据是 DOM 结构，与 DPI、窗口尺寸无关。
+    真机实测外层名字会滞后（出现过名字 "1条未读" 而内层文本 "3"），因此条数以内层
+    文本为准；纯圆点角标（无数字）两者都取不到时返回 None。
     """
+    condition = iuia.CreatePropertyCondition(
+        UIA.UIA_ControlTypePropertyId, UIA.UIA_TextControlTypeId)
+    inner = badge.FindAll(UIA.TreeScope_Descendants, condition)
+    for index in range(inner.Length):
+        match = UNREAD_COUNT_RE.search(inner.GetElement(index).CurrentName or "")
+        if match:
+            return int(match.group(1))
+    match = UNREAD_COUNT_RE.search(badge.CurrentName or "")
+    return int(match.group(1)) if match else None
+
+
+def _row_traits(iuia, element) -> tuple[bool, bool, int | None]:
+    """一次遍历行内"内容块"，同时判定框选复制能力与未读状态。
+
+    返回 ``(copyable, unread, unread_count)``：
+
+    - ``copyable``：内容块下直接挂着"无类名、无名字"的 Image = 服务/系统会话（真机
+      实测："我的手机""QQ邮箱提醒"），它们在聊天区被 QQ 禁用了框选复制，提前标注
+      供 contact_lookup 筛出可用名单。只认"无类名、无名字、直属内容块"的 Image：
+      未读/免打扰角标是带名字的 Group（或其子节点），不会误命中；判据是 DOM 结构，
+      与 DPI、窗口尺寸无关。
+    - ``unread``：内容块下存在名字含「未读」的角标（真机实测形如 "3条未读"）。
+    - ``unread_count``：角标里的条数，取不到为 None。
+    """
+    copyable = True
+    unread = False
+    unread_count: int | None = None
     children = element.FindAll(UIA.TreeScope_Children, iuia.CreateTrueCondition())
     for index in range(children.Length):
         child = children.GetElement(index)
@@ -256,12 +288,22 @@ def _row_copyable(iuia, element) -> bool:
         inner = child.FindAll(UIA.TreeScope_Children, iuia.CreateTrueCondition())
         for inner_index in range(inner.Length):
             grandchild = inner.GetElement(inner_index)
+            if UNREAD_BADGE_NAME_MARKER in (grandchild.CurrentName or ""):
+                unread = True
+                if unread_count is None:
+                    unread_count = _row_unread_count(iuia, grandchild)
+                continue
             if grandchild.CurrentControlType != UIA.UIA_ImageControlTypeId:
                 continue
             if (grandchild.CurrentClassName or "") or (grandchild.CurrentName or ""):
                 continue
-            return False
-    return True
+            copyable = False
+    return copyable, unread, unread_count
+
+
+def _row_copyable(iuia, element) -> bool:
+    """一行会话在聊天区是否还留着框选复制（QQ 的复制项）；实现见 _row_traits。"""
+    return _row_traits(iuia, element)[0]
 
 
 def _element_rect(element) -> tuple[int, int, int, int]:
@@ -551,6 +593,7 @@ class ContactListAccessibility:
                 value = children.GetElement(child_index).CurrentName or ""
                 if value:
                     texts.append(value)
+            copyable, unread, unread_count = _row_traits(iuia, element)
             rows.append(
                 AccessibilityRow(
                     name=texts[0] if texts else "",
@@ -558,13 +601,16 @@ class ContactListAccessibility:
                     rect=rect,
                     selected=ROW_SELECTED_MARKER in class_name,
                     pinned=ROW_PINNED_MARKER in class_name,
-                    copyable=_row_copyable(iuia, element),
+                    copyable=copyable,
+                    unread=unread,
+                    unread_count=unread_count,
                 )
             )
         elapsed_ms = (time.perf_counter() - started) * 1000
         non_copyable = sum(1 for row in rows if not row.copyable)
-        logger.info("accessibility.enumerate rows=%d visible=%d non_copyable=%d elapsed_ms=%.2f",
-                    len(rows), sum(1 for row in rows if row.visible_in(pane)), non_copyable, elapsed_ms)
+        unread_rows = sum(1 for row in rows if row.unread)
+        logger.info("accessibility.enumerate rows=%d visible=%d non_copyable=%d unread=%d elapsed_ms=%.2f",
+                    len(rows), sum(1 for row in rows if row.visible_in(pane)), non_copyable, unread_rows, elapsed_ms)
         return AccessibilityPane(rect=pane, rows=tuple(rows), elapsed_ms=elapsed_ms)
 
     # ── 聊天区枚举 ──────────────────────────────────────────────

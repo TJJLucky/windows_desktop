@@ -53,7 +53,8 @@ class ListContactsResponse(StrictModel):
 
     contacts: dict[str, dict[str, Any]] = Field(
         title="联系人列表",
-        description="联系人名到联系人信息的映射，key 来自 QQ 会话列表（无障碍树行名）。",
+        description="联系人名到联系人信息的映射，key 来自 QQ 会话列表（无障碍树行名）；"
+                    "每行的 unread/unreadCount 来自 QQ 未读角标（unreadCount 取不到时为 null）。",
     )
     count: int = Field(
         ge=0,

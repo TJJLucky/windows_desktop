@@ -332,6 +332,8 @@ def snapshot(hwnd: int, include_non_copyable: bool = False) -> dict[str, dict]:
             "pinned": row.pinned,
             "copyable": row.copyable,
             "refused": row.name in refused,
+            "unread": row.unread,
+            "unreadCount": row.unread_count,
         }
     if filtered:
         logger.info("contacts.snapshot filtered_non_copyable names=%s", filtered)

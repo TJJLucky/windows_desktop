@@ -35,7 +35,8 @@ chat = A.accessibility_chat(hwnd)   # 当前会话的消息
 - `ContactListAccessibility.chat(hwnd) -> AccessibilityChat`
   `contact_name` 当前会话名；`area_rect` 消息区视口；`messages` 全部已渲染消息；
   `visible_messages()` 只留与视口相交的。
-- 每行 `AccessibilityRow`：`name` / `texts` / `rect` / `selected` / `pinned`。
+- 每行 `AccessibilityRow`：`name` / `texts` / `rect` / `selected` / `pinned` / `copyable` /
+  `unread` / `unread_count`（后三个见「未读红点」与「不可复制会话」两节）。
 - 每条 `AccessibilityMessage`：`sender` / `timestamp` / `text` / `texts` / `rect`。
 - 不可用时统一抛 `AccessibilityUnavailableError`（`code = "QQ_ACCESSIBILITY_UNAVAILABLE"`），
   调用方据此回退到截图链路，不应把它当业务失败。
@@ -50,7 +51,10 @@ chat = A.accessibility_chat(hwnd)   # 当前会话的消息
 ```
 q-scroll-view ... recent-contact-list      （列表区，Name="会话列表"）
 └─ recent-contact-item ...                 row rect / --selected / --top
-   └─ Text 昵称 / Text 时间 / Text 预览
+   └─ Group item__content ...              行内容块（头像/文本/角标都挂在它下面）
+      ├─ Text 昵称 / Text 时间 / Text 预览
+      ├─ Group "N条未读"                   未读角标（有未读时才有）
+      └─ Image（无类名、无名字）            服务/系统会话的 <img> 头像 = 不支持复制
 ```
 
 单条消息：
@@ -135,6 +139,30 @@ POST /v1/commands/send   {"commandId":...,"contactName":"TJJ","text":"hi"} -> 42
 `contacts` 响应又以号码为 key、客户端却当昵称用。无障碍树只给名字、客户端也只用名字，
 因此口径统一到 `contactName`；QQ 号降级为诊断（仅 `contacts/current:identify`）。
 
+## 未读红点（新消息判断，2026-10-13 实施）
+
+判断某个会话有没有新消息，直接用树里的**未读角标**，不必再截图找红点 RGB：
+
+- 有未读时，行的内容块（`item__content`）下会多一个**名字形如「N条未读」**的子元素；
+  无未读则没有该元素。真机实测样例：置顶会话 "！" 的内容块下有
+  `Group name="1条未读"`（rect `(435,160,455,180)`，行右侧）。
+- 条数取**角标内层的数字文本**，退回角标自身名字里的数字。
+  坑：外层名字会滞后 —— 真机实测出现过外层 `1条未读` 而内层文本 `3`
+  （消息一直进、名字没刷），所以**条数以内层文本为准**；`99+` 只取第一段数字。
+- 对外字段：`/v1/contacts:query` 每行新增 `unread`（bool）与 `unreadCount`（int 或 null），
+  实现在 `utils/qq/contact_lookup.py:snapshot`（字段名沿用响应里的 camelCase 口径）。
+
+真机实测（2026-10-13，`！` 会话 3 条未读）：
+
+```
+AccessibilityRow: ！  unread=True   unread_count=3   pinned=True  copyable=True
+/v1/contacts:query -> "！": { ..., "unread": true, "unreadCount": 3 }
+```
+
+与旧的图像红点（`utils/qq/user_list.py:check_new_msg`，检测 RGB(247,76,48)、轮廓 200~400px²）
+相比：树里读未读是**同一次列表枚举顺带完成**（真机 10 行枚举约 177 ms，加读未读无可测回归），
+不额外截图、不受主题/DPI 影响；图像红点仍是 `check_new_msg` 的保留能力，仅作兜底/诊断。
+
 ## 落地现状（2026-10-13）
 
 | 环节 | 当前实现 | 提交 |
@@ -144,6 +172,7 @@ POST /v1/commands/send   {"commandId":...,"contactName":"TJJ","text":"hi"} -> 42
 | 读消息（对外 `/v1/commands/read`） | 仍走框选复制（`utils/qq/message.read_messages`），空会话与不可复制会话提前判掉 | `a0e8ec5` |
 | 不可复制会话过滤 | 行结构判据 + 本机学习记录（弱证据两次才生效） | `6f0fdb7` + 本次 |
 | 号码识别 | 仅诊断（`/v1/contacts/current:identify`） | — |
+| 未读/新消息判断 | 无障碍树未读角标（`/v1/contacts:query` 的 `unread`/`unreadCount`） | 本次 |
 
 ## 本次探索的思路取舍（复盘用，避免重走）
 

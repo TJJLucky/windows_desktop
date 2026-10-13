@@ -261,7 +261,7 @@ class UserList:
         self.hwnd = main_window._hWnd
 
     def get_user_list(self, contact_name: str | None = None):
-        """读取会话名单快照（无障碍树）：会话名 → {rect, texts, active, pinned}。
+        """读取会话名单快照（无障碍树）：会话名 → {rect, texts, active, pinned, copyable, refused, unread, unreadCount}。
 
         指定 contact_name 时先滚动确保目标在列表里（找不到抛 ContactNotFoundError）。
         """
