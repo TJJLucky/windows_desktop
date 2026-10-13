@@ -15,6 +15,7 @@
 9. [10-logging-and-diagnostics.md](10-logging-and-diagnostics.md)：应用日志、控制台捕获和诊断字段。
 10. [11-testing-and-operations.md](11-testing-and-operations.md)：构建、真机验收和运行检查清单。
 11. [12-layout-profiles.md](12-layout-profiles.md)：布局版本、模板图片持久化、识别位置接口及可视化管理。
+12. [13-accessibility-tree.md](13-accessibility-tree.md)：无障碍树读取会话列表与聊天区（性能、结构与边界）。
 
 ## 统一约定
 
