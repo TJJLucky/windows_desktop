@@ -89,6 +89,12 @@ def _active_row(region: RegionResult) -> ContactRow:
     if len(absolute) == 1:
         return rows[absolute[0]]
     if len(absolute) > 1:
+        # 歧义基本只有一个来源：某一行正被鼠标悬停。色带里本该只有一个真激活行，但
+        # 常驻 235 灰的行（实测「我的手机」）被悬停时会画成 226 灰，落进同一色带。
+        # 打印候选行的纵坐标与底色，让日志能直接指出是哪几行，而不是只留一个错误码。
+        logger.warning("contacts.number.active_ambiguous candidates=%s",
+                       [(rows[index].avatar[1], UserList.modal_color(_row_image(region, rows[index])))
+                        for index in absolute])
         raise RuntimeError("QQ_CONTACT_NUMBER_ACTIVE_AMBIGUOUS")
     raise RuntimeError("QQ_CONTACT_NUMBER_ACTIVE_NOT_FOUND")
 
@@ -326,6 +332,13 @@ class ContactNumberReader:
                 value = clipboard.read(expected_pid=signature["pid"]).strip()
                 if not re.fullmatch(r"[1-9][0-9]{4,19}", value):
                     raise RuntimeError("QQ_CONTACT_NUMBER_INVALID")
+                # 点击菜单项后指针就停在菜单项上，而菜单紧贴被点的行出现：指针可能正压着
+                # 相邻的一行。真机实测常驻 235 灰的行（如「我的手机」）被悬停时画成 226 灰，
+                # 与激活行同档，于是下面的激活行复核会同时命中两行，误报 ACTIVE_AMBIGUOUS。
+                # 复制动作已经结束，这里先把指针停回列表外的空白处再取复核帧，让复核帧与
+                # 开头基准帧保持同一不变式：没有悬停高亮、也没有压在行上的指针。
+                park_pointer(window)
+                action_barrier = self._clock()
                 frame = checked_frame()
                 if menu_action(frame)[1] is not None:
                     raise RuntimeError("QQ_CONTACT_NUMBER_MENU_CHANGED")
