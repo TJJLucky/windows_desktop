@@ -44,8 +44,6 @@ from dataclasses import dataclass
 
 # comtypes：COM 指针与 COMError
 import comtypes
-# POINTER/cast：把 pywinauto 的 element 转成 IUIAutomationElement
-from comtypes import POINTER, cast
 # UIA：IUIAutomationClient 类型与属性/控件类型常量
 import comtypes.gen.UIAutomationClient as UIA
 # Application / IUIA 一律延迟导入（见下方 _uia_client）：导入即创建 COM 单例，
@@ -109,6 +107,17 @@ class AccessibilityUnavailableError(RuntimeError):
     code = "QQ_ACCESSIBILITY_UNAVAILABLE"
 
 
+class ScrollPatternUnsupported(AccessibilityUnavailableError):
+    """列表容器不发布 ScrollPattern（内容不足一屏时的正常状态）。
+
+    这是"当前这份名单本来就不用滚"的确定性结论，不是元素树瞬时重建，重连重试
+    只会白连三次（真机实测每次都白连，且重连本身是 0xC0000005 崩溃的放大器）。
+    因此它继承可回退的业务错误，但被 is_transient_error 明确排除，不触发重试。
+    """
+
+    code = "QQ_ACCESSIBILITY_SCROLL_UNSUPPORTED"
+
+
 def is_transient_error(error: BaseException) -> bool:
     """判断异常是否为"元素树瞬时重建"这类可重连重试的错误。
 
@@ -116,6 +125,9 @@ def is_transient_error(error: BaseException) -> bool:
     属性会抛出裸 ``ValueError: NULL COM pointer access``（并非 COMError），
     真机实测在窗口刚布局/重绘后必现，因此一并纳入重试。
     """
+    # 不发布 ScrollPattern 是确定性结论，不是瞬态：先判它，别被父类命中
+    if isinstance(error, ScrollPatternUnsupported):
+        return False
     if isinstance(error, (AccessibilityUnavailableError, comtypes.COMError, OSError)):
         return True
     # comtypes 的 NULL 指针访问：COM 事件线程重置元素树时的高频瞬态错误
@@ -434,9 +446,14 @@ class ContactListAccessibility:
         try:
             application, _ = _uia_client()
             app = application(backend="uia").connect(handle=hwnd, timeout=CONNECT_TIMEOUT_SECONDS)
-            element = app.window(handle=hwnd).element_info.element
-            window = cast(element, POINTER(UIA.IUIAutomationElement))
-            # 触发一次属性读取，确认元素真的可用（只 cast 不会暴露失效）
+            # 直接持有 UIA 元素指针本身。绝不能再 cast 成"第二个包装对象"：
+            # ctypes.cast 不会 AddRef，但 comtypes 的指针包装在 __del__ 里照样
+            # Release，于是同一个 COM 元素被多释放一次 —— 之后任何一次 GC 落到
+            # 已释放的指针上就是进程级 0xC0000005 访问违例（真机复现：连续重连
+            # 数次后，GC 恰好发生在 find_elements 内时崩溃）。持有同一个对象，
+            # 引用计数才是平衡的。
+            window = app.window(handle=hwnd).element_info.element
+            # 触发一次属性读取，确认元素真的可用（拿到指针不等于元素有效）
             _ = window.CurrentBoundingRectangle
         except Exception as error:
             self._reset()
@@ -469,10 +486,16 @@ class ContactListAccessibility:
         return element
 
     def _scroll_pattern(self, hwnd: int):
-        """取会话列表的 ScrollPattern 接口。"""
+        """取会话列表的 ScrollPattern 接口；容器不发布时抛非瞬态业务错误。"""
         element = self._pane_element(hwnd)
-        return element.GetCurrentPattern(
-            UIA.UIA_ScrollPatternId).QueryInterface(UIA.IUIAutomationScrollPattern)
+        pattern = element.GetCurrentPattern(UIA.UIA_ScrollPatternId)
+        # 元素不支持该 Pattern 时 GetCurrentPattern 返回空指针（不抛异常）；
+        # 直接 QueryInterface 会得到 comtypes 的 "NULL COM pointer access"，
+        # 那既不是真错误码、又被误判成瞬态。这里显式判空、给出确定语义。
+        if not pattern:
+            raise ScrollPatternUnsupported(
+                "pane {name!r} does not expose ScrollPattern".format(name=LIST_PANE_NAME))
+        return pattern.QueryInterface(UIA.IUIAutomationScrollPattern)
 
     def scroll_state(self, hwnd: int) -> AccessibilityScroll:
         """读取列表滚动状态；容器不发布 ScrollPattern 时抛业务错误。"""

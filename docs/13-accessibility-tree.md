@@ -118,6 +118,8 @@ pane rect (l,t,r,b) = (70, 115, 383, 1385)      行高 80px
   一次右键「复制 QQ 号」），业务链路不再碰号码（见
   [04-user-list-and-activation.md](04-user-list-and-activation.md)）；
 - 长列表仍要滚动：树里只保留「视口附近约一屏半」的行，更远的行不在树里；
+  且名单**不足一屏时容器根本不发布 ScrollPattern**（真机实测 `IsScrollPatternAvailable=False`），
+  百分比滚动定位不可用，此时自动回退滚轮扫掠；
 - 图片消息只有「图片」占位文字，拿不到本地文件路径（现网框选复制能给出 `<img src=...>`）；
 - 时间戳是 QQ 的显示格式（`昨天 12:42` / `星期日` / `10/01`），不是绝对时间；
 - 依赖 QQ 暴露无障碍层：QQ 大版本更新可能改结构，窗口最小化时读不到 —— 两种情况统一抛
@@ -163,6 +165,71 @@ AccessibilityRow: ！  unread=True   unread_count=3   pinned=True  copyable=True
 相比：树里读未读是**同一次列表枚举顺带完成**（真机 10 行枚举约 177 ms，加读未读无可测回归），
 不额外截图、不受主题/DPI 影响；图像红点仍是 `check_new_msg` 的保留能力，仅作兜底/诊断。
 
+## 进程级崩溃 0xC0000005：comtypes 指针被多释放一次（2026-10-13 修复）
+
+**现象**：`POST /v1/contacts:query`（带 `contactName`）调几次之后整个服务进程退出，
+退出码 `-1073741819 (0xC0000005)`。日志末尾固定长这样：
+
+```
+accessibility.enumerate rows=10 ... elapsed_ms=202.11
+accessibility.enumerate rows=10 ... elapsed_ms=39.49
+WARNING accessibility.scroll_state.retry attempt=1 reason=NULL COM pointer access
+accessibility.connect hwnd=722622 previous=None
+WARNING accessibility.scroll_state.retry attempt=2 reason=NULL COM pointer access
+...
+accessibility.connect hwnd=722622 previous=None      <- 这行之后进程就没了
+```
+
+**定位**（`python -X faulthandler` 直接跑 `contact_lookup.list_contacts(name)`，可 100% 复现）：
+faulthandler 打出的原生栈是
+
+```
+Garbage-collecting
+comtypes/_post_coinit/unknwn.py:420 in Release
+comtypes/_post_coinit/unknwn.py:288 in __del__
+pywinauto/findwindows.py:181 in find_elements
+... application.py -> wait_until_passes -> __resolve_control
+utils/qq/accessibility.py:437 in _connect
+```
+
+即 **GC 恰好在 `_connect` 的 `find_elements` 执行期间触发，去 `Release()` 一个已经释放过的
+COM 指针** → 访问违例。不是 QQ 窗口的问题，是本进程把指针释放多了。
+
+**根因**：`_connect` 里原本写的是
+
+```python
+element = app.window(handle=hwnd).element_info.element
+window = cast(element, POINTER(UIA.IUIAutomationElement))   # ← 崩溃源
+```
+
+`comtypes.cast is ctypes.cast`（就是同一个函数，实测为 True）。它只是把**同一个地址再包一层**：
+新包装对象**没有 AddRef**，但 comtypes 的指针包装在 `__del__` 里照样 `Release()`。
+于是同一个 UIA 元素被释放两次 —— 先到的那个把元素销毁，另一个包装就成了悬垂指针，
+之后任何一次 GC 落到它上面就是 `0xC0000005`。重连次数越多、GC 越容易撞上（
+`scroll_state` 每次白重连 3 次，一次查找白连 6 次，正好是放大器）。
+
+**A/B 实测**：只把 `cast` 换成恒等映射（`lambda obj, typ: obj`），同一段压测立刻从「必崩」
+变成「全过」。**修复**就是删掉这次 cast，改成直接持有 `element_info.element` 本身
+（同一个对象，引用计数平衡：`ElementFromHandle` +1 ↔ 丢弃时 -1），见 `accessibility.py:_connect`。
+
+**顺带修掉「白重连」**：会话名单不足一屏时，QQ（Chromium）**根本不发布 ScrollPattern**
+（`GetCurrentPattern(UIA_ScrollPatternId)` 返回空指针，`IsScrollPatternAvailable=False`）。
+空指针再 `.QueryInterface(...)` 会抛裸 `ValueError: NULL COM pointer access`，被
+`is_transient_error` 误判成「元素树瞬时重建」，于是每读一次滚动状态就白重连 3 次。
+现在 `_scroll_pattern` 先判空，抛新增的 `ScrollPatternUnsupported`（继承
+`AccessibilityUnavailableError` 以复用调用方的回退口径，但被 `is_transient_error`
+**明确排除**，不再重试）：调用方照旧 `except AccessibilityUnavailableError` → 回退滚轮扫掠。
+
+真机验证（2026-10-13，hwnd=722622，10 行名单）：
+
+| 项目 | 修前 | 修后 |
+| --- | --- | --- |
+| `list_contacts("不存在的名字")` ×3 | 第 3 轮进程 0xC0000005 退出 | 3 轮全部正常抛 `ContactNotFoundError` |
+| 80 轮 `snapshot` + `_reset()` + 强制 GC | — | 无崩溃 |
+| `scroll_state`（名单不足一屏） | 6 次重连后报业务错误 | **10 ms** 内直接抛 `ScrollPatternUnsupported` |
+| 临时服务 `POST /v1/contacts:query` ×12 | 崩溃 | 12/12 存活（6 次空查询 200、6 次未知名 503 业务错误） |
+| `POST /v1/contacts/current:identify` ×3 | — | 3/3 200，返回 `3442859534`（717~1136 ms） |
+
 ## 落地现状（2026-10-13）
 
 | 环节 | 当前实现 | 提交 |
@@ -173,6 +240,7 @@ AccessibilityRow: ！  unread=True   unread_count=3   pinned=True  copyable=True
 | 不可复制会话过滤 | 行结构判据 + 本机学习记录（弱证据两次才生效） | `6f0fdb7` + 本次 |
 | 号码识别 | 仅诊断（`/v1/contacts/current:identify`） | — |
 | 未读/新消息判断 | 无障碍树未读角标（`/v1/contacts:query` 的 `unread`/`unreadCount`） | 本次 |
+| UIA 指针生命周期 / 滚动状态 | 单指针持有（不再 `ctypes.cast` 二次包装）；`ScrollPatternUnsupported` 不重试 | 本次 |
 
 ## 本次探索的思路取舍（复盘用，避免重走）
 
@@ -197,6 +265,7 @@ AccessibilityRow: ！  unread=True   unread_count=3   pinned=True  copyable=True
 2. 框选复制继续留在两条链路（空会话判定、无障碍树不可用时的回退），
    继续压缩它在真机上的 COM 崩溃面（底层 `_ctypes.pyd 0xc0000005` 未根治，
    已确认普通扫名单不再触发）。
+   注：无障碍树侧那次 `0xC0000005` 不是同一类，已按上文定位并修复（多释放一次指针）。
 3. 清理只剩诊断用途的号码链路：`utils/qq/contact_number.py`、`utils/qq/contact_scan.py`（已删）、
    `templates/copy_qq_number.png`，按「是否还保留 `contacts/current:identify`」决定去留。
 
