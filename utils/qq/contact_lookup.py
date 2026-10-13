@@ -147,6 +147,13 @@ REFUSAL_FAILURE_CODES = frozenset({
     "QQ_COPY_TEXT_EMPTY",
     "QQ_COPY_ACTION_NOT_FOUND",
 })
+# 弱证据：拖拽没能进入框选态。没有消息的空会话（画布是纯色，但像素判空没认出来：
+# 右侧资料栏顶掉了消息视口、别的主题/DPI 下底色采样失手、截图取到一帧陈旧画面……）
+# 也会报这个码。这种会话必须留在名单里，因此它单独一次失败不生效，连续两次才把它
+# 记成"QQ 拒绝复制"——否则一个真实（只是没消息）的会话会被永久筛掉，静默丢掉供应商。
+# 进了多选态之后才失败的几个码是强证据（QQ 确实拒绝了这次复制），一次即生效。
+REFUSAL_WEAK_CODES = frozenset({"QQ_SELECTION_NOT_ENTERED"})
+REFUSAL_MIN_STRIKES = 2
 
 
 def _refusal_learning_enabled() -> bool:
@@ -180,9 +187,27 @@ def refused_contacts() -> dict[str, dict]:
     return contacts if isinstance(contacts, dict) else {}
 
 
+def _strikes_required(code: str) -> int:
+    """该失败码要连续记几次才生效（弱证据见 ``REFUSAL_WEAK_CODES``）。"""
+    return REFUSAL_MIN_STRIKES if code in REFUSAL_WEAK_CODES else 1
+
+
+def refusal_is_effective(info: dict | None) -> bool:
+    """一条学习记录是否已生效（够次数）。"""
+    if not isinstance(info, dict):
+        return False
+    return int(info.get("count") or 0) >= _strikes_required(str(info.get("code") or ""))
+
+
+def confirmed_refusals() -> dict[str, dict]:
+    """已生效的拒绝记录（名单筛除与快速报错都用它）。"""
+    return {name: info for name, info in refused_contacts().items()
+            if refusal_is_effective(info)}
+
+
 def is_refused(contact_name: str) -> bool:
-    """该昵称是否已被记为"QQ 拒绝复制"。"""
-    return contact_name in refused_contacts()
+    """该昵称是否已被确认为"QQ 拒绝复制"（弱证据要够次数才算）。"""
+    return refusal_is_effective(refused_contacts().get(contact_name))
 
 
 def record_refused_copy(contact_name: str, failure_code: str) -> None:
@@ -208,8 +233,14 @@ def record_refused_copy(contact_name: str, failure_code: str) -> None:
             json.dumps({"schemaVersion": 1, "contacts": contacts}, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        logger.warning("contacts.refused.learned contact=%s code=%s count=%s",
-                       name, code, contacts[name]["count"])
+        entry = contacts[name]
+        if refusal_is_effective(entry):
+            logger.warning("contacts.refused.learned contact=%s code=%s count=%s",
+                           name, code, entry["count"])
+        else:
+            logger.warning(
+                "contacts.refused.pending contact=%s code=%s count=%s strikes=%s",
+                name, code, entry["count"], _strikes_required(code))
     except OSError as exc:  # 只是学习记录，写不进去也必须让原错误照常抛出
         logger.warning("contacts.refused.record_failed contact=%s error=%s", name, exc)
 
@@ -281,7 +312,7 @@ def snapshot(hwnd: int, include_non_copyable: bool = False) -> dict[str, dict]:
     标出被筛掉的那些（诊断用）。
     """
     pane = read_pane(hwnd)
-    refused = refused_contacts()
+    refused = confirmed_refusals()
     contacts: dict[str, dict] = {}
     filtered: list[str] = []
     refused_in_view: list[str] = []

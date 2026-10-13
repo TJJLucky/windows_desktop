@@ -43,8 +43,11 @@ _MESSAGE_SELECTION_DRAG_DURATION = 0.2
 # 陌生人会话、"我的手机"）误判成空会话而返回 0 条消息。
 _EMPTY_CHAT_BACKGROUND = (245, 245, 245)
 _EMPTY_CHAT_SAMPLE_WIDTH = 384
-# 右侧采样条要让开的滚动条/窗口边框宽度。
+# 采样条要让开的滚动条/窗口边框宽度：右侧让开滚动条，左侧让开消息区左边界上的
+# 分隔线/阴影。真机实测该竖线 1~2px，别的 DPI/主题下可能更宽；不躲开它时空会话的
+# 底色占比会被拉到阈值以下，纯色画布就被误判成"有消息"而去框选（进而报错）。
 _EMPTY_CHAT_RIGHT_MARGIN = 16
+_EMPTY_CHAT_LEFT_MARGIN = 16
 _EMPTY_CHAT_BACKGROUND_RATIO = 0.995
 
 # 空会话判定用的消息视口宽度下限与左界容差：无障碍树的“消息列表”容器与模板区域
@@ -238,11 +241,13 @@ def _sample_crop(
     *,
     from_right: bool = False,
     right_margin: int = 0,
+    left_margin: int = 0,
 ):
     """裁出消息区宽度为 ``width`` 的采样条（截图内坐标），越界返回 None。
 
     ``from_right=True`` 时从消息区右边界（先让开 ``right_margin`` 像素的滚动条/边框）
-    往左取一条，用来识别"气泡全在右侧"的会话；默认取左侧边距一条。
+    往左取一条；默认从消息区左边界往右取一条。``left_margin``/``right_margin`` 用来
+    让开消息区两侧的边界像素（分隔线、阴影、滚动条），这些像素不是画布底色。
     """
     if image is None:
         return None
@@ -252,7 +257,7 @@ def _sample_crop(
         right = min(image.width, int(region["right"]) - int(window.left) - right_margin)
         left = max(0, right - width)
     else:
-        left = max(0, int(region["left"]) - int(window.left))
+        left = max(0, int(region["left"]) - int(window.left) + max(0, left_margin))
         right = min(image.width, int(region["right"]) - int(window.left), left + width)
     if right <= left or bottom <= top:
         return None
@@ -313,7 +318,10 @@ def _is_empty_message_region(
     的会话）误判成空会话；只看右侧则会把群成员栏/资料栏算进来。底色按当前主题
     自适应（见 ``_canvas_background``），不再写死浅灰。
     """
-    left_crop = _sample_crop(image, window, region, _EMPTY_CHAT_SAMPLE_WIDTH)
+    left_crop = _sample_crop(
+        image, window, region, _EMPTY_CHAT_SAMPLE_WIDTH,
+        left_margin=_EMPTY_CHAT_LEFT_MARGIN,
+    )
     if left_crop is None:
         return False
     if not _is_blank_canvas_crop(left_crop, background):
