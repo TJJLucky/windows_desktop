@@ -735,13 +735,22 @@ def query_contacts(contact_name: str | None = None,
                    all_contacts: bool = False) -> dict:
     """服务层入口：返回 ``{"contacts": 昵称 → 行信息, "complete": 是否覆盖整张名单}``。
 
-    默认只读当前一屏；``all_contacts=True`` 时滚动扫掠整张名单（不只当前一屏）。
+    默认只读当前一屏；``all_contacts=True`` 时返回整张名单（不只当前一屏）——
+    当前一屏就等于整张名单时不扫掠。
     指定 ``contact_name`` 时先按昵称滚动定位（未找到抛 ContactNotFoundError）。
     ``complete`` 如实标注"这份名单是否覆盖了全部会话"：容器能力或扫掠自检不能确认时
     返回 False，绝不谎报全量。
     """
     hwnd = ensure_qq_window_with_retry()._hWnd
     if all_contacts:
+        # 名单不足一屏时不扫掠：先读当前屏，确认整张名单都在视口内就直接返回，不滚动列表。
+        pane = read_pane(hwnd)
+        if _screen_is_complete(hwnd, pane):
+            logger.info("contacts.scan.shortcut rows=%d", len(pane.rows))
+            return {
+                "contacts": _assemble(pane.rows, confirmed_refusals(), include_non_copyable),
+                "complete": True,
+            }
         contacts, complete = scan_all_contacts(hwnd, include_non_copyable)
         return {"contacts": contacts, "complete": complete}
     if contact_name:
