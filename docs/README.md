@@ -7,11 +7,11 @@
 1. [01-exe-only-packaging.md](01-exe-only-packaging.md)：只支持 PyInstaller 单文件 exe 的发布方案。
 2. [02-window-layout-and-topmost.md](02-window-layout-and-topmost.md)：窗口就绪、布局、置顶和焦点策略。
 3. [03-screenshot-and-dpi.md](03-screenshot-and-dpi.md)：WGC 截图、物理像素和 DPI 约定。
-4. [04-user-list-and-activation.md](04-user-list-and-activation.md)：用户列表识别、按 QQ 号激活与右键菜单复制号码。
+4. [04-user-list-and-activation.md](04-user-list-and-activation.md)：会话名单读取（无障碍树）、按会话名滚动定位与激活、不可复制会话过滤。
 5. [06-message-read-and-retry.md](06-message-read-and-retry.md)：消息读取、激活与失败重试。
 6. [07-send-and-command-ledger.md](07-send-and-command-ledger.md)：发送流程、幂等键和结果状态。
 7. [08-http-api-and-contracts.md](08-http-api-and-contracts.md)：FastAPI 接口、中文 OpenAPI 和错误语义。
-8. [09-chat-history.md](09-chat-history.md)：按 QQ 号维护的聊天记录。
+8. [09-chat-history.md](09-chat-history.md)：按会话名维护的聊天记录。
 9. [10-logging-and-diagnostics.md](10-logging-and-diagnostics.md)：应用日志、控制台捕获和诊断字段。
 10. [11-testing-and-operations.md](11-testing-and-operations.md)：构建、真机验收和运行检查清单。
 11. [12-layout-profiles.md](12-layout-profiles.md)：布局版本、模板图片持久化、识别位置接口及可视化管理。
@@ -22,6 +22,6 @@
 - 发行形态：只支持 PyInstaller 单文件 exe。
 - 运行形态：Windows 登录用户交互桌面，不注册 Windows Service。
 - 网络边界：只监听 `127.0.0.1` 随机端口。
-- 联系人键：使用右键菜单「复制 QQ 号」得到、并由 QQ 号复核的精确号码。
+- 联系人键：QQ 会话列表里会话行自报的名字（无障碍树行名）；`/v1/contacts:query` 返回的 key 原样回传。
 - 串行边界：QQ 读写通过 `Dispatcher` 单消费者队列执行；布局检测和切换与该队列共享桌面操作锁，忙碌时拒绝管理操作。
 - 日志：应用结构化日志和完整控制台日志都写入 `<state-dir>/logs/`。

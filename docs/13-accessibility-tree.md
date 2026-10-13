@@ -110,7 +110,8 @@ pane rect (l,t,r,b) = (70, 115, 383, 1385)      行高 80px
 
 ## 已知边界
 
-- **只给名字，不含 QQ 号**；号码仍需右击菜单「复制 QQ 号」取得（见
+- **只给名字，不含 QQ 号**：号码只留一个诊断入口（`POST /v1/contacts/current:identify`,
+  一次右键「复制 QQ 号」），业务链路不再碰号码（见
   [04-user-list-and-activation.md](04-user-list-and-activation.md)）；
 - 长列表仍要滚动：树里只保留「视口附近约一屏半」的行，更远的行不在树里；
 - 图片消息只有「图片」占位文字，拿不到本地文件路径（现网框选复制能给出 `<img src=...>`）；
@@ -118,23 +119,31 @@ pane rect (l,t,r,b) = (70, 115, 383, 1385)      行高 80px
 - 依赖 QQ 暴露无障碍层：QQ 大版本更新可能改结构，窗口最小化时读不到 —— 两种情况统一抛
   `AccessibilityUnavailableError` 让调用方回退。
 
-## 与现有「QQ 号」契约的冲突（待决策）
+## 契约口径：统一为 contactName（2026-10-13 已实施）
 
-`service/contracts.py` 的 `/v1/contacts:query`、`/v1/commands/read`、`/v1/commands/send`
-目前只接受 `qqNumber`（`extra="forbid"`），而客户端
-`price-agent-next/apps/desktop/electron/main/qq/connector.ts` 全链路只发 `contactName`。
-2026-10-13 用客户端真实载荷离线打服务端接口：
+`service/contracts.py` 与命令账本的目标口径已从 `qqNumber` 改成 `contactName`。
+改之前客户端一次都调不通（真实载荷离线打服务端）：
 
 ```
 POST /v1/contacts:query  {"contactName":"TJJ"}   -> 422 extra_forbidden
 POST /v1/commands/read   {"contactName":"TJJ"}   -> 422 missing qqNumber + extra_forbidden
 POST /v1/commands/send   {"commandId":...,"contactName":"TJJ","text":"hi"} -> 422 同上
-POST /v1/contacts:query  {"qqNumber":"10001"}    -> 200
 ```
 
-即：客户端当前一次都调不通；而 `contacts` 响应是以号码为 key，客户端却把它当昵称用。
-无障碍树只给名字，客户端也只用名字，因此后续倾向把目标口径统一到 `contactName`
-（号码仅在需要时对命中行做一次复核，建立 名字 ↔ 号码 映射）。此改动跨两个仓库，尚未实施。
+原因是旧契约只收 `qqNumber`（`extra="forbid"`），而客户端
+`price-agent-next/apps/desktop/electron/main/qq/connector.ts` 全链路只发 `contactName`，
+`contacts` 响应又以号码为 key、客户端却当昵称用。无障碍树只给名字、客户端也只用名字，
+因此口径统一到 `contactName`；QQ 号降级为诊断（仅 `contacts/current:identify`）。
+
+## 落地现状（2026-10-13）
+
+| 环节 | 当前实现 | 提交 |
+| --- | --- | --- |
+| 会话名单枚举 / 滚动定位 / 点击激活 | 无障碍树（`utils/qq/contact_lookup.py`） | `6f0fdb7` |
+| 聊天区会话名、消息枚举 | 无障碍树（`utils/qq/accessibility.py`） | `5205116` |
+| 读消息（对外 `/v1/commands/read`） | 仍走框选复制（`utils/qq/message.read_messages`），空会话与不可复制会话提前判掉 | `a0e8ec5` |
+| 不可复制会话过滤 | 行结构判据 + 本机学习记录（弱证据两次才生效） | `6f0fdb7` + 本次 |
+| 号码识别 | 仅诊断（`/v1/contacts/current:identify`） | — |
 
 ## 本次探索的思路取舍（复盘用，避免重走）
 
@@ -154,13 +163,13 @@ POST /v1/contacts:query  {"qqNumber":"10001"}    -> 200
 
 ## 后续计划（按此顺序）
 
-1. 联系人查找改走无障碍树：读 `pane()` → 命中且可见直接返回；未命中则只在列表区滚一屏
-   后重读，用「行名 + rect 指纹与上页完全相同」判定已到顶/底；点击直接用该行 rect 中心。
-   目标行在视口外、长列表滚动、群与官方号（可能没有「复制 QQ 号」）、窗口中途移动都要覆盖。
-2. 契约口径统一（跨仓库，需先确认）。
-3. 读消息改走无障碍树 `chat()`，`AccessibilityUnavailableError` 时回退现有框选复制。
-4. 清理旧链路：删除 `utils/qq/contact_scan.py` 中永不成立的
-   `if self._scan_context() != context`；把滚动后固定 `sleep(2.0)` 改为位移稳定判定。
+1. 读消息也改走无障碍树 `chat()`（热读 74 ms vs 框选 1770 ms）：先做「树里消息 ↔ 框选文本」
+   的对照验证，再切主路径，`AccessibilityUnavailableError` 时回退框选。
+2. 框选复制继续留在两条链路（空会话判定、无障碍树不可用时的回退），
+   继续压缩它在真机上的 COM 崩溃面（底层 `_ctypes.pyd 0xc0000005` 未根治，
+   已确认普通扫名单不再触发）。
+3. 清理只剩诊断用途的号码链路：`utils/qq/contact_number.py`、`utils/qq/contact_scan.py`（已删）、
+   `templates/copy_qq_number.png`，按「是否还保留 `contacts/current:identify`」决定去留。
 
 ## 如何复现（只读，不点击）
 

@@ -1,6 +1,6 @@
 # Windows 桌面集成（windows_desktop）
 
-对 Windows 桌面 GUI（以 QQ 为主）进行自动化操作的集成包：窗口管理、后台截图（WGC）、图像识别（模板匹配 + OCR）、鼠标键盘模拟，以及 QQ 用户列表/输入框/消息区的识别与操作。
+对 Windows 桌面 GUI（以 QQ 为主）进行自动化操作的集成包：窗口管理、后台截图（WGC）、图像识别（模板匹配 + OCR）、无障碍树（UI Automation）读取、鼠标键盘模拟，以及 QQ 会话列表/输入框/消息区的识别与操作。
 
 `utils/` 是实现层；`service/` 是对外接口层。所有 QQ 操作统一经由 `Dispatcher` 单消费者队列执行，保证全局不并发。
 
@@ -105,7 +105,7 @@ endpoint 文件记录动态 loopback URL 与本次启动的进程 pid（无 toke
 - 单个日志文件达到 5 MB 后轮转，保留 5 个历史文件。
 - endpoint 文件同时写入 `logDirectory`、`applicationLog`、`consoleLog`，调用方可直接定位。
 
-聊天记录以 `qqNumber` 为分区键；调用方应使用 `/v1/contacts:query` 返回的用户列表 key 原样传回。
+聊天记录以 `contactName` 为分区键；调用方应使用 `/v1/contacts:query` 返回的会话名单 key 原样传回。
 
 接口：
 
@@ -113,7 +113,7 @@ endpoint 文件记录动态 loopback URL 与本次启动的进程 pid（无 toke
 | --- | --- | --- |
 | `GET` | `/v1/health` | 服务和 API 版本状态 |
 | `POST` | `/v1/contacts:query` | 读取当前 QQ 联系人 |
-| `POST` | `/v1/contacts/current:identify` | 复制当前激活行的 QQ 号（不发送） |
+| `POST` | `/v1/contacts/current:identify` | 复制当前激活行的 QQ 号（诊断用，不发送） |
 | `POST` | `/v1/commands/read` | 读取指定联系人的可见消息 |
 | `POST` | `/v1/commands/send` | 向指定联系人发送消息 |
 | `GET` | `/v1/commands/{commandId}` | 查询发送命令状态 |
@@ -132,7 +132,7 @@ Content-Type: application/json
 
 {
   "commandId": "cloud-effect-key-or-caller-uuid",
-  "qqNumber": "2881734702",
+  "contactName": "华强电子",
   "text": "STM32F103C8T6，数量 100，请报价。"
 }
 ```
@@ -172,9 +172,9 @@ Content-Type: application/json
 | `window_ops.py` | QQ 进程/窗口枚举、快捷键唤起（Ctrl+Alt+X 打开/隐藏所有窗口，有进程无窗口时唤醒）、`get_main_window` / `ensure_qq_window_with_retry` |
 | `regions.py` | `RegionResult`；`get_userList_region_and_image` / `get_inputbox_region_and_image` / `get_message_box_region_and_image` / `get_input_buttom_region`；模板在 `templates/` |
 | `models.py` | 数据模型：`User`（`to_dict`） |
-| `user_list.py` | `UserList`（单例）：霍夫圆定位用户行 → 逐行右键复制 QQ 号得到行身份 → 红点检测；`active_user_by_number`（滚动查找 + 精确激活 + 号码复核）、`get_user_list`（当前屏幕 QQ 号快照） |
-| `input.py` | `InputBox`（单例）：`send_text(qq_number, text)` 内部自动激活会话→聚焦→剪贴板粘贴→Ctrl+V→按 Enter 快捷键发送 |
-| `message.py` | `MessageList`（单例）：`read_messages(qq_number)` 内部自动激活会话→左上到右下框选→定位并点击 `copy_icon.png`→读取剪贴板→解析 sender/timestamp/text/rawText |
+| `user_list.py` | `UserList`（单例）：`activate`（按会话名激活，见 `contact_lookup`）、`get_user_list`（会话名单快照）、`refresh_image`（截图与区域，供红点/激活态图像判定） |
+| `input.py` | `InputBox`（单例）：`send_text(contact_name, text)` 内部按会话名激活（无障碍树）→聚焦→剪贴板粘贴→Ctrl+V→按 Enter 快捷键发送 |
+| `message.py` | `MessageList`（单例）：`read_messages(contact_name)` 内部按会话名激活→判空（空白会话直接返回 0 条）→左上到右下框选→定位并点击 `copy_icon.png`→等剪贴板写入后退出多选→解析 sender/timestamp/text/rawText |
 | `hotkeys.py` | QQ 全局快捷键配置表（Ctrl+Alt+X 打开/隐藏所有窗口、Enter 发送）与 `send_hotkey` 发送原语 |
 | `dispatcher.py` | `Dispatcher` 单消费者任务队列（唯一入口）：`get_contact_list` / `send_message` / `read_message_list`（发送/读取内部自动激活用户） |
 
@@ -203,8 +203,8 @@ messages, exc = op.read_message_list("华强电子", timeout=120.0)
 | 工具 | 队列 API |
 | --- | --- |
 | `list_qq_contacts` | `get_contact_list()` |
-| `send_qq_message(qq_number, text)` | `send_message(qq_number, text)` |
-| `read_qq_messages(qq_number)` | `read_message_list(qq_number)` |
+| `send_qq_message(contact_name, text)` | `send_message(contact_name, text)` |
+| `read_qq_messages(contact_name)` | `read_message_list(contact_name)` |
 
 ---
 
@@ -217,30 +217,41 @@ messages, exc = op.read_message_list("华强电子", timeout=120.0)
 - **补充资源**：`libs/wgc_capture.dll` 原生截获库；`debug/` 调试图片可随时清理。
 
 
-### 当前联系人号码识别（第一阶段）
+### 会话定位与名单（无障碍树）
 
-`POST /v1/contacts/current:identify` 接收空请求或 `{}`，拒绝坐标、URL、脚本和文件路径。
-成功返回 `{"qqNumber":"800888598"}`。菜单没有“复制 QQ 号”时返回 HTTP 200：
-`{"qqNumber":null,"skipped":true,"reason":"QQ_CONTACT_NUMBER_COPY_UNAVAILABLE"}`，关闭菜单并跳过此行。
-本接口只处理当前激活行，不主动选择下一行，不查找、滚动或发送。
+会话身份取 QQ 会话列表里会话行自报的名字（好友昵称/备注、群名、官方号名），统一叫
+`contactName`；不再使用 QQ 号作为主键，也不做昵称 OCR。查找、滚动、激活都走 UI Automation
+无障碍树（`utils/qq/contact_lookup.py` + `utils/qq/accessibility.py`）：
 
-号码复制在单消费者队列内执行：QQ 窗口就绪 → 头像定位当前行 → 原生鼠标直接右键行左侧 →
-仅在用户列表截图中唯一匹配 `copy_qq_number` 版本模板 → 点击 → 校验新剪贴板序列、QQ 进程归属和纯号码。
-窗口/标题/行身份变化、菜单改变或歧义、剪贴板超时与非号码均返回明确 `QQ_CONTACT_NUMBER_*` 错误（HTTP 503），不自动重试，不回退昵称 OCR。
-菜单最多等待 2 秒，出现即继续；没有固定的拟人鼠标移动延迟。
+- `POST /v1/contacts:query` 可传 `{"contactName":"华强电子"}`：先读当前屏，未命中才在列表区滚动查找（优先 UIA `ScrollPattern` 按百分比定位，容器不发布该 Pattern 时退回滚轮逐段下滚）。
+- 行自带屏幕物理像素矩形，命中行的中心点即点击坐标；已是当前会话时直接返回、不点击（点击已激活行会切掉激活高亮）。
+- 点击后在 4 秒窗口内轮询两个独立信号确认切换生效（聊天区标题 == 目标名，或目标行带上激活标记），两个信号每轮都判；同名多行报 `QQ_CONTACT_AMBIGUOUS`。
+- 名单快照默认筛掉 QQ 没给复制项的会话（`我的手机`、`QQ邮箱提醒` 等，判据见行结构），以及本机读过的“QQ 拒绝复制”会话（`QQ团队`、临时会话邀请卡片、只含系统占位消息的会话）。
+- **空会话**：没有任何消息的会话读取时返回 0 条消息，不进入框选、不报错（判空细节见 [docs/06](docs/06-message-read-and-retry.md)）。
 
-模板使用既有版本管理接口上传、持久化和读取图片；内置默认版本仍不可覆盖或删除。
-布局库升级时仅一次性补全旧自定义版本缺少的新模板字段，不覆盖用户已有图片；运行时缺图报错，不回退默认版本。
-操作日志记录耗时和失败/跳过原因，不记录号码；本轮保留原有发送链路不变。
+### 消息读取
 
-### 按 QQ 号滚动查找与激活（第二阶段）
+消息正文仍走 QQ 原生框选复制（不做 OCR）：按会话名激活 → 判空 → 左上到右下框选 → 定位并点击复制按钮 → 等剪贴板写入后按 Esc 退出多选 → 解析 `sender`/`timestamp`/`text`/`rawText`。
+空白会话在框选前就返回 0 条。判空视口、提示浮层、异步复制与失败语义见 [docs/06-message-read-and-retry.md](docs/06-message-read-and-retry.md)。
 
-联系人身份完全由右键菜单「复制 QQ 号」决定，昵称 OCR 方案已移除：
+### 不可复制会话（学习记录）
 
-- `POST /v1/contacts:query` 可传 `{"qqNumber":"2881734702"}`：先读当前屏，未命中才逐屏滚动查找。
-- 扫描只在好友列表区域内滚动，不点击、不切换会话；用头像像素指纹判断真实滚动量，最多 20 屏 / 90 秒。
-- 目标行即当前激活行时跳过点击（点击已激活行会把激活高亮切掉）；否则点击行头像圆心并复核。
-- 激活判定以行背景绝对色带为准（浅色主题激活约 226 灰、未激活约 245 灰、悬停约 235 灰），不使用右上角标题 OCR，也不使用「相对离群」兜底。
-- 点击后 QQ 约 0.25s 重绘，因此在 4 秒内重试「复制当前激活行号码」，与目标号完全一致才算成功。
-- 行是群或菜单没有「复制 QQ 号」时返回跳过原因（`SKIPPED_COPY_UNAVAILABLE`），不猜坐标、不回退 OCR。
-- 菜单判定先在点击点附近的小 ROI 内做近白面板预筛，再单尺度匹配 `copy_qq_number` 模板（未命中回退多尺度）；无「复制 QQ 号」的菜单在 0.3 秒确认窗口内快速退出，不再空等满 2 秒。
+QQ 对 `我的手机`、`QQ邮箱提醒`、官方号 `QQ团队`、临时会话邀请卡片、只含系统占位消息的会话等
+禁用了框选复制。首次真实读取失败后按昵称记进 `<state>/non-copyable-contacts.json`，之后从
+名单筛掉；直接读取它们毫秒级返回 `QQ_CONTACT_NOT_COPYABLE`（HTTP 503），不再重跑十几秒的
+失败框选。
+
+- 分强弱两级：进了多选态才失败的码（剪贴板不变/文本为空/复制项缺失）一次即生效；没进多选态
+  （`QQ_SELECTION_NOT_ENTERED`）是弱证据，**连续两次**才生效——真机上没有消息的空会话也会报这个码，
+  只记一次就把真实供应商静默筛掉了。
+- 关闭：环境变量 `QQ_CONTACT_REFUSAL_LEARNING=0`。
+- 清空：删除该 JSON 文件。
+
+### 号码识别（诊断）
+
+`POST /v1/contacts/current:identify` 只识别当前激活行、不发送：头像定位当前行 → 右键 → 匹配
+`copy_qq_number` 模板 → 点击 → 校验剪贴板序列、进程归属与纯号码。成功返回
+`{"qqNumber":"800888598"}`；菜单没有“复制 QQ 号”时返回 HTTP 200
+`{"qqNumber":null,"skipped":true,"reason":"QQ_CONTACT_NUMBER_COPY_UNAVAILABLE"}`。此接口不再
+充当联系人查找手段，只留作诊断；窗口/标题/行身份变化、菜单改变或歧义、剪贴板超时与非号码均
+返回明确 `QQ_CONTACT_NUMBER_*` 错误（HTTP 503），不自动重试、不回退昵称 OCR。

@@ -35,7 +35,7 @@ conda run -n qq-desktop-service python .skills\qq-desktop-package\scripts\build_
 - Windows 交互桌面（不能是锁屏、远程断开或无人值守会话）。
 - QQ 已登录，主窗口可见、未最小化，联系人列表可滚动。
 - 服务同一时间只运行一个实例；端口来自 endpoint 文件，不写死。
-- 知道本轮要用的目标联系人 QQ 号和用于回读的唯一标记。
+- 知道本轮要用的目标会话名（`/v1/contacts:query` 返回的 key）和用于回读的唯一标记。
 - 真机操作默认只发给自己或已确认的测试联系人；禁止对真实供应商批量发送。
 
 ## 真机验收步骤
@@ -58,19 +58,19 @@ conda run -n qq-desktop-service python -m service --endpoint-file <endpoint.json
 
 不要缓存上一次的联系人结果。真机每次发送前先：
 
-- `GET /v1/contacts:query` 取当前联系人键。
-- 确认目标 QQ 号在结果里，且刷新时间足够新。
+- `GET /v1/contacts:query` 取当前会话名单。
+- 确认目标会话名在结果里，且刷新时间足够新。
 
-### 3. QQ 号定位与复制验收
+### 3. 会话定位与读取验收
 
-- `POST /v1/contacts/current:identify` 只识别当前激活行，不发送消息。
-- 返回的 `qqNumber` 必须与目标号码精确一致，不允许按昵称或模糊匹配代替。
-- 激活行是群或菜单没有“复制QQ号”时，必须返回跳过原因（如 `QQ_CONTACT_NUMBER_COPY_UNAVAILABLE`），不得猜测坐标或回退 OCR 昵称匹配。
-- 重点观察右键菜单弹出识别是否正确、菜单缺项是否快速退出、窗口是否被遮挡或移动。
+- 会话定位走无障碍树：`/v1/contacts:query` 传 `{"contactName":"..."}` 时先读当前屏，未命中才滚动查找；命中即按行名精确匹配，不做模糊匹配。
+- 空白会话（没有任何消息）必须返回 0 条消息、不进入框选、不报错、不卡死；真机至少手动确认一个空白会话（如 `！`）返回 `n=0`。
+- QQ 拒绝复制的会话（`我的手机`、`QQ邮箱提醒`、`QQ团队`、临时会话邀请卡片等）应被名单筛掉；直接读取它们必须毫秒级返回 `QQ_CONTACT_NOT_COPYABLE`，不再跑十几秒的失败框选。
+- `POST /v1/contacts/current:identify`（号码识别）保留为诊断用：只识别当前激活行，不发送消息；菜单没有“复制QQ号”时返回跳过原因（如 `QQ_CONTACT_NUMBER_COPY_UNAVAILABLE`）。
 
 ### 4. 发送与回读验收
 
-- `POST /v1/commands/send` 发送前再次确认目标会话与 QQ 号。
+- `POST /v1/commands/send` 发送前再次确认目标会话名。
 - 轮询 `GET /v1/commands/{commandId}`，只把 `SUCCEEDED` 视为命令完成；`pending_outbound` 不等于已送达。
 - 用 `GET /v1/commands/read` 或目标会话人工回读唯一标记，确认消息真实出现在正确会话里。
 - 发送失败、窗口变化或采集超时都按失败处理，不自动重放点击。
@@ -92,9 +92,9 @@ conda run -n qq-desktop-service python -m service --endpoint-file <endpoint.json
 | 项目 | 期望 | 实际 | 结论 |
 | --- | --- | --- | --- |
 | `/v1/health` | `READY` | | |
-| 联系人查询 | 目标 QQ 号在结果中 | | |
-| QQ 号识别 | 与目标号码完全一致 | | |
-| 群/缺项 | 返回跳过原因，不点击 | | |
+| 联系人查询 | 目标会话名在结果中 | | |
+| 空白会话 | 返回 0 条，不框选不报错 | | |
+| 不可复制会话 | 名单筛掉，直接读取毫秒级 `QQ_CONTACT_NOT_COPYABLE` | | |
 | 发送命令 | 最终 `SUCCEEDED` | | |
 | 会话回读 | 唯一标记出现在正确会话 | | |
 | 客户端连接 | 显示已连接 | | |
@@ -104,5 +104,5 @@ conda run -n qq-desktop-service python -m service --endpoint-file <endpoint.json
 
 - 必须运行在 Windows 交互桌面。
 - 交付只复制 `dist-exe/qq-desktop-service.exe`；客户端使用前先同步资源。
-- 真实 QQ 验证重点检查：窗口置顶、列表滚动、激活行色带判定、点击坐标、右键菜单识别、剪贴板号码核对和消息读取重试。
+- 真实 QQ 验证重点检查：窗口置顶、无障碍树会话定位与滚动查找、激活确认、空白会话判空、不可复制会话过滤、框选复制与剪贴板读取。
 - 任何“通过”结论都必须来自真机证据；没有真机证据只能写“未验证”。
