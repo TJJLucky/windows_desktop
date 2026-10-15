@@ -29,3 +29,4 @@ composed/
 
 # 本地真实接口压力测试临时目录
 .tmp-live-*/
+.tmp-qidian-*/
