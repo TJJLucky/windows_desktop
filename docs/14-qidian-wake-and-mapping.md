@@ -97,7 +97,8 @@ qidian 链接被打开后，QQ 会把该商家的临时会话弹到会话列表�
   `contact_name / qq_number`，便于复盘「接待人换过没有」。
 - **覆盖策略**：同一 `(siteId, supplierId)` 直接覆盖，不返回冲突提示；旧映射只进唤醒日志。
 - **同链去重**：同一 `linkHash` 在 120 秒（`DEDUP_WINDOW_SECONDS`）窗口内重复请求直接复用
-  上次结果（响应 `reused=true`），不重复唤醒；不同链接按 FIFO 排队。
+  上次结果（响应 `reused=true`），不重复唤醒、不写唤醒日志、不加 `wakeCount`；但会用本次请求的
+  `targetQqNumber` 调 `refresh_target()` 刷新映射行，保证响应与落库同号；不同链接按 FIFO 排队。
   去重键以路由层 `normalize_link()` + `link_hash()` 算出的指纹为准（与日志查询键同一个值）。
 
 ## 接口
@@ -111,7 +112,8 @@ qidian 链接被打开后，QQ 会把该商家的临时会话弹到会话列表�
   `qqNumberVerified=true` 表示识别到的接待人 QQ 号与**本次请求传入的目标号**一致。
 - `POST /v1/qidian/mappings:query`：请求 `{siteId?, supplierId?, linkHash?}`（`linkHash` 与
   `(siteId, supplierId)` 二选一，缺两者 422）；响应 `found` + 映射字段（映射行的 `source` 固定
-  `qidian_wake`，`targetQqNumber` 是最近一次唤醒调用方传入的商家 QQ 号）。
+  `qidian_wake`，`targetQqNumber` 是最近一次调用方传入的商家 QQ 号——真唤醒与复用命中都会刷新它，
+  `wakeCount` 只统计真唤醒）。
 
 ## 真机验证（2026-10-15）
 
@@ -140,10 +142,15 @@ qidian 链接被打开后，QQ 会把该商家的临时会话弹到会话列表�
   - `targetQqNumber` 生效：日志 `qidian.target qq=...`、响应 `targetQqNumber` 回显、`qqNumberVerified=true`；
   - **决定性证据**：用 `wpa1` 短链（链接里的号是企点路由号 `3009004623`）+ 调用方传 `800885759` →
     响应 `qqNumberVerified=true`、`contactName=森蓝微电子`，说明判定只用调用方传的号；
-  - 复用窗口内重提：`reused=true` 且 `targetQqNumber`/`qqNumberVerified` 取**本次请求**的值
-    （旧映射只提供 `contactName/qqNumber`）；
-  - 移除链接解析后的回归（2026-10-15）：不带 `targetQqNumber` 的请求一律 422，服务端不再有任何
-    解析链接的分支；带号的明文/msgrd 链接仍 `verified=true`。
+  - 复用窗口内重提：`reused=true`，`targetQqNumber`/`qqNumberVerified` 取**本次请求**的值，
+    并把该目标号刷进映射行的 `target_qq_number`（响应与落库必须同号），`wake_count` 不增加
+    （复用等于「这次没有真的唤醒」）；
+  - 移除链接解析后的回归（2026-10-15 真机）：不带 `targetQqNumber` → 422 `missing`；`"abc"`/`"1234"`/
+    `"0123456"` → 422 `string_too_short` / `string_pattern_mismatch`，都不唤醒、不写映射；
+  - **真机端到端（2026-10-15 20:55，QQ 在线）**：明文链接 + 调用方传 `3003790385` → HTTP 200、
+    `reused=false`、`contactName=粤能半导体（深圳）`、`qqNumber=3003790385`、`qqNumberVerified=true`、
+    耗时 9.09s；服务端日志 `qidian.target qq=3003790385` → `qidian.wake.done ... verified=True`，
+    全程没有任何「解析链接」的分支被走到。
 - **观察到的抖动（与本次改动无关，客户端应容错）**：同一条会话在很短时间内被第二次唤醒时，可能出现
   名单已稳定但**读不到激活行** → 503 `QQ_QIDIAN_ACTIVE_NOT_FOUND`（真机复现 2 次，均发生在同一
   `supplierId` 连续唤醒时）。调用方按 503 重试或回退人工确认即可，服务端不写脏映射。
