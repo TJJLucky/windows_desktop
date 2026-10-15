@@ -11,7 +11,8 @@
   「某个供应商曾经对应过哪个接待人」，也是同链去重窗口的判据。
 
 同链去重：同一 ``link_hash`` 在 ``DEDUP_WINDOW_SECONDS`` 窗口内重复请求直接复用上次
-唤醒结果（调用方返回 ``reused=true``），不再打开链接、不再唤醒 QQ。
+唤醒结果（调用方返回 ``reused=true``），不再打开链接、不再唤醒 QQ；复用只刷新映射行的
+``target_qq_number`` / ``updated_at``（调用方是目标号的权威），**不增加 ``wake_count``**。
 """
 
 from __future__ import annotations
@@ -153,6 +154,29 @@ class QidianMappingStore:
             "updatedAt": woke_at,
             "wakeCount": wake_count,
         }
+
+    def refresh_target(self, *, site_id: str, supplier_id: str, link_hash: str, supplier_name: str,
+                       contact_name: str, qq_number: str | None, target_qq_number: str | None,
+                       woke_at: str, woke_epoch: float) -> None:
+        """同链复用命中时刷新映射行的目标号口径（不新增唤醒日志、不增加 wake_count）。
+
+        复用意味着「这次没有真的唤醒」，所以不写 ``qidian_wake_log``、也不把 ``wake_count`` +1；
+        但调用方仍是目标号的权威来源——它这次传的号要覆盖到映射行，否则响应里的
+        ``targetQqNumber`` 会和落库的值不一致。旧值已在上一次真正唤醒时记进日志，不会丢。
+        """
+        with self._lock, closing(self._connect()) as connection, connection:
+            connection.execute(
+                "INSERT INTO qidian_mapping("
+                "  site_id, supplier_id, link_hash, supplier_name, contact_name, qq_number,"
+                "  target_qq_number, source, updated_at, woke_epoch, wake_count"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0) "
+                "ON CONFLICT(site_id, supplier_id) DO UPDATE SET "
+                "  target_qq_number = excluded.target_qq_number, updated_at = excluded.updated_at",
+                (site_id, supplier_id, link_hash, supplier_name, contact_name, qq_number,
+                 target_qq_number, SOURCE, woke_at, woke_epoch),
+            )
+        logger.info("qidian.mapping.refresh_target site=%s supplier=%s target=%s contact=%r",
+                    site_id, supplier_id, target_qq_number, contact_name)
 
     def recent_wake(self, link_hash: str, *, now_epoch: float,
                     window_seconds: float = DEDUP_WINDOW_SECONDS) -> dict[str, Any] | None:

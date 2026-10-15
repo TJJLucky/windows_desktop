@@ -466,7 +466,20 @@ def create_app(
             )
             record_attempt("QIDIAN_WAKE", operation_started, status="REUSED",
                            details={"linkHash": hash_, "contactName": recent["contactName"]})
-            # 命中复用：字段全部来自上次唤醒日志，reused=true 告知调用方本次没有真的唤醒
+            # 复用不写唤醒日志、不加 wakeCount，但把调用方这次传的目标号刷到映射行上，
+            # 保证「响应里的 targetQqNumber」与「落库的映射」是同一个值。
+            qidian_mappings.refresh_target(
+                site_id=request.site_id,
+                supplier_id=request.supplier_id,
+                link_hash=hash_,
+                supplier_name=request.supplier_name,
+                contact_name=recent["contactName"],
+                qq_number=qq_number,
+                target_qq_number=target_qq,
+                woke_at=recent["updatedAt"],
+                woke_epoch=time.time(),
+            )
+            # 命中复用：接待人与 QQ 号来自上次唤醒日志，目标号取本次请求，reused=true 告知本次没有真的唤醒
             return QidianWakeResponse.model_validate({
                 "linkHash": recent["linkHash"],
                 "siteId": request.site_id,
