@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 API_VERSION = "v1"
@@ -239,3 +239,169 @@ class IdentifyCurrentContactResponse(StrictModel):
     skipped: bool = False
     reason: str | None = None
     qq_number: str | None = Field(alias="qqNumber", pattern=r"^[1-9][0-9]{4,19}$", title="QQ 号")
+class QidianWakeRequest(StrictModel):
+    """qidian 唤醒请求：链接 + 该链接对应的公司信息（从网站上提取）。"""
+
+    link: str = Field(
+        min_length=8,
+        max_length=4096,
+        title="qidian 链接",
+        description="华强电子网 qidian 联系链接，只接受 http(s)://qidianqq.hqew.com/GoClient"
+                    "（拒 userinfo、端口、其他路径、子域变体与其他协议）。",
+        examples=["https://qidianqq.hqew.com/GoClient?QQ=123456789&Signature=abc"],
+    )
+    site_id: str = Field(
+        alias="siteId",
+        min_length=1,
+        max_length=64,
+        title="站点 ID",
+        description="链接所属站点标识（与客户端 SiteDescriptor.id 对齐，如 hqew）。",
+        examples=["hqew"],
+    )
+    supplier_id: str = Field(
+        alias="supplierId",
+        min_length=1,
+        max_length=128,
+        title="供应商 ID",
+        description="站内供应商标识；与 siteId 一起构成映射主键。",
+        examples=["hqew-8899"],
+    )
+    supplier_name: str = Field(
+        alias="supplierName",
+        min_length=1,
+        max_length=256,
+        title="供应商名称",
+        description="从网站上提取的公司名，仅用于审计与人工核对。",
+        examples=["深圳市某某电子有限公司"],
+    )
+    target_id: str | None = Field(
+        alias="targetId",
+        default=None,
+        max_length=128,
+        title="询价目标 ID",
+        description="可选的询价目标标识，仅用于审计追溯，不参与映射。",
+    )
+    mpn: str | None = Field(
+        default=None,
+        max_length=128,
+        title="物料型号",
+        description="可选的目标型号（如 STM32F103C8T6），仅用于审计追溯。",
+    )
+    batch_id: str | None = Field(
+        alias="batchId",
+        default=None,
+        max_length=128,
+        title="批次 ID",
+        description="可选的批次标识，仅用于审计追溯。",
+    )
+
+    @field_validator("link", "site_id", "supplier_id", "supplier_name")
+    @classmethod
+    def _reject_blank(cls, value: str) -> str:
+        """必填文本去首尾空白；全空白按参数违规拒绝。"""
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("不能是空白字符串")
+        return stripped
+
+
+class QidianWakeResponse(StrictModel):
+    """qidian 唤醒结果：本次唤醒识别到的接待人及其 QQ 号。"""
+
+    link_hash: str = Field(
+        alias="linkHash",
+        title="链接指纹",
+        description="qidian 链接的 sha256 指纹，用于同链去重与映射查询。",
+    )
+    site_id: str = Field(alias="siteId", title="站点 ID", description="本次请求的站点标识。")
+    supplier_id: str = Field(alias="supplierId", title="供应商 ID", description="本次请求的供应商标识。")
+    supplier_name: str = Field(alias="supplierName", title="供应商名称", description="本次请求携带的供应商名称。")
+    contact_name: str = Field(
+        alias="contactName",
+        title="接待人会话名",
+        description="QQ 会话列表里被激活的那一行名字（唤醒后由无障碍树读出）。",
+    )
+    qq_number: str | None = Field(
+        alias="qqNumber",
+        default=None,
+        pattern=r"^[1-9][0-9]{4,19}$",
+        title="接待人 QQ 号",
+        description="识别到的当前接待人 QQ 号；群会话或不提供复制项的会话为 null。",
+    )
+    target_qq_number: str | None = Field(
+        alias="targetQqNumber",
+        default=None,
+        pattern=r"^[1-9][0-9]{4,19}$",
+        title="链接目标 QQ 号",
+        description="从 qidian 链接解析出的目标 QQ 号；解析不到属于业务失败，不会返回该字段。",
+    )
+    qq_number_verified: bool = Field(
+        alias="qqNumberVerified",
+        title="QQ 号是否一致",
+        description="true = 识别到的接待人 QQ 号与链接解析出的目标 QQ 号完全一致。",
+    )
+    active_stable: bool = Field(
+        alias="activeStable",
+        title="激活行是否稳定",
+        description="true = 已等到连续两次同一份会话名单且只有唯一激活行。",
+    )
+    reused: bool = Field(
+        title="是否复用",
+        description="true = 同一链接在去重窗口内命中上次结果，本次没有再次唤醒 QQ。",
+    )
+    woke_at: str = Field(
+        alias="wokeAt",
+        title="唤醒时间",
+        description="本次（或命中的上次）唤醒完成时间，ISO 8601 带时区偏移。",
+    )
+
+
+class QidianMappingQuery(StrictModel):
+    """按 (siteId, supplierId) 或 linkHash 读回 qidian 唤醒映射。"""
+
+    site_id: str | None = Field(
+        alias="siteId",
+        default=None,
+        max_length=64,
+        title="站点 ID",
+        description="与 supplierId 一起定位映射；未提供 linkHash 时必填。",
+    )
+    supplier_id: str | None = Field(
+        alias="supplierId",
+        default=None,
+        max_length=128,
+        title="供应商 ID",
+        description="与 siteId 一起定位映射；未提供 linkHash 时必填。",
+    )
+    link_hash: str | None = Field(
+        alias="linkHash",
+        default=None,
+        max_length=128,
+        title="链接指纹",
+        description="按链接指纹反查映射；与 (siteId, supplierId) 二选一。",
+    )
+
+    @model_validator(mode="after")
+    def _require_lookup_key(self) -> "QidianMappingQuery":
+        """必须给出 linkHash，或同时给出 siteId 与 supplierId。"""
+        if self.link_hash:
+            self.link_hash = self.link_hash.strip()
+        if self.link_hash or (self.site_id and self.supplier_id):
+            return self
+        raise ValueError("必须提供 linkHash，或同时提供 siteId 与 supplierId")
+
+
+class QidianMappingResponse(StrictModel):
+    """qidian 唤醒映射查询结果；found=false 时其余字段均为 null。"""
+
+    found: bool = Field(title="是否命中映射", description="false = 该键还没有映射记录，其余字段均为 null。")
+    site_id: str | None = Field(alias="siteId", default=None, title="站点 ID", description="映射主键的一部分。")
+    supplier_id: str | None = Field(alias="supplierId", default=None, title="供应商 ID", description="映射主键的一部分。")
+    link_hash: str | None = Field(alias="linkHash", default=None, title="链接指纹", description="最近一次唤醒使用的链接指纹。")
+    supplier_name: str | None = Field(alias="supplierName", default=None, title="供应商名称", description="最近一次唤醒携带的公司名。")
+    contact_name: str | None = Field(alias="contactName", default=None, title="接待人会话名", description="最近一次唤醒识别到的 QQ 会话名。")
+    qq_number: str | None = Field(alias="qqNumber", default=None, title="接待人 QQ 号", description="最近一次识别到的接待人 QQ 号；不提供复制项的会话为 null。")
+    target_qq_number: str | None = Field(alias="targetQqNumber", default=None, title="链接目标 QQ 号", description="最近一次从链接解析出的目标 QQ 号。")
+    source: Literal["qidian_wake"] | None = Field(default=None, title="映射来源", description="映射写入来源，当前只有 qidian_wake。")
+    updated_at: str | None = Field(alias="updatedAt", default=None, title="更新时间", description="最近一次覆盖写入时间，ISO 8601 带时区偏移。")
+    wake_count: int | None = Field(alias="wakeCount", default=None, ge=0, title="唤醒次数", description="该映射键累计写入次数。")

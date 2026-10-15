@@ -61,6 +61,13 @@ _ERROR_CODE_PREFIXES = (
     "QQ_COPY_CAPTURE_FAILED",
     "QQ_MESSAGE_REGION_TOO_SMALL",
     "QQ_WINDOW_NOT_READY",
+    "QQ_QIDIAN_LINK_INVALID",
+    "QQ_QIDIAN_QQ_UNRESOLVED",
+    "QQ_QIDIAN_WAKE_FAILED",
+    "QQ_QIDIAN_SESSION_NOT_STABLE",
+    "QQ_QIDIAN_ACTIVE_NOT_FOUND",
+    "QQ_QIDIAN_ACTIVE_AMBIGUOUS",
+    "QQ_QIDIAN_QUEUE_TIMEOUT",
 )
 
 
@@ -116,6 +123,14 @@ class QqAutomationPort(Protocol):
 
     def read_messages(self, contact_name: str) -> dict:
         """读取指定联系人会话的可见消息，返回含 messages 列表的 dict。"""
+        ...
+
+    def wake_qidian(self, link: str) -> dict:
+        """打开 qidian 链接唤醒 QQ 会话并识别当前接待人，返回结果 dict。
+
+        整段（解析 → 唤醒 → 等会话稳定 → 识别）在 Dispatcher 队列里串行执行，
+        与读名单/发送/读消息互斥，因此多个 qidian 不会同时抢 QQ 窗口。
+        """
         ...
 
     def check_capture_ready(self) -> dict:
