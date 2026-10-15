@@ -112,6 +112,9 @@ class Dispatcher:
                         number = ContactNumberReader().identify_current()
                         result = ({"qqNumber": number} if number is not None else
                                   {"qqNumber": None, "skipped": True, "reason": "QQ_CONTACT_NUMBER_COPY_UNAVAILABLE"})
+                    elif task_type == "qidian_wake":
+                        link, = args
+                        result = self.wake_qidian_impl(link)
                     elif task_type == "check_capture_ready":
                         result = self.check_capture_ready_impl()
                     else:
@@ -142,6 +145,19 @@ class Dispatcher:
             return res_q.get(timeout=timeout)
         except queue.Empty:
             return {}, TimeoutError("QQ_CONTACT_NUMBER_QUEUE_TIMEOUT")
+
+    def wake_qidian(self, link: str, timeout: float = 45.0) -> Tuple[dict, Optional[Exception]]:
+        """qidian 唤醒（打开链接 → 等会话稳定 → 识别接待人），入队列串行执行。
+
+        整段唤醒比普通任务长（约 25 秒预算）；排队超时只表示"没等到结果"，
+        任务本身不被取消（与其它入口的超时语义一致）。
+        """
+        res_q = queue.Queue(maxsize=1)
+        self.task_queue.put(("qidian_wake", (link,), {}, res_q))
+        try:
+            return res_q.get(timeout=timeout)
+        except queue.Empty:
+            return {}, TimeoutError("QQ_QIDIAN_QUEUE_TIMEOUT")
 
     def check_capture_ready(self, timeout: float = 30.0) -> Tuple[dict, Optional[Exception]]:
         """把截图能力检查也放入串行队列，避免与联系人/消息操作并发控制 QQ。"""
@@ -201,6 +217,12 @@ class Dispatcher:
 
         win = ensure_qq_window_with_retry()
         return {"ready": True, "windowTitle": getattr(win, "title", None)}
+
+    def wake_qidian_impl(self, link: str) -> dict:
+        """实际实现：qidian 链接唤醒 + 会话稳定等待 + 当前接待人识别。"""
+        from .qidian import wake_and_identify
+
+        return wake_and_identify(link)
 
     def get_contact_list_impl(self, contact_name: str | None = None,
                               all_contacts: bool = False) -> dict:

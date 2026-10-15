@@ -223,6 +223,23 @@ class LegacyQqAutomationFacade:
             "error": None,
         }
 
+    def wake_qidian(self, link: str) -> dict:
+        """打开 qidian 链接唤醒 QQ 会话并识别当前接待人（Dispatcher 内串行）。
+
+        单次唤醒预算约 25 秒，因此队列等待上限按"前面排了多少个任务"放大，
+        避免合法的排队被误判成超时；真排队超时抛 QQ_QIDIAN_QUEUE_TIMEOUT。
+        """
+        # 惰性 import：保持本模块在没有桌面依赖的环境里也能加载
+        from utils.qq.qidian import WAKE_TIMEOUT_BUDGET_SECONDS
+
+        operator = self._operator()
+        # 队列里已有的任务数 × 单次预算 + 余量；上限兜底防止失控等待
+        timeout = min(180.0, WAKE_TIMEOUT_BUDGET_SECONDS * (operator.pending_task_count + 1) + 15.0)
+        result, error = operator.wake_qidian(link, timeout=timeout)
+        if error is not None:
+            raise QqAutomationError(_operation_error_code(error, "QQ_QIDIAN_WAKE_FAILED")) from error
+        return result
+
     def check_capture_ready(self) -> dict:
         """检查 QQ 截图是否可用：调用 ensure_qq_window_with_retry 做窗口就绪检测。
 
