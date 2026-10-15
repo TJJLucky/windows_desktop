@@ -146,12 +146,12 @@ class Dispatcher:
         except queue.Empty:
             return {}, TimeoutError("QQ_CONTACT_NUMBER_QUEUE_TIMEOUT")
 
-    def wake_qidian(self, link: str, target_qq_number: str | None = None,
+    def wake_qidian(self, link: str, target_qq_number: str,
                     timeout: float = 45.0) -> Tuple[dict, Optional[Exception]]:
         """qidian 唤醒（打开链接 → 等会话稳定 → 识别接待人），入队列串行执行。
 
-        ``target_qq_number`` 是调用方从华强搜索结果页读到的商家 QQ 号，原样透传给实现层；
-        给了就用它当目标号，不给才由实现层退回链接解析。
+        ``target_qq_number``（必填）是调用方从华强搜索结果页读到的商家 QQ 号，原样透传给实现层；
+        实现层只用它当目标号，不解析链接。
 
         整段唤醒比普通任务长（约 25 秒预算）；排队超时只表示"没等到结果"，
         任务本身不被取消（与其它入口的超时语义一致）。
@@ -222,7 +222,7 @@ class Dispatcher:
         win = ensure_qq_window_with_retry()
         return {"ready": True, "windowTitle": getattr(win, "title", None)}
 
-    def wake_qidian_impl(self, link: str, target_qq_number: str | None = None) -> dict:
+    def wake_qidian_impl(self, link: str, target_qq_number: str) -> dict:
         """实际实现：qidian 链接唤醒 + 会话稳定等待 + 当前接待人识别。"""
         from .qidian import wake_and_identify
 

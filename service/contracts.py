@@ -274,14 +274,15 @@ class QidianWakeRequest(StrictModel):
         description="从网站上提取的公司名，仅用于审计与人工核对。",
         examples=["深圳市某某电子有限公司"],
     )
-    target_qq_number: str | None = Field(
+    target_qq_number: str = Field(
         alias="targetQqNumber",
-        default=None,
+        min_length=5,
+        max_length=20,
         pattern=r"^[1-9][0-9]{4,19}$",
-        title="调用方提供的目标 QQ 号",
-        description="调用方（客户端）从华强搜索/报价结果页读到的商家 QQ 号；提供时它直接作为本次唤醒的"
-                    "目标号，链接自身的 QQ 参数与站点 GetQQLinkUrl 接口都不再参与解析（只留作审计对比）；"
-                    "不提供时才退回链接解析。",
+        title="目标 QQ 号",
+        description="调用方（客户端）从华强搜索结果页行内 a.customerqq[qq] 读到的商家 QQ 号，必填："
+                    "服务端只用它作为本次唤醒的目标号，**不解析链接里的号**（链接里的号是企点路由/客服号，"
+                    "与 QQ 客户端里显示的接待人不是一回事）。缺失或格式非法按参数违规拒绝。",
         examples=["3004348344"],
     )
     target_id: str | None = Field(
@@ -305,7 +306,7 @@ class QidianWakeRequest(StrictModel):
         description="可选的批次标识，仅用于审计追溯。",
     )
 
-    @field_validator("link", "site_id", "supplier_id", "supplier_name")
+    @field_validator("link", "site_id", "supplier_id", "supplier_name", "target_qq_number")
     @classmethod
     def _reject_blank(cls, value: str) -> str:
         """必填文本去首尾空白；全空白按参数违规拒绝。"""
@@ -338,25 +339,17 @@ class QidianWakeResponse(StrictModel):
         title="接待人 QQ 号",
         description="识别到的当前接待人 QQ 号；群会话或不提供复制项的会话为 null。",
     )
-    target_qq_number: str | None = Field(
+    target_qq_number: str = Field(
         alias="targetQqNumber",
-        default=None,
         pattern=r"^[1-9][0-9]{4,19}$",
         title="本次唤醒的目标 QQ 号",
-        description="本次用来判定接待人的目标 QQ 号：调用方传入时就是它，否则是从 qidian 链接解析出的号；"
-                    "两边都拿不到属于业务失败，不会返回该字段。",
-    )
-    target_source: Literal["caller", "link", "api"] | None = Field(
-        alias="targetSource",
-        default=None,
-        title="目标号来源",
-        description="caller = 调用方（客户端从华强搜索结果页）传入；link = 链接自身的 QQ 参数；"
-                    "api = 站点 GetQQLinkUrl 兜底解析；复用上次结果（reused=true）且本次未传号时为 null。",
+        description="本次用来判定接待人的目标 QQ 号，回显请求里的 targetQqNumber（客户端从华强搜索"
+                    "结果页读到的商家 QQ 号），因此一定非空。",
     )
     qq_number_verified: bool = Field(
         alias="qqNumberVerified",
         title="QQ 号是否一致",
-        description="true = 识别到的接待人 QQ 号与链接解析出的目标 QQ 号完全一致。",
+        description="true = 识别到的接待人 QQ 号与请求里的目标 QQ 号完全一致。",
     )
     active_stable: bool = Field(
         alias="activeStable",
@@ -419,7 +412,7 @@ class QidianMappingResponse(StrictModel):
     supplier_name: str | None = Field(alias="supplierName", default=None, title="供应商名称", description="最近一次唤醒携带的公司名。")
     contact_name: str | None = Field(alias="contactName", default=None, title="接待人会话名", description="最近一次唤醒识别到的 QQ 会话名。")
     qq_number: str | None = Field(alias="qqNumber", default=None, title="接待人 QQ 号", description="最近一次识别到的接待人 QQ 号；不提供复制项的会话为 null。")
-    target_qq_number: str | None = Field(alias="targetQqNumber", default=None, title="链接目标 QQ 号", description="最近一次从链接解析出的目标 QQ 号。")
+    target_qq_number: str | None = Field(alias="targetQqNumber", default=None, title="目标 QQ 号", description="最近一次唤醒时调用方传入的商家 QQ 号。")
     source: Literal["qidian_wake"] | None = Field(default=None, title="映射来源", description="映射写入来源，当前只有 qidian_wake。")
     updated_at: str | None = Field(alias="updatedAt", default=None, title="更新时间", description="最近一次覆盖写入时间，ISO 8601 带时区偏移。")
     wake_count: int | None = Field(alias="wakeCount", default=None, ge=0, title="唤醒次数", description="该映射键累计写入次数。")

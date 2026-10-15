@@ -125,11 +125,11 @@ class QqAutomationPort(Protocol):
         """读取指定联系人会话的可见消息，返回含 messages 列表的 dict。"""
         ...
 
-    def wake_qidian(self, link: str, target_qq_number: str | None = None) -> dict:
+    def wake_qidian(self, link: str, target_qq_number: str) -> dict:
         """打开 qidian 链接唤醒 QQ 会话并识别当前接待人，返回结果 dict。
 
-        ``target_qq_number`` 是调用方（客户端从华强搜索结果页）读到的商家 QQ 号：
-        给了就用它判定接待人，链接解析整体跳过；没给才退回链接 ``QQ`` 参数解析。
+        ``target_qq_number``（必填）是调用方（客户端从华强搜索结果页）读到的商家 QQ 号，
+        服务端只用它判定接待人，不解析链接里的号。
 
         整段（确定目标号 → 唤醒 → 等会话稳定 → 识别）在 Dispatcher 队列里串行执行，
         与读名单/发送/读消息互斥，因此多个 qidian 不会同时抢 QQ 窗口。
@@ -226,7 +226,7 @@ class LegacyQqAutomationFacade:
             "error": None,
         }
 
-    def wake_qidian(self, link: str, target_qq_number: str | None = None) -> dict:
+    def wake_qidian(self, link: str, target_qq_number: str) -> dict:
         """打开 qidian 链接唤醒 QQ 会话并识别当前接待人（Dispatcher 内串行）。
 
         单次唤醒预算约 25 秒，因此队列等待上限按"前面排了多少个任务"放大，
