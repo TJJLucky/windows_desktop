@@ -4,9 +4,9 @@
 它只把 **qidian 链接 + 目标 QQ 号 + 该链接对应的公司信息** 交给本机服务，剩下的唤醒、识别、
 落映射全部由服务串行完成，避免多个 qidian 同时唤醒时接待人对应错乱。
 
-其中 **目标 QQ 号由调用方显式传入**：客户端在打开链接之前，已经从华强搜索结果页行内的
-`a.customerqq[qq]` 读到商家 QQ 号，它才是权威来源。服务端**不再把「从链接里解析」当作必须**，
-只有调用方没给号时才退回链接解析兜底（原因见「为什么不再依赖链接解析」）。
+其中 **目标 QQ 号由调用方显式传入，且是必填**：客户端在打开链接之前，已经从华强搜索结果页行内的
+`a.customerqq[qq]` 读到商家 QQ 号，它才是权威来源。服务端**完全不解析链接里的号**（原因见
+「为什么服务端不解析链接里的号」）。
 
 ## 为什么要放到服务端串行
 
@@ -21,16 +21,11 @@ qidian 链接被打开后，QQ 会把该商家的临时会话弹到会话列表�
    （精确主机 + 精确路径）；拒绝 `userinfo`、显式端口、其他路径、子域变体（如
    `qidianqq.hqew.com.evil.test`、`sub.qidianqq.hqew.com`）与其他协议（`tencent://`、
    `javascript:`）。规则与客户端 `isHqewContactUrl()` 对齐。违规 → `QQ_QIDIAN_LINK_INVALID`（HTTP 422）。
-2. **确定目标 QQ 号** `resolve_target_qq(link, provided)`：**以调用方传入的 `targetQqNumber` 为准**
-   （`source=caller`）。它就是客户端从华强搜索结果页行内 `a.customerqq[qq]` 读到的商家 QQ 号，
-   与接待人是同一个号；给了它就**直接生效**，既不访问链接也不访问站点接口。传入值不满足
-   `^[1-9][0-9]{4,19}$` 时由契约层直接 422 拒绝（服务内另保留一条 503 防御分支，用于绕过契约的内部调用）。
-
-   只有 `targetQqNumber` 缺省（老调用方、手工排查）时才退回链接解析兜底（`source=link` / `source=api`）：
-   先取链接自身的 `QQ` 参数（**明文号**形态直接可用；`wpa.qq.com/msgrd?...&uin=` 取 `uin=`），
-   再退回站点自己的 `POST https://qidianqq.hqew.com/QidianApi/User/GetQQLinkUrl`
-   （GoClient 页面 JS 用的就是它：把链接全部 query 参数原样透传、`Content-Type: application/json`，
-   缺的键补空串）。两条兜底路都拿不到号 → `QQ_QIDIAN_QQ_UNRESOLVED`（HTTP 503），**不唤醒**。
+2. **取目标 QQ 号** `require_target_qq(provided)`：**只认调用方传入的 `targetQqNumber`**。
+   它就是客户端从华强搜索结果页行内 `a.customerqq[qq]` 读到的商家 QQ 号，与接待人是同一个号。
+   服务端**不取链接里的号、也不调站点接口**：缺失或格式非法 → `QQ_QIDIAN_QQ_UNRESOLVED`
+   （HTTP 契约层对必填与 `^[1-9][0-9]{4,19}$` 直接 422；服务内另留一条 503 防御分支，用于绕过
+   契约的内部调用），**不唤醒**。
 3. **唤醒**：QQ 进程不存在时先走既有 `window_ops.start_qq()`；再 `os.startfile(链接)`
    交给默认浏览器打开（与客户端现网已跑通的路径一致，不反向构造 `tencent://` 链接）。
    打开失败 → `QQ_QIDIAN_WAKE_FAILED`。
@@ -49,12 +44,13 @@ qidian 链接被打开后，QQ 会把该商家的临时会话弹到会话列表�
 
 总等待上限 `WAKE_TIMEOUT_BUDGET_SECONDS`（约 25 秒，含窗口就绪等待），超时 → `QQ_QIDIAN_SESSION_NOT_STABLE`。
 
-> **企点客服号 vs 接待人号**：`wpa1.qq.com` 短链解析出的是企点路由号 `kfuin`，真机实测与客户端里
-> 显示的接待人号**不相等**（例：链接目标 `3009004623`，识别到 `800885759`）。此时
-> `qqNumberVerified=false`，映射仍以 `contactName`（真机上就是接待窗口名）落库；要求号完全一致的
-> 调用方需自行按 `qqNumberVerified` 裁决。
+> **企点客服号 vs 接待人号**：链接里带的也可能是企点路由号 `kfuin`，真机实测与 QQ 客户端里
+> 显示的接待人号**不相等**（例：`wpa1.qq.com` 短链的 `3009004623`，`identify` 读到 `800885759`）。
+> 这正是服务端不解析链接的原因：判定接待人一律用调用方从网站读到的商家 QQ 号。
+> 号对不上时 `qqNumberVerified=false`，映射仍以 `contactName`（真机上就是接待窗口名）落库；
+> 要求号完全一致的调用方需自行按 `qqNumberVerified` 裁决。
 
-## 为什么不再依赖链接解析
+## 为什么服务端不解析链接里的号
 
 2026-10-15 从本机 Edge 历史采样 **30 条真实链接**（明文 12 / msgrd 14 / wpa1 4），逐条核对
 「链接解析出的号」与「QQ 客户端里 `identify` 读到的接待人号」：
@@ -66,20 +62,21 @@ qidian 链接被打开后，QQ 会把该商家的临时会话弹到会话列表�
 | `wpa1.qq.com/<短码>`（302 后 `kfuin`） | 企点**路由/客服号** | 否（真机：目标 `3009004623`，`identify` 读到 `800885759`） |
 | 站点 `GetQQLinkUrl` 返回的 `kfuin` | 企点**路由/客服号** | 否（同上） |
 
-也就是说链接解析里存在拿到**不等于接待人**的企点路由号的情况：用它做目标号会让
+也就是说「链接/接口拿到的号」里存在**不等于接待人**的企点路由号：用它做目标号会让
 `qqNumberVerified` 永远为 false，映射也失去「号 == 接待人」这层保证。而华强搜索结果页行内
-`a.customerqq[qq]` 本来就是商家对外公布的接待 QQ 号，客户端在点开链接时已经拿到它，
-因此**由调用方传号**才是权威来源，链接解析降级为老链路的兜底。
+`a.customerqq[qq]` 本来就是商家对外公布的接待 QQ 号，客户端在准备询价时已经拿到它，
+因此**由调用方传号**才是权威来源。
 
-服务端保留链接解析能力只为了两件事：兼容尚未升级的调用方；以及在真机排查时人工对照
-「链接里的号」与「调用方传入的号」是否一致（响应里 `targetQqNumber` + `targetSource` 可区分来源）。
+服务端因此**彻底移除了链接解析**（不再有 `QQ` 参数兜底、不再调 `GetQQLinkUrl`、不再跟随
+`wpa1` 短链 302）：少一条 URL 抓取路径，就少一处失败面与一处「号可能不对」的歧义。
+`targetQqNumber` 是必填字段，缺号直接 422，服务端不会退化成「猜一个号去唤醒」。
 
 ## 错误码
 
 | 错误码 | 触发条件 |
 | --- | --- |
 | `QQ_QIDIAN_LINK_INVALID` | 链接不满足主机/路径/协议白名单（HTTP 422） |
-| `QQ_QIDIAN_QQ_UNRESOLVED` | 未传 `targetQqNumber` 且链接没有 `QQ` 参数、qidian 接口也解析不出目标 QQ 号（HTTP 503）；`targetQqNumber` 格式非法在契约层就按 422 拒绝 |
+| `QQ_QIDIAN_QQ_UNRESOLVED` | `targetQqNumber` 缺失或格式非法（HTTP 契约层 422；绕过契约的内部调用由服务内防御分支映射成 503） |
 | `QQ_QIDIAN_WAKE_FAILED` | QQ 窗口就绪失败、无法把链接交给默认浏览器，或链接未生效（名单与唤醒前完全一致且 QQ 号对不上，拒绝写映射） |
 | `QQ_QIDIAN_SESSION_NOT_STABLE` | 总预算内没等到「稳定名单 + 唯一激活行」，或识别阶段失败 |
 | `QQ_QIDIAN_ACTIVE_NOT_FOUND` | 名单稳定但读不到激活行 |
@@ -105,18 +102,16 @@ qidian 链接被打开后，QQ 会把该商家的临时会话弹到会话列表�
 
 ## 接口
 
-- `POST /v1/qidian:wake`：请求 `{link, siteId, supplierId, supplierName, targetQqNumber?, targetId?,
+- `POST /v1/qidian:wake`：请求 `{link, siteId, supplierId, supplierName, targetQqNumber, targetId?,
   mpn?, batchId?}`（`targetId/mpn/batchId` 仅用于审计追溯，不参与映射）。
-  **`targetQqNumber` 是推荐字段**：调用方从华强搜索结果页读到的商家 QQ 号，必须满足
-  `^[1-9][0-9]{4,19}$`，传了就一定用它判定接待人；不传才退回链接解析。
-  响应 `linkHash / siteId / supplierId / supplierName / contactName / qqNumber? / targetQqNumber? /
-  targetSource? / qqNumberVerified / activeStable / reused / wokeAt`。
-  `targetSource` 区分目标号来源：`caller`（调用方传入）/ `link`（链接 `QQ` 参数）/ `api`
-  （站点接口兜底）/ `null`（复用上次结果且本次未传号）。`qqNumberVerified=true` 表示识别到的
-  接待人 QQ 号与**本次的目标号**一致。
+  **`targetQqNumber` 是必填字段**：调用方从华强搜索结果页读到的商家 QQ 号，必须满足
+  `^[1-9][0-9]{4,19}$`，缺失或格式非法一律 422；服务端只用它判定接待人，不解析链接里的号。
+  响应 `linkHash / siteId / supplierId / supplierName / contactName / qqNumber? / targetQqNumber /
+  qqNumberVerified / activeStable / reused / wokeAt`。
+  `qqNumberVerified=true` 表示识别到的接待人 QQ 号与**本次请求传入的目标号**一致。
 - `POST /v1/qidian/mappings:query`：请求 `{siteId?, supplierId?, linkHash?}`（`linkHash` 与
   `(siteId, supplierId)` 二选一，缺两者 422）；响应 `found` + 映射字段（映射行的 `source` 固定
-  `qidian_wake`，目标号来源另在唤醒响应里以 `targetSource` 给出）。
+  `qidian_wake`，`targetQqNumber` 是最近一次唤醒调用方传入的商家 QQ 号）。
 
 ## 真机验证（2026-10-15）
 
@@ -139,16 +134,16 @@ qidian 链接被打开后，QQ 会把该商家的临时会话弹到会话列表�
 
 - **同链去重**：同一链接 120s 内再提交 → HTTP 200、`reused=true`、耗时 0.02s，未二次唤醒。
 - **参数违规**：非白名单主机 / 协议 / 路径 / 带端口 → 422 `QQ_QIDIAN_LINK_INVALID`。
-- **解析失败**：白名单链接但无 `QQ` 参数且接口无结果 → 503 `QQ_QIDIAN_QQ_UNRESOLVED`，不唤醒。
+- **缺号**：不传 `targetQqNumber` → HTTP **422**（`missing`）；`targetQqNumber="abc"` → HTTP **422**
+  （`string_pattern_mismatch`）；两种情况都不唤醒、不写映射。
 - **调用方传号（2026-10-15 新增，真机跑通）**：
-  - `targetQqNumber` 生效：`qidian.resolve source=caller`、响应 `targetSource="caller"`、`verified=true`；
-  - **优先级决定性地被验证**：用 `wpa1` 短链（链接自身只能解析出企点路由号 `3009004623`）+ 调用方传
-    `800885759` → 响应 `qqNumberVerified=true`、`contactName=森蓝微电子`，说明判定用的是调用方传的号，
-    链接解析没有参与；
-  - 复用窗口内带号重提：`reused=true` 且 `targetQqNumber` 取**本次请求**的值（旧映射只提供
-    `contactName/qqNumber`），`targetSource="caller"`；
-  - 不传号的老链路照旧：`source=link`、`verified=true`；
-  - `targetQqNumber="abc"` → HTTP **422**（`string_pattern_mismatch`），不唤醒也不写映射。
+  - `targetQqNumber` 生效：日志 `qidian.target qq=...`、响应 `targetQqNumber` 回显、`qqNumberVerified=true`；
+  - **决定性证据**：用 `wpa1` 短链（链接里的号是企点路由号 `3009004623`）+ 调用方传 `800885759` →
+    响应 `qqNumberVerified=true`、`contactName=森蓝微电子`，说明判定只用调用方传的号；
+  - 复用窗口内重提：`reused=true` 且 `targetQqNumber`/`qqNumberVerified` 取**本次请求**的值
+    （旧映射只提供 `contactName/qqNumber`）；
+  - 移除链接解析后的回归（2026-10-15）：不带 `targetQqNumber` 的请求一律 422，服务端不再有任何
+    解析链接的分支；带号的明文/msgrd 链接仍 `verified=true`。
 - **观察到的抖动（与本次改动无关，客户端应容错）**：同一条会话在很短时间内被第二次唤醒时，可能出现
   名单已稳定但**读不到激活行** → 503 `QQ_QIDIAN_ACTIVE_NOT_FOUND`（真机复现 2 次，均发生在同一
   `supplierId` 连续唤醒时）。调用方按 503 重试或回退人工确认即可，服务端不写脏映射。
