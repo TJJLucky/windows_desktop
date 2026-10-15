@@ -31,8 +31,10 @@ from fastapi.encoders import jsonable_encoder
 from .chat_history import ChatHistoryStore
 # CommandConflictError：相同 commandId 配不同消息体的冲突异常；CommandLedger：命令幂等账本
 from .command_ledger import CommandConflictError, CommandLedger
+# QidianMappingStore：qidian 唤醒映射与唤醒日志（(siteId, supplierId) 主键）
+from .qidian_mapping import QidianMappingStore
 # 全部 Pydantic 请求/响应契约模型（API 的输入输出 schema）
-from .contracts import IdentifyCurrentContactRequest, IdentifyCurrentContactResponse, API_VERSION, CaptureCheckResponse, ChatHistoryRequest, ChatHistoryResponse, CommandResponse, ListContactsRequest, ListContactsResponse, ReadMessagesRequest, ReadMessagesResponse, SendMessageRequest, ServiceHealthResponse
+from .contracts import IdentifyCurrentContactRequest, IdentifyCurrentContactResponse, API_VERSION, CaptureCheckResponse, ChatHistoryRequest, ChatHistoryResponse, CommandResponse, ListContactsRequest, ListContactsResponse, QidianMappingQuery, QidianMappingResponse, QidianWakeRequest, QidianWakeResponse, ReadMessagesRequest, ReadMessagesResponse, SendMessageRequest, ServiceHealthResponse
 # QqAutomationPort：自动化端口抽象（测试时可注入替身）；LegacyQqAutomationFacade：真实实现（视觉 RPA）；QqAutomationError：QQ 操作失败统一异常
 from .facade import LegacyQqAutomationFacade, QqAutomationError, QqAutomationPort, QqContactNotFoundError
 
@@ -46,6 +48,7 @@ OPENAPI_TAGS = [
     {"name": "联系人", "description": "读取 QQ 用户列表。"},
     {"name": "消息", "description": "读取和发送 QQ 消息。"},
     {"name": "聊天记录", "description": "本地聊天记录查询。"},
+    {"name": "qidian", "description": "接收 qidian 链接与公司信息，服务端自己唤醒 QQ 并登记接待人映射。"},
 ]
 
 
@@ -54,6 +57,7 @@ def create_app(
     *,
     ledger_path: Path,
     chat_history_path: Path | None = None,
+    qidian_mapping_path: Path | None = None,
     layout_desktop=None,
 ) -> FastAPI:
     """构造 FastAPI 应用，注册全部 v1 接口并返回应用对象。
@@ -61,13 +65,18 @@ def create_app(
     参数：
     - automation：自动化实现（默认用真实视觉 RPA 门面；测试注入替身）；
     - ledger_path：命令账本数据库文件路径；
-    - chat_history_path：聊天记录库路径（缺省自动放在账本同目录）。
+    - chat_history_path：聊天记录库路径（缺省自动放在账本同目录）；
+    - qidian_mapping_path：qidian 唤醒映射库路径（缺省同样放在账本同目录）。
     """
 
     # 聊天记录库未显式指定时，默认与账本放同一目录，便于统一管理
     chat_history_path = chat_history_path or (ledger_path.parent / "qq-chat-history.sqlite3")
     # 初始化聊天记录存储（打开 SQLite、建表、启用 WAL）
     chat_history = ChatHistoryStore(chat_history_path)
+    # qidian 映射库未显式指定时，同样与账本放同一目录，便于统一管理
+    qidian_mapping_path = qidian_mapping_path or (ledger_path.parent / "qq-qidian-mappings.sqlite3")
+    # 初始化 qidian 唤醒映射存储（打开 SQLite、建表）
+    qidian_mappings = QidianMappingStore(qidian_mapping_path)
     # 自动化实现：外部传入了就用外部实现（测试/定制），否则用真实视觉 RPA 门面
     facade = automation or LegacyQqAutomationFacade()
     # 初始化命令账本（打开 SQLite、建表），用于发送命令的幂等控制
@@ -101,9 +110,10 @@ def create_app(
     async def layout_error_handler(request: Request, exc: LayoutError):
         return JSONResponse(status_code=exc.status, content={"detail": str(exc)})
     logger.info(
-        "application.create ledger_path=%s chat_history_path=%s automation=%s",
+        "application.create ledger_path=%s chat_history_path=%s qidian_mapping_path=%s automation=%s",
         ledger_path,
         chat_history_path,
+        qidian_mapping_path,
         type(facade).__name__,
     )
 
@@ -415,6 +425,134 @@ def create_app(
             copiedText=payload.get("copiedText") if update == "ok" else None,
             update=update,
         )
+
+    # —— qidian 唤醒接口（打开链接 → 等会话稳定 → 识别接待人 → 覆盖写入映射） ——
+    @app.post(
+        "/v1/qidian:wake",
+        response_model=QidianWakeResponse,
+        summary="唤醒 qidian 链接对应的 QQ 会话并登记接待人映射",
+        description="服务端自己从 qidian 链接解析目标 QQ 号 → 用默认浏览器打开链接 → 等无障碍树会话名单"
+                    "稳定并出现唯一激活行 → 复制当前接待人 QQ 号 → 按 (siteId, supplierId) 覆盖写入映射。"
+                    "整段唤醒都在内部单消费者队列里串行执行，多个 qidian 同时到达不会交叉。"
+                    "同一链接在 120 秒窗口内重复提交直接复用上次结果（reused=true），不会重复唤醒 QQ。",
+        tags=["qidian"],
+        responses={503: {"description": "唤醒失败 / 会话不稳定 / 读不到唯一激活行"}},
+        response_description="本次（或命中的上次）唤醒结果与映射",
+    )
+    def wake_qidian(request: QidianWakeRequest) -> QidianWakeResponse:
+        # 惰性导入：qidian 模块依赖 Windows 桌面能力，不在服务启动时加载
+        from utils.qq.qidian import QidianError, link_hash, normalize_link
+
+        operation_started = time.perf_counter()
+        # 链接白名单校验放在路由层：非法链接属于参数违规（422），不进队列、不碰 QQ
+        try:
+            normalized = normalize_link(request.link)
+        except QidianError as exc:
+            record_attempt("QIDIAN_WAKE", operation_started, status="FAILED", failure_code=str(exc))
+            logger.warning("qidian.wake.invalid_link link=%r code=%s", request.link, exc)
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        hash_ = link_hash(normalized)
+        # 同链去重：120 秒窗口内同一链接直接复用上次结果，不重复唤醒
+        recent = qidian_mappings.recent_wake(hash_, now_epoch=time.time())
+        if recent is not None:
+            qq_number = recent["qqNumber"]
+            target_qq = recent["targetQqNumber"]
+            logger.info(
+                "qidian.wake.reused site=%s supplier=%s hash=%s contact=%r",
+                request.site_id, request.supplier_id, hash_[:12], recent["contactName"],
+            )
+            record_attempt("QIDIAN_WAKE", operation_started, status="REUSED",
+                           details={"linkHash": hash_, "contactName": recent["contactName"]})
+            # 命中复用：字段全部来自上次唤醒日志，reused=true 告知调用方本次没有真的唤醒
+            return QidianWakeResponse.model_validate({
+                "linkHash": recent["linkHash"],
+                "siteId": request.site_id,
+                "supplierId": request.supplier_id,
+                "supplierName": request.supplier_name,
+                "contactName": recent["contactName"],
+                "qqNumber": qq_number,
+                "targetQqNumber": target_qq,
+                "qqNumberVerified": qq_number is not None and qq_number == target_qq,
+                "activeStable": True,
+                "reused": True,
+                "wokeAt": recent["updatedAt"],
+            })
+
+        # 真正唤醒：facade 走 Dispatcher 单消费者队列（视觉操作串行），失败投影成 503
+        try:
+            result = facade.wake_qidian(normalized)
+        except QqAutomationError as exc:
+            record_attempt("QIDIAN_WAKE", operation_started, status="FAILED", failure_code=str(exc))
+            logger.warning(
+                "qidian.wake.failed site=%s supplier=%s code=%s duration_ms=%.2f",
+                request.site_id, request.supplier_id, exc, (time.perf_counter() - operation_started) * 1000,
+            )
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+        # 去重键以路由层算出的指纹为准（与 recent_wake 的查询键是同一个值）；
+        # 实现层返回的 linkHash 是同一算法的复核，不一致说明链路有 bug，仅告警不改行为。
+        if result.get("linkHash") not in (None, hash_):
+            logger.warning("qidian.wake.hash_mismatch route=%s impl=%s", hash_, result.get("linkHash"))
+        # 覆盖写入映射（旧值一并进唤醒日志）：同一 (siteId, supplierId) 直接覆盖，不返回冲突
+        row = qidian_mappings.record_wake(
+            site_id=request.site_id,
+            supplier_id=request.supplier_id,
+            link_hash=hash_,
+            supplier_name=request.supplier_name,
+            contact_name=result["contactName"],
+            qq_number=result.get("qqNumber"),
+            target_qq_number=result.get("targetQqNumber"),
+            woke_at=result["wokeAt"],
+            woke_epoch=time.time(),
+        )
+        record_attempt(
+            "QIDIAN_WAKE", operation_started, contact_name=result["contactName"], status="SUCCESS",
+            details={"linkHash": hash_, "qqNumber": result.get("qqNumber"),
+                     "qqNumberVerified": result.get("qqNumberVerified"), "wakeCount": row["wakeCount"]},
+        )
+        logger.info(
+            "qidian.wake.success site=%s supplier=%s contact=%r qq=%s verified=%s wake_count=%d duration_ms=%.2f",
+            request.site_id, request.supplier_id, result["contactName"], result.get("qqNumber"),
+            result.get("qqNumberVerified"), row["wakeCount"], (time.perf_counter() - operation_started) * 1000,
+        )
+        # 组装响应：唤醒结果 + 本次请求携带的公司信息 + reused=false（linkHash 用路由层指纹覆盖）
+        return QidianWakeResponse.model_validate({
+            **result,
+            "linkHash": hash_,
+            "siteId": request.site_id,
+            "supplierId": request.supplier_id,
+            "supplierName": request.supplier_name,
+            "reused": False,
+        })
+
+    # —— qidian 映射查询接口（纯本地 SQLite，不触碰 QQ） ——
+    @app.post(
+        "/v1/qidian/mappings:query",
+        response_model=QidianMappingResponse,
+        summary="查询 qidian 唤醒映射",
+        description="按 (siteId, supplierId) 或 linkHash 读回最近一次 qidian 唤醒写入的映射；"
+                    "没有记录时返回 found=false，其余字段为空。",
+        tags=["qidian"],
+        response_description="映射记录（found=false 表示该键还没有映射）",
+    )
+    def query_qidian_mapping(request: QidianMappingQuery) -> QidianMappingResponse:
+        operation_started = time.perf_counter()
+        # 本地 SQLite 短连接查询：不触碰 QQ，可与唤醒任务并发
+        row = qidian_mappings.get(
+            site_id=request.site_id, supplier_id=request.supplier_id, link_hash=request.link_hash,
+        )
+        if row is None:
+            record_attempt("QIDIAN_MAPPING_QUERY", operation_started, status="NOT_FOUND")
+            logger.info("qidian.mapping.miss site=%s supplier=%s hash=%s",
+                        request.site_id, request.supplier_id, request.link_hash)
+            # 没有映射不是错误：返回 found=false，其余字段保持为空
+            return QidianMappingResponse(found=False)
+        record_attempt(
+            "QIDIAN_MAPPING_QUERY", operation_started, contact_name=row["contactName"], status="SUCCESS",
+            details={"siteId": row["siteId"], "supplierId": row["supplierId"], "wakeCount": row["wakeCount"]},
+        )
+        return QidianMappingResponse.model_validate({**row, "found": True})
 
     # 返回构造好的应用对象（由调用方交给 uvicorn 托管）
     return app

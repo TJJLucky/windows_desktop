@@ -25,6 +25,11 @@ FastAPI 只监听 `127.0.0.1` 的随机端口，endpoint 文件包含：
 - `POST /v1/commands/send`：发送消息。
 - `GET /v1/commands/{commandId}`：查询命令状态。
 - `POST /v1/chat/history`：查询本地聊天记录。
+- `POST /v1/qidian:wake`：接收 qidian 链接与公司信息，服务端自己解析目标 QQ 号、串行唤醒 QQ、
+  等会话稳定后识别当前接待人，并按 `(siteId, supplierId)` 覆盖写入映射。同一链接 120 秒内
+  重复提交命中 `reused=true`（不重复唤醒）。失败投影 503（`QQ_QIDIAN_*`），链接违规投影 422。
+- `POST /v1/qidian/mappings:query`：按 `(siteId, supplierId)` 或 `linkHash` 读回 qidian 唤醒映射；
+  没有记录返回 `found=false`。详见 `14-qidian-wake-and-mapping.md`。
 
 ## 契约模型
 
