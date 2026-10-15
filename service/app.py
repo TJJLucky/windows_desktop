@@ -431,7 +431,8 @@ def create_app(
         "/v1/qidian:wake",
         response_model=QidianWakeResponse,
         summary="唤醒 qidian 链接对应的 QQ 会话并登记接待人映射",
-        description="服务端自己从 qidian 链接解析目标 QQ 号 → 用默认浏览器打开链接 → 等无障碍树会话名单"
+        description="优先用请求里的 targetQqNumber（调用方从华强搜索结果页读到的商家 QQ 号）当目标号，"
+                    "缺省时才退回链接解析 → 用默认浏览器打开链接 → 等无障碍树会话名单"
                     "稳定并出现唯一激活行 → 复制当前接待人 QQ 号 → 按 (siteId, supplierId) 覆盖写入映射。"
                     "整段唤醒都在内部单消费者队列里串行执行，多个 qidian 同时到达不会交叉。"
                     "同一链接在 120 秒窗口内重复提交直接复用上次结果（reused=true），不会重复唤醒 QQ。",
@@ -457,10 +458,13 @@ def create_app(
         recent = qidian_mappings.recent_wake(hash_, now_epoch=time.time())
         if recent is not None:
             qq_number = recent["qqNumber"]
-            target_qq = recent["targetQqNumber"]
+            # 复用判定只认「同一条链接」；目标号以本次请求为准（调用方可能补上了 hq 页面的号）
+            target_qq = request.target_qq_number or recent["targetQqNumber"]
+            target_source = "caller" if request.target_qq_number else None
             logger.info(
-                "qidian.wake.reused site=%s supplier=%s hash=%s contact=%r",
+                "qidian.wake.reused site=%s supplier=%s hash=%s contact=%r target=%s source=%s",
                 request.site_id, request.supplier_id, hash_[:12], recent["contactName"],
+                target_qq, target_source,
             )
             record_attempt("QIDIAN_WAKE", operation_started, status="REUSED",
                            details={"linkHash": hash_, "contactName": recent["contactName"]})
@@ -473,6 +477,7 @@ def create_app(
                 "contactName": recent["contactName"],
                 "qqNumber": qq_number,
                 "targetQqNumber": target_qq,
+                "targetSource": target_source,
                 "qqNumberVerified": qq_number is not None and qq_number == target_qq,
                 "activeStable": True,
                 "reused": True,
@@ -481,7 +486,7 @@ def create_app(
 
         # 真正唤醒：facade 走 Dispatcher 单消费者队列（视觉操作串行），失败投影成 503
         try:
-            result = facade.wake_qidian(normalized)
+            result = facade.wake_qidian(normalized, request.target_qq_number)
         except QqAutomationError as exc:
             record_attempt("QIDIAN_WAKE", operation_started, status="FAILED", failure_code=str(exc))
             logger.warning(
@@ -512,9 +517,11 @@ def create_app(
                      "qqNumberVerified": result.get("qqNumberVerified"), "wakeCount": row["wakeCount"]},
         )
         logger.info(
-            "qidian.wake.success site=%s supplier=%s contact=%r qq=%s verified=%s wake_count=%d duration_ms=%.2f",
+            "qidian.wake.success site=%s supplier=%s contact=%r qq=%s target=%s source=%s verified=%s "
+            "wake_count=%d duration_ms=%.2f",
             request.site_id, request.supplier_id, result["contactName"], result.get("qqNumber"),
-            result.get("qqNumberVerified"), row["wakeCount"], (time.perf_counter() - operation_started) * 1000,
+            result.get("targetQqNumber"), result.get("targetSource"), result.get("qqNumberVerified"),
+            row["wakeCount"], (time.perf_counter() - operation_started) * 1000,
         )
         # 组装响应：唤醒结果 + 本次请求携带的公司信息 + reused=false（linkHash 用路由层指纹覆盖）
         return QidianWakeResponse.model_validate({

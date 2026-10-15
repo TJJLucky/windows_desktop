@@ -274,6 +274,16 @@ class QidianWakeRequest(StrictModel):
         description="从网站上提取的公司名，仅用于审计与人工核对。",
         examples=["深圳市某某电子有限公司"],
     )
+    target_qq_number: str | None = Field(
+        alias="targetQqNumber",
+        default=None,
+        pattern=r"^[1-9][0-9]{4,19}$",
+        title="调用方提供的目标 QQ 号",
+        description="调用方（客户端）从华强搜索/报价结果页读到的商家 QQ 号；提供时它直接作为本次唤醒的"
+                    "目标号，链接自身的 QQ 参数与站点 GetQQLinkUrl 接口都不再参与解析（只留作审计对比）；"
+                    "不提供时才退回链接解析。",
+        examples=["3004348344"],
+    )
     target_id: str | None = Field(
         alias="targetId",
         default=None,
@@ -332,8 +342,16 @@ class QidianWakeResponse(StrictModel):
         alias="targetQqNumber",
         default=None,
         pattern=r"^[1-9][0-9]{4,19}$",
-        title="链接目标 QQ 号",
-        description="从 qidian 链接解析出的目标 QQ 号；解析不到属于业务失败，不会返回该字段。",
+        title="本次唤醒的目标 QQ 号",
+        description="本次用来判定接待人的目标 QQ 号：调用方传入时就是它，否则是从 qidian 链接解析出的号；"
+                    "两边都拿不到属于业务失败，不会返回该字段。",
+    )
+    target_source: Literal["caller", "link", "api"] | None = Field(
+        alias="targetSource",
+        default=None,
+        title="目标号来源",
+        description="caller = 调用方（客户端从华强搜索结果页）传入；link = 链接自身的 QQ 参数；"
+                    "api = 站点 GetQQLinkUrl 兜底解析；复用上次结果（reused=true）且本次未传号时为 null。",
     )
     qq_number_verified: bool = Field(
         alias="qqNumberVerified",

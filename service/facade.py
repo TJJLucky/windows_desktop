@@ -125,10 +125,13 @@ class QqAutomationPort(Protocol):
         """读取指定联系人会话的可见消息，返回含 messages 列表的 dict。"""
         ...
 
-    def wake_qidian(self, link: str) -> dict:
+    def wake_qidian(self, link: str, target_qq_number: str | None = None) -> dict:
         """打开 qidian 链接唤醒 QQ 会话并识别当前接待人，返回结果 dict。
 
-        整段（解析 → 唤醒 → 等会话稳定 → 识别）在 Dispatcher 队列里串行执行，
+        ``target_qq_number`` 是调用方（客户端从华强搜索结果页）读到的商家 QQ 号：
+        给了就用它判定接待人，链接解析整体跳过；没给才退回链接 ``QQ`` 参数解析。
+
+        整段（确定目标号 → 唤醒 → 等会话稳定 → 识别）在 Dispatcher 队列里串行执行，
         与读名单/发送/读消息互斥，因此多个 qidian 不会同时抢 QQ 窗口。
         """
         ...
@@ -223,7 +226,7 @@ class LegacyQqAutomationFacade:
             "error": None,
         }
 
-    def wake_qidian(self, link: str) -> dict:
+    def wake_qidian(self, link: str, target_qq_number: str | None = None) -> dict:
         """打开 qidian 链接唤醒 QQ 会话并识别当前接待人（Dispatcher 内串行）。
 
         单次唤醒预算约 25 秒，因此队列等待上限按"前面排了多少个任务"放大，
@@ -235,7 +238,7 @@ class LegacyQqAutomationFacade:
         operator = self._operator()
         # 队列里已有的任务数 × 单次预算 + 余量；上限兜底防止失控等待
         timeout = min(180.0, WAKE_TIMEOUT_BUDGET_SECONDS * (operator.pending_task_count + 1) + 15.0)
-        result, error = operator.wake_qidian(link, timeout=timeout)
+        result, error = operator.wake_qidian(link, target_qq_number, timeout=timeout)
         if error is not None:
             raise QqAutomationError(_operation_error_code(error, "QQ_QIDIAN_WAKE_FAILED")) from error
         return result

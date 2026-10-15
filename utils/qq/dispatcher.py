@@ -113,8 +113,8 @@ class Dispatcher:
                         result = ({"qqNumber": number} if number is not None else
                                   {"qqNumber": None, "skipped": True, "reason": "QQ_CONTACT_NUMBER_COPY_UNAVAILABLE"})
                     elif task_type == "qidian_wake":
-                        link, = args
-                        result = self.wake_qidian_impl(link)
+                        link, target_qq_number = args
+                        result = self.wake_qidian_impl(link, target_qq_number)
                     elif task_type == "check_capture_ready":
                         result = self.check_capture_ready_impl()
                     else:
@@ -146,14 +146,18 @@ class Dispatcher:
         except queue.Empty:
             return {}, TimeoutError("QQ_CONTACT_NUMBER_QUEUE_TIMEOUT")
 
-    def wake_qidian(self, link: str, timeout: float = 45.0) -> Tuple[dict, Optional[Exception]]:
+    def wake_qidian(self, link: str, target_qq_number: str | None = None,
+                    timeout: float = 45.0) -> Tuple[dict, Optional[Exception]]:
         """qidian 唤醒（打开链接 → 等会话稳定 → 识别接待人），入队列串行执行。
+
+        ``target_qq_number`` 是调用方从华强搜索结果页读到的商家 QQ 号，原样透传给实现层；
+        给了就用它当目标号，不给才由实现层退回链接解析。
 
         整段唤醒比普通任务长（约 25 秒预算）；排队超时只表示"没等到结果"，
         任务本身不被取消（与其它入口的超时语义一致）。
         """
         res_q = queue.Queue(maxsize=1)
-        self.task_queue.put(("qidian_wake", (link,), {}, res_q))
+        self.task_queue.put(("qidian_wake", (link, target_qq_number), {}, res_q))
         try:
             return res_q.get(timeout=timeout)
         except queue.Empty:
@@ -218,11 +222,11 @@ class Dispatcher:
         win = ensure_qq_window_with_retry()
         return {"ready": True, "windowTitle": getattr(win, "title", None)}
 
-    def wake_qidian_impl(self, link: str) -> dict:
+    def wake_qidian_impl(self, link: str, target_qq_number: str | None = None) -> dict:
         """实际实现：qidian 链接唤醒 + 会话稳定等待 + 当前接待人识别。"""
         from .qidian import wake_and_identify
 
-        return wake_and_identify(link)
+        return wake_and_identify(link, target_qq_number)
 
     def get_contact_list_impl(self, contact_name: str | None = None,
                               all_contacts: bool = False) -> dict:

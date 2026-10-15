@@ -5,11 +5,12 @@
 
 1. **链接校验**：只接受 ``http(s)://qidianqq.hqew.com/GoClient``——拒 userinfo、端口、
    其他路径、子域变体与其他协议，与客户端 ``isHqewContactUrl()`` 同一条规则；
-2. **解析目标 QQ 号** ``resolve_target_qq()``：优先取链接自身的 ``QQ`` 参数。真实链接的
-   ``QQ`` 参数有三种形态：明文号（``QQ=3004348344``，真机实测就是 QQ 客户端里显示的接待
-   人 QQ 号）、``wpa.qq.com/msgrd?...&uin=`` 链接、``wpa1.qq.com/<短码>`` 短链（跟随 302
-   落到 qidian 落地页取 ``kfuin``）。``QQ`` 参数拿不到号时才退回站点自己的
-   ``GetQQLinkUrl``（GoClient 页面 JS 用的就是它）。两者都拿不到即业务失败
+2. **确定目标 QQ 号** ``resolve_target_qq()``：**优先用调用方传入的号**
+   （``targetQqNumber``——客户端从华强搜索/报价结果页读到的商家 QQ 号，``a.customerqq[qq]``）。
+   真机实测链接自身的 ``QQ`` 参数并不可靠：另一种形态 ``wpa1.qq.com/<短码>`` 跟随 302 后拿到的是
+   企点路由/客服号 ``kfuin``（真机：目标 3009004623 而 QQ 客户端显示的接待人是 800885759），
+   站点 ``GetQQLinkUrl`` 返回的也是同一个路由号，两者都不能当作接待人 QQ 号。因此链接解析只在
+   调用方**没有**传号时兜底（链接 ``QQ`` 参数 → ``GetQQLinkUrl``）；两种来源都拿不到即业务失败
    （``QQ_QIDIAN_QQ_UNRESOLVED``），**不唤醒**；
 3. **唤醒**：QQ 进程不存在时先走 ``window_ops.start_qq()``，再 ``os.startfile(链接)``
    交给默认浏览器（与客户端现网已跑通的路径一致，不反向构造 ``tencent://``）；
@@ -18,8 +19,8 @@
    内不再变化且出现唯一激活行；
 5. **识别接待人**：用 ``ContactNumberReader.identify_current()`` 复制当前激活行的 QQ 号；
    群会话 / 不提供「复制 QQ 号」菜单项的会话返回 ``None``（不报错）；
-6. **生效判定（防脏映射）**：唤醒前先记下当时的会话名单指纹与激活行名。识别值等于链接解析
-   出的目标 QQ 号 → 通过（``qqNumberVerified=true``）；名单在唤醒后发生了变化（会话被顶到
+6. **生效判定（防脏映射）**：唤醒前先记下当时的会话名单指纹与激活行名。识别值等于目标 QQ 号
+   → 通过（``qqNumberVerified=true``）；名单在唤醒后发生了变化（会话被顶到
    最前 / 新会话出现）→ 也通过（``qqNumberVerified=false``，接待人可能换了号或本身是客服号）；
    名单与唤醒前**一模一样**且读到的 QQ 号与目标对不上 → 判定链接未真正生效，报
    ``QQ_QIDIAN_WAKE_FAILED`` 并**拒绝写映射**，绝不让「上一次的激活行」冒充本次接待人。
@@ -215,19 +216,30 @@ def extract_target_qq(link: str) -> str | None:
     return None
 
 
-def resolve_target_qq(link: str) -> tuple[str | None, str]:
-    """解析目标 QQ 号，返回 ``(QQ 号, 来源)``；解析不到返回 ``(None, "")``。
+def resolve_target_qq(link: str, provided: str | None = None) -> tuple[str | None, str]:
+    """确定目标 QQ 号，返回 ``(QQ 号, 来源)``；都拿不到返回 ``(None, "")``。
 
-    优先取链接自身的 ``QQ`` 参数：真实链接里它就是 QQ 客户端里那个接待人 QQ 号
-    （明文号形态直接可用；``wpa.qq.com/msgrd?...&uin=`` 取 ``uin``；``wpa1.qq.com``
-    短链跟随 302 取 ``kfuin``）。``QQ`` 参数拿不到号时才退回站点自己的
-    ``GetQQLinkUrl``（GoClient 页面 JS 用的就是它，返回的是同一条唤醒链接）。
+    ``provided``（调用方传入的 ``targetQqNumber``）优先且直接生效，不再访问链接或站点接口；
+    只有它为 None/空白时才走下面的链接解析兜底。来源取 ``caller`` / ``link`` / ``api``。
 
-    注意：该接口返回的 ``kfuin`` 是**企点路由/客服号**，实测与 QQ 客户端里显示的接待人
-    QQ 号并不相等（2026-10-15 真机：明文号链接 ``QQ=3004348344`` 与
-    ``/v1/contacts/current:identify`` 读到的一致，接口返回的却是 ``kfuin=3009070386``），
-    所以接口只能兜底、不能优先。来源取 ``link`` / ``api``，仅用于日志。
+    没有 ``provided`` 时的兜底顺序：先取链接自身的 ``QQ`` 参数（明文号直接可用，
+    ``wpa.qq.com/msgrd?...&uin=`` 取 ``uin``），再退回站点自己的 ``GetQQLinkUrl``
+    （GoClient 页面 JS 用的就是它，返回的是同一条唤醒链接）。
+
+    注意这两条兜底路都可能拿到**企点路由/客服号**而不是接待人号：``wpa1.qq.com`` 短链
+    302 之后的 ``kfuin``、以及 ``GetQQLinkUrl`` 返回的 ``kfuin`` 都实测与 QQ 客户端里显示
+    的接待人 QQ 号不相等（2026-10-15 真机：短链目标 3009004623，识别到的接待人是
+    800885759）。所以客户端能从华强结果页读到商家 QQ 号时，一定要通过 ``provided``
+    直接传进来；链接解析只用于没有该号的老链路。
     """
+    caller = (provided or "").strip()
+    if caller:
+        if not _QQ_PATTERN.match(caller):
+            raise QidianError("QQ_QIDIAN_QQ_UNRESOLVED",
+                              f"调用方提供的目标 QQ 号格式不合法：{caller[:32]!r}")
+        logger.info("qidian.resolve source=caller qq=%s", caller)
+        return caller, "caller"
+
     direct = extract_target_qq(link)
     if direct:
         logger.info("qidian.resolve source=link qq=%s", direct)
@@ -378,17 +390,21 @@ def _identify_active_qq() -> str | None:
         raise QidianError("QQ_QIDIAN_SESSION_NOT_STABLE", f"识别接待人 QQ 号失败：{code}") from exc
 
 
-def wake_and_identify(link: str, *, timeout: float = WAKE_TIMEOUT_BUDGET_SECONDS) -> dict:
+def wake_and_identify(link: str, target_qq_number: str | None = None, *,
+                      timeout: float = WAKE_TIMEOUT_BUDGET_SECONDS) -> dict:
     """唤醒 qidian 链接对应的 QQ 会话并识别当前接待人。
+
+    ``target_qq_number`` 是调用方（客户端从华强搜索结果页）读到的商家 QQ 号：给了就用它，
+    链接解析整体跳过；没给才退回链接 ``QQ`` 参数与站点 ``GetQQLinkUrl`` 兜底。
 
     只在 Dispatcher 的 worker 线程内调用（串行消费队列），返回结果 dict；
     任何业务失败都抛 ``QidianError``（错误码 ``QQ_QIDIAN_*``）。
     """
     normalized = normalize_link(link)
-    target_qq, target_source = resolve_target_qq(normalized)
+    target_qq, target_source = resolve_target_qq(normalized, target_qq_number)
     if not target_qq:
         raise QidianError("QQ_QIDIAN_QQ_UNRESOLVED",
-                          "链接既没有可识别的 QQ 参数，qidian 接口也解析不出目标 QQ 号")
+                          "调用方没有传目标 QQ 号，链接既没有可识别的 QQ 参数，qidian 接口也解析不出号")
     logger.info("qidian.wake.target qq=%s source=%s", target_qq, target_source)
 
     started = time.monotonic()
@@ -451,6 +467,7 @@ def wake_and_identify(link: str, *, timeout: float = WAKE_TIMEOUT_BUDGET_SECONDS
         "contactName": contact_name,
         "qqNumber": qq_number,
         "targetQqNumber": target_qq,
+        "targetSource": target_source,
         "qqNumberVerified": verified,
         "activeStable": True,
         "wokeAt": datetime.now().astimezone().isoformat(timespec="seconds"),
