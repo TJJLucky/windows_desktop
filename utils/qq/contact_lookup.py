@@ -144,7 +144,7 @@ class ContactNotCopyableError(ContactLookupError):
 # 行结构判据（accessibility._row_copyable）能挡住"我的手机""QQ邮箱提醒"这类行内挂着
 # <img> 的服务/系统会话；真机上还有一批行结构与普通会话一样、QQ 却同样不给复制的会话：
 # 官方号"QQ团队"（框选始终进不了多选态，真机实测白等 13.7s 后报 QQ_SELECTION_NOT_ENTERED）、
-# 临时会话里的邀请卡片（进了多选态但剪贴板不变）、只含"暂不支持该消息类型"占位消息的会话。
+# 临时会话里的不可复制邀请卡片、只含"暂不支持该消息类型"占位消息的会话。
 # 把它们留在名单里，每次读取都要重跑一遍失败的框选（还是在真机上把服务拖进 COM 崩溃
 # 风险最大的那条链路），因此凡是"确实试过、QQ 明确拒绝"的会话按名字记到 state 目录：
 # 之后从名单里筛掉，直接读取它们则毫秒级报 QQ_CONTACT_NOT_COPYABLE。
@@ -155,10 +155,11 @@ class ContactNotCopyableError(ContactLookupError):
 REFUSAL_LEARNING_ENV = "QQ_CONTACT_REFUSAL_LEARNING"
 REFUSAL_STORE_FILENAME = "non-copyable-contacts.json"
 REFUSAL_MAX_ENTRIES = 200
-# 只有这些失败码代表"QQ 拒绝复制"：窗口不可用、截图失败、解析失败等真实错误不记。
+# 剪贴板未变化可能是点击/渲染时序问题，不能据此永久过滤联系人。
+# 该失败仍返回调用方，由串行队列有限重试；旧版误学记录也不再生效。
+# 窗口不可用、截图失败、解析失败等真实错误不记。
 REFUSAL_FAILURE_CODES = frozenset({
     "QQ_SELECTION_NOT_ENTERED",
-    "QQ_COPY_CLIPBOARD_UNCHANGED",
     "QQ_COPY_TEXT_EMPTY",
     "QQ_COPY_ACTION_NOT_FOUND",
 })
@@ -211,7 +212,10 @@ def refusal_is_effective(info: dict | None) -> bool:
     """一条学习记录是否已生效（够次数）。"""
     if not isinstance(info, dict):
         return False
-    return int(info.get("count") or 0) >= _strikes_required(str(info.get("code") or ""))
+    code = str(info.get("code") or "")
+    if code not in REFUSAL_FAILURE_CODES:
+        return False
+    return int(info.get("count") or 0) >= _strikes_required(code)
 
 
 def confirmed_refusals() -> dict[str, dict]:

@@ -798,7 +798,7 @@ class MessageList:
         try:
             copied_text = self.copy_visible_selection()
         except RuntimeError as exc:
-            # QQ 明确拒绝复制的会话（框选进不了多选态、剪贴板始终不变等）：按昵称记进
+            # QQ 明确拒绝复制的会话（框选进不了多选态、找不到复制项等）：按昵称记进
             # state 目录，之后从名单里筛掉并直接报 QQ_CONTACT_NOT_COPYABLE，不再重跑
             # 这条十几秒的失败路径。原错误照常抛给调用方。
             record_refused_copy(contact_name, str(exc))
