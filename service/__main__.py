@@ -36,6 +36,8 @@ from pathlib import Path
 import socket
 # tempfile：以"先写临时文件再原子替换"的方式写 endpoint 文件，避免调用方读到半截内容
 import tempfile
+import sys
+import threading
 
 # uvicorn：ASGI 服务器，负责把 HTTP 请求转交给 FastAPI 应用处理
 import uvicorn
@@ -71,6 +73,8 @@ def main() -> None:
         default=None,
         help="日志目录（缺省：state-dir\\logs）",
     )
+    parser.add_argument("--shutdown-on-stdin", action="store_true",
+                        help="由父进程管道管理生命周期；收到 shutdown 或 EOF 时正常退出")
     # 解析命令行参数；argparse 会在参数非法时自动打印用法并退出
     arguments = parser.parse_args()
 
@@ -125,6 +129,7 @@ def main() -> None:
             app_log=app_log,
             console_log=console_log,
             logger=logger,
+            shutdown_on_stdin=arguments.shutdown_on_stdin,
         )
     finally:
         instance_mutex.close()
@@ -140,6 +145,7 @@ def _run_service(
     app_log: Path,
     console_log: Path,
     logger: logging.Logger,
+    shutdown_on_stdin: bool = False,
 ) -> None:
     """在已持有 state_dir mutex 的前提下初始化并运行服务。"""
     # 绑定 loopback 监听套接字（127.0.0.1 + 系统分配随机端口），只接受本机连接
@@ -163,7 +169,8 @@ def _run_service(
 
         # create_app 会初始化 SQLite，因此也必须处于 mutex 与清理保护范围内。
         app = create_app(ledger_path=state_dir / "qq-command-ledger.sqlite3")
-        asyncio.run(uvicorn.Server(uvicorn.Config(app, log_level="info", use_colors=False)).serve(sockets=[listener]))
+        server = uvicorn.Server(uvicorn.Config(app, log_level="info", use_colors=False))
+        asyncio.run(_serve(server, listener, shutdown_on_stdin=shutdown_on_stdin))
     except Exception:
         logger.exception("service.crashed")
         raise
@@ -173,6 +180,29 @@ def _run_service(
         if endpoint_published:
             _delete_owned_endpoint(endpoint_file)
 
+
+
+async def _serve(server, listener, *, shutdown_on_stdin: bool) -> None:
+    if shutdown_on_stdin:
+        loop = asyncio.get_running_loop()
+
+        def watch_parent():
+            # 管道只属于启动本服务的客户端；不新增可被其他调用者关闭服务的 HTTP 路由。
+            # EOF 同时覆盖父进程意外退出；独立启动不启用此模式。
+            try:
+                if sys.stdin is not None:
+                    for line in sys.stdin:
+                        if line.strip() == "shutdown":
+                            break
+            finally:
+                logging.getLogger("qq_service.startup").info("service.shutdown.request source=parent_pipe")
+                try:
+                    loop.call_soon_threadsafe(setattr, server, "should_exit", True)
+                except RuntimeError:
+                    pass  # 正常退出已关闭事件循环。
+
+        threading.Thread(target=watch_parent, name="qq-parent-lifecycle", daemon=True).start()
+    await server.serve(sockets=[listener])
 
 
 class _StateDirectoryMutex:
