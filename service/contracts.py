@@ -242,6 +242,8 @@ class IdentifyCurrentContactResponse(StrictModel):
 class QidianWakeRequest(StrictModel):
     """qidian 唤醒请求：链接 + 该链接对应的公司信息（从网站上提取）。"""
 
+    account_scope: str = Field(alias="accountScope", min_length=1, max_length=256, title="QQ 资料范围", description="客户端主进程提供的资料范围；不代表实际登录 QQ 账号检测。")
+
     link: str = Field(
         min_length=8,
         max_length=4096,
@@ -306,7 +308,7 @@ class QidianWakeRequest(StrictModel):
         description="可选的批次标识，仅用于审计追溯。",
     )
 
-    @field_validator("link", "site_id", "supplier_id", "supplier_name", "target_qq_number")
+    @field_validator("link", "site_id", "supplier_id", "supplier_name", "target_qq_number", "account_scope")
     @classmethod
     def _reject_blank(cls, value: str) -> str:
         """必填文本去首尾空白；全空白按参数违规拒绝。"""
@@ -319,10 +321,12 @@ class QidianWakeRequest(StrictModel):
 class QidianWakeResponse(StrictModel):
     """qidian 唤醒结果：本次唤醒识别到的接待人及其 QQ 号。"""
 
+    account_scope: str = Field(alias="accountScope", title="QQ 资料范围", description="已验证映射所属的客户端资料范围。")
+
     link_hash: str = Field(
         alias="linkHash",
         title="链接指纹",
-        description="qidian 链接的 sha256 指纹，用于同链去重与映射查询。",
+        description="qidian 链接的 sha256 指纹，用于审计与映射查询；复用按资料范围和网站 QQ 判断。",
     )
     site_id: str = Field(alias="siteId", title="站点 ID", description="本次请求的站点标识。")
     supplier_id: str = Field(alias="supplierId", title="供应商 ID", description="本次请求的供应商标识。")
@@ -337,7 +341,7 @@ class QidianWakeResponse(StrictModel):
         default=None,
         pattern=r"^[1-9][0-9]{4,19}$",
         title="接待人 QQ 号",
-        description="识别到的当前接待人 QQ 号；群会话或不提供复制项的会话为 null。",
+        description="已核验的网站商家 QQ 号；无法复制号码时拒绝首次建映射。",
     )
     target_qq_number: str = Field(
         alias="targetQqNumber",
@@ -354,21 +358,23 @@ class QidianWakeResponse(StrictModel):
     active_stable: bool = Field(
         alias="activeStable",
         title="激活行是否稳定",
-        description="true = 已等到连续两次同一份会话名单且只有唯一激活行。",
+        description="true = 连续两次读到同一唯一激活行，并通过号码验证或已验证映射复用。",
     )
     reused: bool = Field(
         title="是否复用",
-        description="true = 同一链接在去重窗口内命中上次结果，本次没有再次唤醒 QQ。",
+        description="true = 同一资料范围、同一 QQ 的已验证映射已通过无障碍树重新激活，本次没有再次打开链接。",
     )
     woke_at: str = Field(
         alias="wokeAt",
         title="唤醒时间",
-        description="本次（或命中的上次）唤醒完成时间，ISO 8601 带时区偏移。",
+        description="本次号码验证或复用激活完成时间，ISO 8601 带时区偏移。",
     )
 
 
 class QidianMappingQuery(StrictModel):
     """按 (siteId, supplierId) 或 linkHash 读回 qidian 唤醒映射。"""
+
+    account_scope: str = Field(alias="accountScope", min_length=1, max_length=256, title="QQ 资料范围", description="客户端主进程提供的资料范围；不代表实际登录 QQ 账号检测。")
 
     site_id: str | None = Field(
         alias="siteId",
@@ -392,6 +398,16 @@ class QidianMappingQuery(StrictModel):
         description="按链接指纹反查映射；与 (siteId, supplierId) 二选一。",
     )
 
+    @field_validator("account_scope", "site_id", "supplier_id", "link_hash")
+    @classmethod
+    def _trim_lookup(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("查询字段不能为空")
+        return value
+
     @model_validator(mode="after")
     def _require_lookup_key(self) -> "QidianMappingQuery":
         """必须给出 linkHash，或同时给出 siteId 与 supplierId。"""
@@ -405,14 +421,16 @@ class QidianMappingQuery(StrictModel):
 class QidianMappingResponse(StrictModel):
     """qidian 唤醒映射查询结果；found=false 时其余字段均为 null。"""
 
+    account_scope: str = Field(alias="accountScope", title="QQ 资料范围", description="已验证映射所属的客户端资料范围。")
+
     found: bool = Field(title="是否命中映射", description="false = 该键还没有映射记录，其余字段均为 null。")
     site_id: str | None = Field(alias="siteId", default=None, title="站点 ID", description="映射主键的一部分。")
     supplier_id: str | None = Field(alias="supplierId", default=None, title="供应商 ID", description="映射主键的一部分。")
     link_hash: str | None = Field(alias="linkHash", default=None, title="链接指纹", description="最近一次唤醒使用的链接指纹。")
     supplier_name: str | None = Field(alias="supplierName", default=None, title="供应商名称", description="最近一次唤醒携带的公司名。")
     contact_name: str | None = Field(alias="contactName", default=None, title="接待人会话名", description="最近一次唤醒识别到的 QQ 会话名。")
-    qq_number: str | None = Field(alias="qqNumber", default=None, title="接待人 QQ 号", description="最近一次识别到的接待人 QQ 号；不提供复制项的会话为 null。")
+    qq_number: str | None = Field(alias="qqNumber", default=None, title="接待人 QQ 号", description="已验证的接待人 QQ 号；found=false 时为空。")
     target_qq_number: str | None = Field(alias="targetQqNumber", default=None, title="目标 QQ 号", description="最近一次唤醒时调用方传入的商家 QQ 号。")
     source: Literal["qidian_wake"] | None = Field(default=None, title="映射来源", description="映射写入来源，当前只有 qidian_wake。")
     updated_at: str | None = Field(alias="updatedAt", default=None, title="更新时间", description="最近一次覆盖写入时间，ISO 8601 带时区偏移。")
-    wake_count: int | None = Field(alias="wakeCount", default=None, ge=0, title="唤醒次数", description="该映射键累计写入次数。")
+    wake_count: int | None = Field(alias="wakeCount", default=None, ge=0, title="唤醒次数", description="当前资料范围与 QQ 会话验证记录累计真实唤醒次数，复用不增加；记录失效重建后重新计数。")

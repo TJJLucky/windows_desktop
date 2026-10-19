@@ -24,7 +24,7 @@ from PIL import Image
 # 列表区域识别（截图 + 锚点定位）
 from .regions import get_userList_region_and_image, RegionResult
 # 窗口就绪保证（重试）
-from .window_ops import ensure_qq_window_with_retry
+from .window_ops import ensure_qq_session_ready
 # 计时装饰器
 from ..core.timing import timed_stage, timer
 
@@ -249,7 +249,7 @@ class UserList:
         """
         # 每个阶段单独计时；外层 @timer 输出 refresh_image 总耗时。
         with timed_stage("refresh_image.ensure_window"):
-            main_window = ensure_qq_window_with_retry()
+            main_window = ensure_qq_session_ready()
         # 兼容旧调用：只有显式 stabilize=True 时才等待旧的 1.2 秒。
         with timed_stage("refresh_image.stabilize_wait"):
             if stabilize:

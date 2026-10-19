@@ -31,7 +31,7 @@ from fastapi.encoders import jsonable_encoder
 from .chat_history import ChatHistoryStore
 # CommandConflictError：相同 commandId 配不同消息体的冲突异常；CommandLedger：命令幂等账本
 from .command_ledger import CommandConflictError, CommandLedger
-# QidianMappingStore：qidian 唤醒映射与唤醒日志（(siteId, supplierId) 主键）
+# QidianMappingStore：qidian 唤醒映射与唤醒日志（资料范围内供应商和 QQ 会话分别存储）
 from .qidian_mapping import QidianMappingStore
 # 全部 Pydantic 请求/响应契约模型（API 的输入输出 schema）
 from .contracts import IdentifyCurrentContactRequest, IdentifyCurrentContactResponse, API_VERSION, CaptureCheckResponse, ChatHistoryRequest, ChatHistoryResponse, CommandResponse, ListContactsRequest, ListContactsResponse, QidianMappingQuery, QidianMappingResponse, QidianWakeRequest, QidianWakeResponse, ReadMessagesRequest, ReadMessagesResponse, SendMessageRequest, ServiceHealthResponse
@@ -160,7 +160,7 @@ def create_app(
             raise
         elapsed_ms = (time.perf_counter() - started) * 1000
         response.headers["X-Request-ID"] = request_id
-        logger.info(
+        (logger.warning if response.status_code >= 400 else logger.info)(
             "http.request.end request_id=%s method=%s path=%s status=%d duration_ms=%.2f total_duration_ms=%.2f",
             request_id,
             request.method,
@@ -350,12 +350,14 @@ def create_app(
             result = facade.send_message(request.contact_name, request.text)
         except QqAutomationError as exc:
             logger.exception("message.send.failed command_id=%s", request.command_id)
-            # 发送失败：构造失败结果并让账本落 FAILED 终态（不会留下悬空的 RUNNING）
-            result = {"ok": False, "sent": False, "textLength": len(request.text), "error": str(exc)}
+            # 已开始的任务超时仍可能发送，不能记成明确失败后让客户端重试。
+            status = "EFFECT_UNKNOWN" if str(exc) == "QQ_SEND_EFFECT_UNKNOWN" else "FAILED"
+            result = {"ok": False, "textLength": len(request.text), "error": str(exc)}
+            if status == "FAILED":
+                result["sent"] = False
             record_attempt("SEND", operation_started, contact_name=request.contact_name, status="FAILED", failure_code=str(exc))
-            ledger.resolve(request.command_id, "FAILED", result)
-            # 返回 FAILED 状态给调用方
-            return CommandResponse(commandId=request.command_id, status="FAILED", result=result)
+            ledger.resolve(request.command_id, status, result)
+            return CommandResponse(commandId=request.command_id, status=status, result=result)
         # 发送成功：账本落 SUCCEEDED 终态。聊天历史以后续 QQ 原生复制结果为准；
         # 服务不按正文猜测哪个复制记录对应这次发送。
         ledger.resolve(request.command_id, "SUCCEEDED", result)
@@ -433,16 +435,16 @@ def create_app(
         summary="唤醒 qidian 链接对应的 QQ 会话并登记接待人映射",
         description="用请求里的 targetQqNumber（调用方从华强搜索结果页读到的商家 QQ 号，必填）当目标号"
                     "（服务端不解析链接里的号）→ 用默认浏览器打开链接 → 等无障碍树会话名单"
-                    "稳定并出现唯一激活行 → 复制当前接待人 QQ 号 → 按 (siteId, supplierId) 覆盖写入映射。"
+                    "稳定并出现唯一激活行 → 复制当前接待人 QQ 号 → 按 (accountScope, siteId, supplierId) 写入已验证映射。"
                     "整段唤醒都在内部单消费者队列里串行执行，多个 qidian 同时到达不会交叉。"
-                    "同一链接在 120 秒窗口内重复提交直接复用上次结果（reused=true），不会重复唤醒 QQ。",
+                    "同一资料范围和网站 QQ 的已验证映射经无障碍树重新定位激活后复用（reused=true）；未命中时打开链接并轮询号码完全匹配后保存。",
         tags=["qidian"],
         responses={503: {"description": "唤醒失败 / 会话不稳定 / 读不到唯一激活行"}},
         response_description="本次（或命中的上次）唤醒结果与映射",
     )
     def wake_qidian(request: QidianWakeRequest) -> QidianWakeResponse:
         # 惰性导入：qidian 模块依赖 Windows 桌面能力，不在服务启动时加载
-        from utils.qq.qidian import QidianError, link_hash, normalize_link
+        from utils.qq.qidian import QidianError, normalize_link
 
         operation_started = time.perf_counter()
         # 链接白名单校验放在路由层：非法链接属于参数违规（422），不进队列、不碰 QQ
@@ -453,102 +455,25 @@ def create_app(
             logger.warning("qidian.wake.invalid_link link=%r code=%s", request.link, exc)
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-        hash_ = link_hash(normalized)
-        # 同链去重：120 秒窗口内同一链接直接复用上次结果，不重复唤醒
-        recent = qidian_mappings.recent_wake(hash_, now_epoch=time.time())
-        if recent is not None:
-            qq_number = recent["qqNumber"]
-            # 复用判定只认「同一条链接」；目标号以本次请求为准（同链不同号说明上一次的号有问题）
-            target_qq = request.target_qq_number
-            logger.info(
-                "qidian.wake.reused site=%s supplier=%s hash=%s contact=%r target=%s",
-                request.site_id, request.supplier_id, hash_[:12], recent["contactName"], target_qq,
-            )
-            record_attempt("QIDIAN_WAKE", operation_started, status="REUSED",
-                           details={"linkHash": hash_, "contactName": recent["contactName"]})
-            # 复用不写唤醒日志、不加 wakeCount，但把调用方这次传的目标号刷到映射行上，
-            # 保证「响应里的 targetQqNumber」与「落库的映射」是同一个值。
-            qidian_mappings.refresh_target(
-                site_id=request.site_id,
-                supplier_id=request.supplier_id,
-                link_hash=hash_,
-                supplier_name=request.supplier_name,
-                contact_name=recent["contactName"],
-                qq_number=qq_number,
-                target_qq_number=target_qq,
-                woke_at=recent["updatedAt"],
-                woke_epoch=time.time(),
-            )
-            # 命中复用：接待人与 QQ 号来自上次唤醒日志，目标号取本次请求，reused=true 告知本次没有真的唤醒
-            return QidianWakeResponse.model_validate({
-                "linkHash": recent["linkHash"],
-                "siteId": request.site_id,
-                "supplierId": request.supplier_id,
-                "supplierName": request.supplier_name,
-                "contactName": recent["contactName"],
-                "qqNumber": qq_number,
-                "targetQqNumber": target_qq,
-                "qqNumberVerified": qq_number is not None and qq_number == target_qq,
-                "activeStable": True,
-                "reused": True,
-                "wokeAt": recent["updatedAt"],
-            })
-
-        # 真正唤醒：facade 走 Dispatcher 单消费者队列（视觉操作串行），失败投影成 503
         try:
-            result = facade.wake_qidian(normalized, request.target_qq_number)
+            result = facade.wake_qidian(normalized, request.target_qq_number,
+                metadata=dict(account_scope=request.account_scope, site_id=request.site_id,
+                              supplier_id=request.supplier_id, supplier_name=request.supplier_name,
+                               audit=dict(targetId=request.target_id, mpn=request.mpn, batchId=request.batch_id)),
+                mappings=qidian_mappings)
         except QqAutomationError as exc:
             record_attempt("QIDIAN_WAKE", operation_started, status="FAILED", failure_code=str(exc))
-            logger.warning(
-                "qidian.wake.failed site=%s supplier=%s code=%s duration_ms=%.2f",
-                request.site_id, request.supplier_id, exc, (time.perf_counter() - operation_started) * 1000,
-            )
             raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-        # 去重键以路由层算出的指纹为准（与 recent_wake 的查询键是同一个值）；
-        # 实现层返回的 linkHash 是同一算法的复核，不一致说明链路有 bug，仅告警不改行为。
-        if result.get("linkHash") not in (None, hash_):
-            logger.warning("qidian.wake.hash_mismatch route=%s impl=%s", hash_, result.get("linkHash"))
-        # 覆盖写入映射（旧值一并进唤醒日志）：同一 (siteId, supplierId) 直接覆盖，不返回冲突
-        row = qidian_mappings.record_wake(
-            site_id=request.site_id,
-            supplier_id=request.supplier_id,
-            link_hash=hash_,
-            supplier_name=request.supplier_name,
-            contact_name=result["contactName"],
-            qq_number=result.get("qqNumber"),
-            target_qq_number=result.get("targetQqNumber"),
-            woke_at=result["wokeAt"],
-            woke_epoch=time.time(),
-        )
-        record_attempt(
-            "QIDIAN_WAKE", operation_started, contact_name=result["contactName"], status="SUCCESS",
-            details={"linkHash": hash_, "qqNumber": result.get("qqNumber"),
-                     "qqNumberVerified": result.get("qqNumberVerified"), "wakeCount": row["wakeCount"]},
-        )
-        logger.info(
-            "qidian.wake.success site=%s supplier=%s contact=%r qq=%s target=%s verified=%s "
-            "wake_count=%d duration_ms=%.2f",
-            request.site_id, request.supplier_id, result["contactName"], result.get("qqNumber"),
-            result.get("targetQqNumber"), result.get("qqNumberVerified"),
-            row["wakeCount"], (time.perf_counter() - operation_started) * 1000,
-        )
-        # 组装响应：唤醒结果 + 本次请求携带的公司信息 + reused=false（linkHash 用路由层指纹覆盖）
-        return QidianWakeResponse.model_validate({
-            **result,
-            "linkHash": hash_,
-            "siteId": request.site_id,
-            "supplierId": request.supplier_id,
-            "supplierName": request.supplier_name,
-            "reused": False,
-        })
+        record_attempt("QIDIAN_WAKE", operation_started, contact_name=result["contactName"],
+                       status="REUSED" if result["reused"] else "SUCCESS")
+        return QidianWakeResponse.model_validate(result)
 
     # —— qidian 映射查询接口（纯本地 SQLite，不触碰 QQ） ——
     @app.post(
         "/v1/qidian/mappings:query",
         response_model=QidianMappingResponse,
         summary="查询 qidian 唤醒映射",
-        description="按 (siteId, supplierId) 或 linkHash 读回最近一次 qidian 唤醒写入的映射；"
+        description="在必填 accountScope 内按 (siteId, supplierId) 或 linkHash 读回已验证映射；"
                     "没有记录时返回 found=false，其余字段为空。",
         tags=["qidian"],
         response_description="映射记录（found=false 表示该键还没有映射）",
@@ -557,14 +482,14 @@ def create_app(
         operation_started = time.perf_counter()
         # 本地 SQLite 短连接查询：不触碰 QQ，可与唤醒任务并发
         row = qidian_mappings.get(
-            site_id=request.site_id, supplier_id=request.supplier_id, link_hash=request.link_hash,
+            account_scope=request.account_scope, site_id=request.site_id, supplier_id=request.supplier_id, link_hash=request.link_hash,
         )
         if row is None:
             record_attempt("QIDIAN_MAPPING_QUERY", operation_started, status="NOT_FOUND")
             logger.info("qidian.mapping.miss site=%s supplier=%s hash=%s",
                         request.site_id, request.supplier_id, request.link_hash)
             # 没有映射不是错误：返回 found=false，其余字段保持为空
-            return QidianMappingResponse(found=False)
+            return QidianMappingResponse(accountScope=request.account_scope, found=False)
         record_attempt(
             "QIDIAN_MAPPING_QUERY", operation_started, contact_name=row["contactName"], status="SUCCESS",
             details={"siteId": row["siteId"], "supplierId": row["supplierId"], "wakeCount": row["wakeCount"]},

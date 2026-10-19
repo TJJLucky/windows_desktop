@@ -11,6 +11,7 @@
 
 # ctypes：读取窗口 DPI（GetDpiForWindow）
 import ctypes
+import logging
 # os：路径拼接
 import os
 # time：等待系统动画/渲染
@@ -20,6 +21,7 @@ from pathlib import Path
 
 # psutil：进程枚举（按进程名找 QQ.exe）
 import psutil
+import pywintypes
 # pygetwindow：窗口枚举与几何信息（left/top/right/bottom/isMaximized）
 import pygetwindow as gw
 # win32gui：窗口可见性/最小化状态查询
@@ -44,6 +46,10 @@ from .hotkeys import send_hotkey, TOGGLE_QQ_WINDOWS
 # SQLite 窗口状态缓存
 from .window_cache import WindowSnapshot, WindowStateCache, default_window_cache_path
 
+logger = logging.getLogger("qq_service.window")
+
+_SESSION_READY_TIMEOUT_SECONDS = 25.0
+_SESSION_READY_POLL_SECONDS = 0.2
 _WINDOW_FULL_REFRESH_TTL_SECONDS = 30.0
 _window_cache_instance: WindowStateCache | None = None
 
@@ -178,37 +184,32 @@ def _main_window_candidates() -> list:
     return [win for win in get_qq_windows() if win.title.strip().casefold() == "qq"]
 
 
-def _reset_duplicate_main_windows(windows: list, timeout: float = 5.0):
-    """关闭冲突的 QQ 主窗口，再通过 QQ 全局快捷键重新打开唯一主面板。"""
-    hwnds = sorted({int(win._hWnd) for win in windows})
-    print(f"[WARN] 检测到 {len(hwnds)} 个标题为 QQ 的窗口，关闭后重新打开主窗口: {hwnds}")
-    for hwnd in hwnds:
-        if win32gui.IsWindow(hwnd):
-            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
-
-    deadline = time.time() + min(timeout, 2.0)
-    while time.time() < deadline and _main_window_candidates():
-        time.sleep(0.1)
-
-    # QQ 通常仍驻留托盘，使用用户配置的全局快捷键主动打开主面板。
-    send_hotkey(TOGGLE_QQ_WINDOWS)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        candidates = _main_window_candidates()
-        if len(candidates) == 1:
-            print(f"[OK] QQ 主窗口已重新打开 hwnd={candidates[0]._hWnd}")
-            return candidates[0]
-        time.sleep(0.2)
-    return None
-
-
 def get_main_window():
-    """查找唯一 QQ 主窗口；冲突时关闭所有同名窗口并重新打开。"""
+    """筛选主窗口；同名登录窗不能被布局或关闭，多个主窗口时拒绝猜测账号。"""
+    from .accessibility import AccessibilityUnavailableError, ContactListAccessibility
+
     candidates = _main_window_candidates()
-    if len(candidates) == 1:
-        return candidates[0]
-    if len(candidates) > 1:
-        return _reset_duplicate_main_windows(candidates)
+    main_windows = []
+    for win in candidates:
+        # 已登录窗口通常可调整大小；登录窗为固定尺寸。这个样式只作初筛，
+        # 固定尺寸窗口仍可用真实主界面节点证明身份，不使用固定像素阈值。
+        if win32gui.GetWindowLong(win._hWnd, win32con.GWL_STYLE) & win32con.WS_THICKFRAME:
+            main_windows.append(win)
+            continue
+        try:
+            kind = ContactListAccessibility().window_kind(win._hWnd)
+        except AccessibilityUnavailableError:
+            kind = "unknown"
+        if kind in ("session", "main"):
+            main_windows.append(win)
+        else:
+            logger.debug("window.candidate.skipped hwnd=%s rect=%s dpi=%s reason=fixed_window_without_main_tree",
+                         win._hWnd, win32gui.GetWindowRect(win._hWnd), _window_dpi(win._hWnd))
+    if len(main_windows) == 1:
+        return main_windows[0]
+    if len(main_windows) > 1:
+        raise QQWindowNotReadyError(
+            f"检测到多个 QQ 主窗口，无法确定操作账号：{[win._hWnd for win in main_windows]}")
     return None
 
 
@@ -314,7 +315,7 @@ def _snapshot_and_verify(win) -> bool:
     return True
 
 
-def ensure_qq_window():
+def ensure_qq_window(main_win=None):
     """对外统一入口：保证 QQ 主窗口处于前置、左半铺满（高度占满+宽50%+靠左）、可截图状态。
 
     分级校验（成本从低到高）：
@@ -327,7 +328,7 @@ def ensure_qq_window():
     :return: 主窗口对象；失败返回 None（由 with_retry 决定重试/抛错）
     """
     # L1：取主窗口；不存在则尝试唤起
-    main_win = get_main_window()
+    main_win = main_win or get_main_window()
     if main_win is None and activate_qq():
         # 唤起成功后重取
         main_win = get_main_window()
@@ -392,3 +393,87 @@ def ensure_qq_window_with_retry(retry: int = 3):
             time.sleep(1)
     # 重试耗尽：显式抛错（上层转 503），绝不返回空数据
     raise QQWindowNotReadyError("QQ 主窗口在多次重试后仍未就绪") from last_err
+
+
+def ensure_qq_session_ready(*, deadline: float | None = None):
+    """在 Dispatcher 原任务内等真实会话列表，并在每轮重新选择窗口句柄。
+
+    截图就绪仍由 ensure_qq_window_with_retry 提供；联系人/收发/核号额外要求
+    列表容器存在。空列表有效，不要求滚动接口或当前有选中会话。
+    """
+    from .accessibility import AccessibilityUnavailableError, ContactListAccessibility
+
+    started = time.monotonic()
+    deadline = deadline if deadline is not None else started + _SESSION_READY_TIMEOUT_SECONDS
+    start_requested = False
+    toggle_requested = False
+    last_state = None
+    fixed_window_since = None
+    fixed_window_handles = ()
+    last_error = "尚未检测到主窗口"
+    while time.monotonic() < deadline:
+        hwnd = None
+        stage = "window_missing"
+        try:
+            if not get_qq_pids():
+                fixed_window_handles = ()
+                fixed_window_since = None
+                stage = "process_starting"
+                last_error = "QQ 进程正在启动，请完成登录"
+                if not start_requested:
+                    start_qq()
+                    start_requested = True
+            else:
+                win = get_main_window()
+                if win is None:
+                    visible = get_qq_windows()
+                    if visible:
+                        stage = "login_or_startup"
+                        last_error = "只有登录或启动窗口，请完成 QQ 登录并打开消息页"
+                        fixed = tuple(sorted(w._hWnd for w in visible if w.title.strip().casefold() == "qq"
+                                             and not win32gui.GetWindowLong(w._hWnd, win32con.GWL_STYLE) & win32con.WS_THICKFRAME))
+                        if fixed and fixed == fixed_window_handles:
+                            # 刚启动的进程仍保留完整等待预算；不以像素大小或缺少 UIA 节点证明登录状态。
+                            ages = [time.time() - psutil.Process(win32process.GetWindowThreadProcessId(h)[1]).create_time()
+                                    for h in fixed]
+                            if min(ages) - (time.monotonic() - started) >= _SESSION_READY_TIMEOUT_SECONDS and time.monotonic() - fixed_window_since >= 2.0:
+                                logger.warning("window.session.unavailable stage=login_or_startup hwnds=%s elapsed_ms=%.1f", fixed,
+                                               (time.monotonic() - started) * 1000)
+                                break
+                        else:
+                            fixed_window_handles = fixed
+                            fixed_window_since = time.monotonic()
+                    else:
+                        fixed_window_handles = ()
+                        fixed_window_since = None
+                        if not toggle_requested:
+                            send_hotkey(TOGGLE_QQ_WINDOWS)
+                            toggle_requested = True
+                else:
+                    fixed_window_handles = ()
+                    fixed_window_since = None
+                    hwnd = win._hWnd
+                    stage = "capture_not_ready"
+                    last_error = "QQ 主窗口尚不可截图"
+                    if ensure_qq_window(win) is not None:
+                        stage = "session_pane_missing"
+                        last_error = "主窗口可截图，但会话列表尚未出现，请确认已进入 QQ 消息页"
+                        if ContactListAccessibility().window_kind(hwnd) == "session":
+                            if time.monotonic() >= deadline:
+                                break
+                            logger.info("window.session.ready hwnd=%s elapsed_ms=%.1f", hwnd,
+                                        (time.monotonic() - started) * 1000)
+                            return win
+        except (QQWindowNotReadyError, AccessibilityUnavailableError, OSError, pywintypes.error, psutil.Error) as exc:
+            fixed_window_handles = ()
+            fixed_window_since = None
+            last_error = str(exc)
+        state = (hwnd, stage, last_error)
+        if state != last_state:
+            logger.info("window.session.wait hwnd=%s stage=%s previous_hwnd=%s reason=%s",
+                        hwnd, stage, last_state[0] if last_state else None, last_error)
+            last_state = state
+        time.sleep(min(_SESSION_READY_POLL_SECONDS, max(0, deadline - time.monotonic())))
+    logger.warning("window.session.not_ready elapsed_ms=%.1f state=%s",
+                   (time.monotonic() - started) * 1000, last_state)
+    raise QQWindowNotReadyError(f"QQ 会话列表未就绪：{last_error}")

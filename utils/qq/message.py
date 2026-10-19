@@ -26,7 +26,7 @@ from .regions import (
     get_message_box_region_and_image,
 )
 from .user_list import UserList
-from .window_ops import ensure_qq_window_with_retry, get_qq_window_image
+from .window_ops import ensure_qq_session_ready, get_qq_window_image
 from ..core.mouse import click_at, drag, find_non_resize_x
 from ..core.screenshot import window_dpi
 from ..core.timing import timer
@@ -640,7 +640,7 @@ class MessageList:
         before = after = search_image = None
         metadata: dict[str, Any] = {"requestId": diagnostic_id}
         try:
-            main_window = ensure_qq_window_with_retry()
+            main_window = ensure_qq_session_ready()
             self.hwnd = main_window._hWnd
             sentinel = f"QQ_DESKTOP_COPY_SENTINEL_{uuid.uuid4().hex}"
             with WindowCaptureCtx(self.hwnd):

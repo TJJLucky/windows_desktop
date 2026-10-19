@@ -64,6 +64,7 @@ _ERROR_CODE_PREFIXES = (
     "QQ_QIDIAN_LINK_INVALID",
     "QQ_QIDIAN_QQ_UNRESOLVED",
     "QQ_QIDIAN_WAKE_FAILED",
+    "QQ_QIDIAN_FRIEND_REQUIRED",
     "QQ_QIDIAN_SESSION_NOT_STABLE",
     "QQ_QIDIAN_ACTIVE_NOT_FOUND",
     "QQ_QIDIAN_ACTIVE_AMBIGUOUS",
@@ -125,7 +126,7 @@ class QqAutomationPort(Protocol):
         """读取指定联系人会话的可见消息，返回含 messages 列表的 dict。"""
         ...
 
-    def wake_qidian(self, link: str, target_qq_number: str) -> dict:
+    def wake_qidian(self, link: str, target_qq_number: str, *, metadata: dict, mappings) -> dict:
         """打开 qidian 链接唤醒 QQ 会话并识别当前接待人，返回结果 dict。
 
         ``target_qq_number``（必填）是调用方（客户端从华强搜索结果页）读到的商家 QQ 号，
@@ -197,6 +198,8 @@ class LegacyQqAutomationFacade:
         # 入队发送；error 非空表示失败（如窗口不可用、识别失败）
         sent, error = self._operator().send_message(contact_name, text, timeout=60.0)
         if error is not None:
+            if isinstance(error, TimeoutError) and getattr(error, "started", False):
+                raise QqAutomationError("QQ_SEND_EFFECT_UNKNOWN") from error
             _raise_operation_error(error, contact_name, "QQ_SEND_FAILED")
         # 规范化的成功结果：ok/sent 同值、消息长度、无错误
         return {"ok": bool(sent), "sent": bool(sent), "textLength": len(text), "error": None}
@@ -226,7 +229,7 @@ class LegacyQqAutomationFacade:
             "error": None,
         }
 
-    def wake_qidian(self, link: str, target_qq_number: str) -> dict:
+    def wake_qidian(self, link: str, target_qq_number: str, *, metadata: dict, mappings) -> dict:
         """打开 qidian 链接唤醒 QQ 会话并识别当前接待人（Dispatcher 内串行）。
 
         单次唤醒预算约 25 秒，因此队列等待上限按"前面排了多少个任务"放大，
@@ -238,7 +241,7 @@ class LegacyQqAutomationFacade:
         operator = self._operator()
         # 队列里已有的任务数 × 单次预算 + 余量；上限兜底防止失控等待
         timeout = min(180.0, WAKE_TIMEOUT_BUDGET_SECONDS * (operator.pending_task_count + 1) + 15.0)
-        result, error = operator.wake_qidian(link, target_qq_number, timeout=timeout)
+        result, error = operator.wake_qidian(link, target_qq_number, timeout=timeout, metadata=metadata, mappings=mappings)
         if error is not None:
             raise QqAutomationError(_operation_error_code(error, "QQ_QIDIAN_WAKE_FAILED")) from error
         return result

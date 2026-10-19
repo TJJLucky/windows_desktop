@@ -1,119 +1,46 @@
-# qidian 唤醒与映射
+# Qidian 首次验证与后续复用
 
-调用方（客户端）不再自己打开 qidian 链接，也不自己维护「哪个商家对应哪个 QQ 接待人」。
-它只把 **qidian 链接 + 目标 QQ 号 + 该链接对应的公司信息** 交给本机服务，剩下的唤醒、识别、
-落映射全部由服务串行完成，避免多个 qidian 同时唤醒时接待人对应错乱。
+当前实现：2026-10-17。网站数据由客户端应用浏览器采集并保存，QQ 服务不抓取网站、不解析链接或调用企点接口取号码。
 
-其中 **目标 QQ 号由调用方显式传入，且是必填**：客户端在打开链接之前，已经从华强搜索结果页行内的
-`a.customerqq[qq]` 读到商家 QQ 号，它才是权威来源。服务端**完全不解析链接里的号**（原因见
-「为什么服务端不解析链接里的号」）。
+## 契约和执行链
 
-## 为什么要放到服务端串行
+`POST /v1/qidian:wake` 接收 `accountScope/link/siteId/supplierId/supplierName/targetQqNumber`，可附带 `targetId/mpn/batchId` 审计信息。
+`targetQqNumber` 必须来自网站候选记录；链接只用于默认浏览器打开，链接内路由号不参与身份判断。
 
-qidian 链接被打开后，QQ 会把该商家的临时会话弹到会话列表顶部并激活它。识别
-「当前接待人」只能读**当前激活行**，所以「打开链接」和「读激活行」必须是一段不可被打断的
-临界区。服务端把整段唤醒作为一个 `qidian_wake` 任务投进 `Dispatcher` 单消费者队列，
-与读名单、发送、读消息天然互斥（FIFO 排队），因此并发到达的多个 qidian 只会依次执行。
+1. 在 Dispatcher 单消费者内查找 `(accountScope, targetQqNumber)` 已验证会话。
+2. 命中时通过无障碍树确认名称唯一、定位激活、连续两次核对当前会话，返回 `reused=true`。不打开链接、不再复制号码。
+3. 未命中或复用失败时打开原始链接一次，在约 25 秒预算内轮询唯一激活行并复制号码；错号、暂时无激活行继续等待，完全匹配才成功。
+4. 名称唯一性检查包括屏外行。列表可滚动时按 UIA 滚动状态扫全，使用当前元素标识及内容位置检查重叠与变化；未扫全、超时、无滚动能力或同名则拒绝名称定位。元素标识不持久化，不作为 QQ 身份。
+5. 首次验证还须通过名称唯一性检查，避免建立后续无法安全按名读取的映射。空消息页不影响号码验证；无法复制号码时不能首次建立可信映射。
+6. 保存与激活在同一队列任务内。超时、错号、歧义不写新映射；复用失败先使旧会话映射失效，再尝试首次验证。
 
-## 链路（`utils/qq/qidian.py`）
+长列表完整扫描会增加延迟，无法保证所有机器固定耗时。底层窗口/复制调用可能使约 25 秒预算略微超出。队列等待超时只说明 HTTP 未等到结果，任务可能仍在执行；调用方不得据此并发直接唤醒或发送。
 
-1. **链接校验** `normalize_link()`：只接受 `http(s)://qidianqq.hqew.com/GoClient`
-   （精确主机 + 精确路径）；拒绝 `userinfo`、显式端口、其他路径、子域变体（如
-   `qidianqq.hqew.com.evil.test`、`sub.qidianqq.hqew.com`）与其他协议（`tencent://`、
-   `javascript:`）。规则与客户端 `isHqewContactUrl()` 对齐。违规 → `QQ_QIDIAN_LINK_INVALID`（HTTP 422）。
-2. **取目标 QQ 号** `require_target_qq(provided)`：**只认调用方传入的 `targetQqNumber`**。
-   它就是客户端从华强搜索结果页行内 `a.customerqq[qq]` 读到的商家 QQ 号，与接待人是同一个号。
-   服务端**不取链接里的号、也不调站点接口**：缺失或格式非法 → `QQ_QIDIAN_QQ_UNRESOLVED`
-   （HTTP 契约层对必填与 `^[1-9][0-9]{4,19}$` 直接 422；服务内另留一条 503 防御分支，用于绕过
-   契约的内部调用），**不唤醒**。
-3. **唤醒**：QQ 进程不存在时先走既有 `window_ops.start_qq()`；再 `os.startfile(链接)`
-   交给默认浏览器打开（与客户端现网已跑通的路径一致，不反向构造 `tencent://` 链接）。
-   打开失败 → `QQ_QIDIAN_WAKE_FAILED`。
-4. **等会话稳定** `_wait_active_contact()`：唤醒不是「打开浏览器就生效」——浏览器要起页、GoClient 再
-   302/跳转、QQ 才把目标会话顶到最前（真机实测 3~5 秒）。所以**先等名单相对唤醒前发生变化**
-   （预算 `WAKE_CHANGE_BUDGET_SECONDS` = 15s），再等名单在 `WAKE_SETTLE_SECONDS` = 1.5s 内不再变化
-   且出现唯一激活行。名单已稳定却迟迟没有唯一激活行时按具体原因失败，不空等预算。
-5. **识别接待人** `ContactNumberReader.identify_current()`：复制当前激活行的 QQ 号；群会话或
-   不提供「复制 QQ 号」菜单项的会话（如官方号）返回 `null`，**不算失败**。会话刚被顶到最前时名单
-   还在重绘、色带判定会瞬时读不到激活行，因此识别最多重试 `IDENTIFY_ATTEMPTS` = 3 次。
-6. **生效判定（防脏映射）+ 落映射**：识别值 == 本次的目标号 → `qqNumberVerified=true` 通过；
-   若号对不上但**名单确实变了**（会话被顶到最前/新增一行）→ 也通过（`qqNumberVerified=false`，
-   接待人可能换了号、或本身就是企点客服号）；只有「名单与唤醒前**一模一样**且号也对不上」才判定链接
-   没生效，报 `QQ_QIDIAN_WAKE_FAILED` 并**拒绝写映射**，绝不让上一次的激活行冒充本次接待人。通过后由
-   `service/qidian_mapping.py` 按 `(siteId, supplierId)` 覆盖写入。
+## 临时会话明确受限（2026-10-18）
 
-总等待上限 `WAKE_TIMEOUT_BUDGET_SECONDS`（约 25 秒，含窗口就绪等待），超时 → `QQ_QIDIAN_SESSION_NOT_STABLE`。
+首次唤醒时，在同一个 Dispatcher/UIA 归属线程读取本机浏览器的无障碍树，无网络抓取、OCR 或切换标签页。只认 HTTPS `admin.qidian.qq.com/static_proxy/b2b-qq/wpa-link/index.html` 的 `/person?uin=` 页面；uin 必须唯一且等于调用方网站 `targetQqNumber`，并同时出现“无法发起临时会话”和“您可以先添加对方为好友，再发送消息”。页面号码只用于关联提示，不替代网站号码。
 
-> **企点客服号 vs 接待人号**：链接里带的也可能是企点路由号 `kfuin`，真机实测与 QQ 客户端里
-> 显示的接待人号**不相等**（例：`wpa1.qq.com` 短链的 `3009004623`，`identify` 读到 `800885759`）。
-> 这正是服务端不解析链接的原因：判定接待人一律用调用方从网站读到的商家 QQ 号。
-> 号对不上时 `qqNumberVerified=false`，映射仍以 `contactName`（真机上就是接待窗口名）落库；
-> 要求号完全一致的调用方需自行按 `qqNumberVerified` 裁决。
+打开链接前记录已有拒绝页面的窗口、运行时元素标识、URL；仅本次打开后新出现的匹配拒绝页面返回 HTTP 503 `QQ_QIDIAN_FRIEND_REQUIRED`。不写映射、不执行发送。约每 0.75 秒检查一次；基线读取失败、旧页未变化、目标不一致、无明确提示均不自动排除，继续原号码验证及超时处理。浏览器不可访问、隐藏标签或提供器未更新可能无法检测，不能声称覆盖所有浏览器。底层 UIA 调用也可能超出轮询预算。
 
-## 为什么服务端不解析链接里的号
+客户端按结构化错误码，将当前批次共享该 QQ 会话的未完成目标标记“需加好友，已跳过”，保留已发送记录和已完成报价，继续其他会话；不建立永久黑名单。已有可信会话复用不检查旧浏览器提示。
 
-2026-10-15 从本机 Edge 历史采样 **30 条真实链接**（明文 12 / msgrd 14 / wpa1 4），逐条核对
-「链接解析出的号」与「QQ 客户端里 `identify` 读到的接待人号」：
+真机只读证据：目标 `2388851108` 的现有页面返回上述两句 Text 文本，运行时标识可读。端到端新页面检测和批次跳过仍须在真实唤醒中核验。
 
-| 链接形态 | 链接/接口能拿到的号 | 是不是接待人 |
-| --- | --- | --- |
-| 明文号 `QQ=3004348344` | 3004348344 | 是（实测与 `identify` 一致） |
-| `wpa.qq.com/msgrd?...&uin=` | uin | 是（实测一致） |
-| `wpa1.qq.com/<短码>`（302 后 `kfuin`） | 企点**路由/客服号** | 否（真机：目标 `3009004623`，`identify` 读到 `800885759`） |
-| 站点 `GetQQLinkUrl` 返回的 `kfuin` | 企点**路由/客服号** | 否（同上） |
+## 存储与范围
 
-也就是说「链接/接口拿到的号」里存在**不等于接待人**的企点路由号：用它做目标号会让
-`qqNumberVerified` 永远为 false，映射也失去「号 == 接待人」这层保证。而华强搜索结果页行内
-`a.customerqq[qq]` 本来就是商家对外公布的接待 QQ 号，客户端在准备询价时已经拿到它，
-因此**由调用方传号**才是权威来源。
+- `qidian_verified_conversation`：主键 `(account_scope, qq_number)`，保存已验证会话名。
+- `qidian_verified_supplier`：主键 `(account_scope, site_id, supplier_id)`，关联共享 QQ 会话。
+- `qidian_verified_log`：每次成功验证/复用的结果、审计信息及旧值。
+- 旧无范围表保留但不作为可信映射自动升级。旧会话失效后相关供应商查询不再命中。
+- `wakeCount` 统计当前会话验证记录的真实唤醒次数，复用不增加；失效删除后重新验证从新记录计数。
+- 同一 QQ 的供应商共用会话，客户端商家记忆与报价归属分别保留。
+- `accountScope` 是客户端选择的账号资料范围，不能自动检测用户在 QQ 应用内切换登录账号。切换实际 QQ 后须使用对应资料，不能声称仅凭名称可检测身份替换。
 
-服务端因此**彻底移除了链接解析**（不再有 `QQ` 参数兜底、不再调 `GetQQLinkUrl`、不再跟随
-`wpa1` 短链 302）：少一条 URL 抓取路径，就少一处失败面与一处「号可能不对」的歧义。
-`targetQqNumber` 是必填字段，缺号直接 422，服务端不会退化成「猜一个号去唤醒」。
+`POST /v1/qidian/mappings:query` 必须传 `accountScope`，另传 `siteId+supplierId` 或 `linkHash`；不触碰桌面。成功 wake 的 `qqNumber` 必须等于 `targetQqNumber`，`qqNumberVerified/activeStable` 均为 true。复用时号码来自已验证记录，`wokeAt` 是本次激活完成时间。
 
-## 错误码
+## 历史验证记录的适用范围
 
-| 错误码 | 触发条件 |
-| --- | --- |
-| `QQ_QIDIAN_LINK_INVALID` | 链接不满足主机/路径/协议白名单（HTTP 422） |
-| `QQ_QIDIAN_QQ_UNRESOLVED` | `targetQqNumber` 缺失或格式非法（HTTP 契约层 422；绕过契约的内部调用由服务内防御分支映射成 503） |
-| `QQ_QIDIAN_WAKE_FAILED` | QQ 窗口就绪失败、无法把链接交给默认浏览器，或链接未生效（名单与唤醒前完全一致且 QQ 号对不上，拒绝写映射） |
-| `QQ_QIDIAN_SESSION_NOT_STABLE` | 总预算内没等到「稳定名单 + 唯一激活行」，或识别阶段失败 |
-| `QQ_QIDIAN_ACTIVE_NOT_FOUND` | 名单稳定但读不到激活行 |
-| `QQ_QIDIAN_ACTIVE_AMBIGUOUS` | 名单里出现多行激活（不做启发式猜测，直接失败） |
-| `QQ_QIDIAN_QUEUE_TIMEOUT` | 排队等待超过放大后的上限（任务本身不会被取消） |
-
-任何失败都**不写映射**，调用方不会拿到脏数据。
-
-## 映射存储口径
-
-`service/qidian_mapping.py`：标准库 `sqlite3` + 短连接 + 进程内 `threading.Lock`，与
-`chat_history.py` / `command_ledger.py` 同构；默认落在账本同目录的 `qq-qidian-mappings.sqlite3`。
-
-- `qidian_mapping`：主键 `(site_id, supplier_id)`，字段含 `link_hash / supplier_name /
-  contact_name / qq_number / target_qq_number / source / updated_at / woke_epoch / wake_count`；
-  另有 `link_hash` 索引便于反查。
-- `qidian_wake_log`：每次唤醒一行（自增 id），同时保存本次与上一次的
-  `contact_name / qq_number`，便于复盘「接待人换过没有」。
-- **覆盖策略**：同一 `(siteId, supplierId)` 直接覆盖，不返回冲突提示；旧映射只进唤醒日志。
-- **同链去重**：同一 `linkHash` 在 120 秒（`DEDUP_WINDOW_SECONDS`）窗口内重复请求直接复用
-  上次结果（响应 `reused=true`），不重复唤醒、不写唤醒日志、不加 `wakeCount`；但会用本次请求的
-  `targetQqNumber` 调 `refresh_target()` 刷新映射行，保证响应与落库同号；不同链接按 FIFO 排队。
-  去重键以路由层 `normalize_link()` + `link_hash()` 算出的指纹为准（与日志查询键同一个值）。
-
-## 接口
-
-- `POST /v1/qidian:wake`：请求 `{link, siteId, supplierId, supplierName, targetQqNumber, targetId?,
-  mpn?, batchId?}`（`targetId/mpn/batchId` 仅用于审计追溯，不参与映射）。
-  **`targetQqNumber` 是必填字段**：调用方从华强搜索结果页读到的商家 QQ 号，必须满足
-  `^[1-9][0-9]{4,19}$`，缺失或格式非法一律 422；服务端只用它判定接待人，不解析链接里的号。
-  响应 `linkHash / siteId / supplierId / supplierName / contactName / qqNumber? / targetQqNumber /
-  qqNumberVerified / activeStable / reused / wokeAt`。
-  `qqNumberVerified=true` 表示识别到的接待人 QQ 号与**本次请求传入的目标号**一致。
-- `POST /v1/qidian/mappings:query`：请求 `{siteId?, supplierId?, linkHash?}`（`linkHash` 与
-  `(siteId, supplierId)` 二选一，缺两者 422）；响应 `found` + 映射字段（映射行的 `source` 固定
-  `qidian_wake`，`targetQqNumber` 是最近一次调用方传入的商家 QQ 号——真唤醒与复用命中都会刷新它，
-  `wakeCount` 只统计真唤醒）。
+下列 2026-10-15 记录仅说明旧版本当时的结果，其中链接解析、错号成功、120 秒直接缓存和无范围键已被本次实现替换，不是当前版本验收结果。
 
 ## 真机验证（2026-10-15）
 
@@ -156,3 +83,33 @@ qidian 链接被打开后，QQ 会把该商家的临时会话弹到会话列表�
   `supplierId` 连续唤醒时）。调用方按 503 重试或回退人工确认即可，服务端不写脏映射。
 - **早期坑（已修）**：曾用伪造链接 `?QQ=110001335`（缺 `BHqewUserID`）测试——能通过校验但**不会真弹会话**，
   识别到的是上一次的激活行，写出脏映射。故新增「生效判定」：名单未变且号对不上就拒绝写映射。
+
+
+## 2026-10-18 App 真机复盘：激活不等于核号成功
+
+- 客户端应用内嵌 HQ 浏览器搜索 `STM32F103C8T6`，采购量 1000，取得深圳市恒嘉微实业有限公司、网站 QQ `2885718744`。未使用直接网站 HTTP 抓取。
+- 15:35 首次 wake 在约 25.25 秒后返回 `QQ_QIDIAN_SESSION_NOT_STABLE`。轮询日志为 14 行、无唯一激活行；失败发生于号码复制之前。用户观察到 QQ 已激活，不能把本错误解释成链接未唤醒 QQ。
+- 15:58 经 App 点击“识别身份”，读出 `洪先生/恒嘉微实业`、`2885718744`，与网站号码相同，接口 5.21 秒成功；映射库 `account_scope=3442859534`，`wake_count=1`。
+- 16:06 经 App 继续已授权询价，命令 `39ef8386-fd88-4a72-a8d1-c8f2e9962edd` 为 `SUCCEEDED`，发送接口约 2.88 秒。16:07 从同一会话复制回读到完整询价，发送人 `TJJ`。随后客户端因本方署名核对未完成而暂停，不属于映射失败，不能据此声称自动多轮报价已完成。
+- 本次补强：GoClient 打开后，每轮观察在 `WindowCaptureCtx` 内让 QQ 露出并等待渲染，然后读取唯一激活行、复制号码、精确比较、复核同一激活行及名字唯一性。窗口露出不作为身份凭据。
+- 日志新增 `qidian.wake.compare`（实际号、目标号、匹配结果、次数、耗时）及带阶段的 retry/timeout；无激活行错误携带名单行数和激活行数。可以区分树未就绪、复制失败、号码不一致与名字检查失败。
+- “浏览器遮挡导致 QQ 树未更新”仍是待验证原因，14→15 行及手动露出后的恢复仅支持这个方向，不能据此排除 QQ 自身异步延迟。单次成功不能保证所有窗口状态均成功。
+- 16:14 正常停止本次服务，日志确认 `automation.closed capture_released=true`。
+
+### 修改后 App 复验
+
+- 16:51 历史任务点击恒嘉微“识别身份”，`qidian.reuse.activated`，HTTP 200 / 4032.77 ms；不打开链接、不重新复制号码，`wake_count` 仍为 1。
+- 17:11 历史任务点击杰兴电子“识别身份”，由应用传原始真实链接及网站号 `2885512390`：
+  - attempt=2：名字恒嘉微，实际 `2885718744`，目标 `2885512390`，`matched=False`，继续轮询。
+  - attempt=3：先读到旧名字恒嘉微，随后已复制到 `2885512390`；复制后检查发现激活会话变化，`stage=confirm_active` 拒绝本次观察，未写错映射。
+  - attempt=5：名字 `杰兴电子科技-单片机销售`，实际及目标均 `2885512390`；检查名字唯一、会话未再变化后成功。HTTP 200 / 8314.15 ms，映射库核对 `wake_count=1`。
+- 此次直接证明 QQ 号码复制与 UIA 名称观察会跨越异步切换，必须核对复制前后同一名字。不能仅拿到目标号码就把它绑定到之前缓存的名字。
+- 旧任务没有 `conversationQq` 字段，服务端验证/复用成功后客户端仍报号码不一致。补充了客户端前置检查：提示“旧批次未记录网站 QQ 号码，请以此任务新建并重新准备询价”，不降低号码校验要求。此提示修改通过类型检查/构建，尚未重新启动 App 点击验收。
+- 本次额外身份识别没有向杰兴电子发送消息；此前真实询价仅发送给恒嘉微一次。
+
+
+### 2026-10-18 20:38 连续两轮核号修复
+
+首次建映射改为连续两轮得到同一名字和网站目标 QQ 号，每轮均复核复制前后激活名字；任何变化或异常重新计数。已有映射继续走无障碍树快速复用。
+真机再次拦住旧名字与新号码组合；恒嘉微首次 10.43 秒、杰兴首次 7.59 秒、恒嘉微复用 2.55 秒，均 HTTP 200；并发联系人查询在唤醒完成后执行。测试退出已释放 WGC。
+详见 [问题计划与验收记录](16-qq-live-issues-plan-2026-10-18.md)。

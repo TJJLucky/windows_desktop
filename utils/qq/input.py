@@ -22,7 +22,7 @@ import win32con
 # 输入框区域识别
 from .regions import get_inputbox_region_and_image, RegionResult
 # 窗口就绪保证
-from .window_ops import ensure_qq_window_with_retry
+from .window_ops import ensure_qq_session_ready
 # 无焦点置顶上下文（点击前保证窗口完整在屏内）
 from ..core.window import WindowCaptureCtx
 # 计时装饰器
@@ -120,7 +120,7 @@ class InputBox:
         窗口不就绪时抛 QQWindowNotReadyError，不静默返回 False。
         """
         # 确保 QQ 主窗口就绪（分级校验 + 重试）
-        main_window = ensure_qq_window_with_retry()
+        main_window = ensure_qq_session_ready()
         # 记录句柄（点击输入框时置顶窗口用）
         self.hwnd = main_window._hWnd
 

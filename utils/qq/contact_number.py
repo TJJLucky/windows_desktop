@@ -21,7 +21,7 @@ from .hotkeys import send_hotkey
 from .regions import RegionResult, get_userList_region_and_image
 from .template_runtime import find_unique_template, load_image, window_signature
 from .user_list import UserList
-from .window_ops import ensure_qq_window_with_retry
+from .window_ops import ensure_qq_session_ready
 
 logger = logging.getLogger("qq_service.contact_number")
 MENU_WAIT_SECONDS = 2.0
@@ -184,7 +184,8 @@ class ContactNumberReader:
         image = self._capture(window)
         return get_userList_region_and_image(window, image)
 
-    def identify_current(self, *, attempts: int = IDENTIFY_RETRY_ATTEMPTS) -> str | None:
+    def identify_current(self, *, attempts: int = IDENTIFY_RETRY_ATTEMPTS,
+                         deadline: float | None = None, expected_hwnd: int | None = None) -> str | None:
         """复制当前激活行的 QQ 号；窗口捕获面被重建（WINDOW_CHANGED）时整段重试。
 
         读取本身无副作用且幂等，重试只会重新截取一帧再复制一次，因此只对瞬时
@@ -192,7 +193,9 @@ class ContactNumberReader:
         """
         for attempt in range(1, attempts + 1):
             self._generation = None
-            window = ensure_qq_window_with_retry()
+            window = ensure_qq_session_ready(deadline=deadline)
+            if expected_hwnd is not None and window._hWnd != expected_hwnd:
+                raise RuntimeError("QQ_CONTACT_NUMBER_WINDOW_CHANGED")
             try:
                 with WindowCaptureCtx(window._hWnd):
                     region = self.capture_region(window)

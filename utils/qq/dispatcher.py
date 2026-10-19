@@ -8,13 +8,16 @@
 
 对外 API（get_contact_list / send_message / read_message_list）：
   入队 → 阻塞等待结果，统一返回 (result, error) 二元组；
-  超时仅表示"没等到结果"，不保证任务未执行（任务可能仍在队列/执行中）。
+  超时会取消尚未开始的任务；已经开始的任务继续完成，调用方必须按结果未知处理。
 """
 
 # queue：FIFO 任务队列 + 结果队列
 import queue
 # threading：后台工作线程 + 停止事件
 import threading
+import time
+import logging
+from dataclasses import dataclass, field
 # 类型标注
 from typing import Any, Optional, Tuple
 
@@ -22,6 +25,27 @@ from typing import Any, Optional, Tuple
 from .user_list import UserList
 from .input import InputBox
 from .message import MessageList
+
+
+logger = logging.getLogger("qq_service.dispatcher")
+
+
+class TaskTimeoutError(TimeoutError):
+    def __init__(self, code: str, *, started: bool):
+        super().__init__(code)
+        self.started = started
+
+
+@dataclass
+class _Task:
+    kind: str
+    args: tuple
+    deadline: float
+    timeout_code: str
+    result: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=1))
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    started: bool = False
+    cancelled: bool = False
 
 
 class Dispatcher:
@@ -55,7 +79,7 @@ class Dispatcher:
         self.inputBox = InputBox()
         self.messageList = MessageList()
 
-        # 任务队列: 每个元素 (task_type, args, kwargs, result_queue)
+        # 任务队列：开始与取消共用任务锁，避免超时后才执行桌面操作
         self.task_queue: queue.Queue = queue.Queue()
         # 后台工作线程
         self.worker_thread: Optional[threading.Thread] = None
@@ -91,8 +115,15 @@ class Dispatcher:
                 # 队列空 → 继续轮询停止信号
                 continue
 
-            # 解包任务：类型 / 位置参数 / 关键字参数 / 结果队列
-            task_type, args, kwargs, res_q = task
+            with task.lock:
+                if task.cancelled or time.monotonic() >= task.deadline:
+                    task.cancelled = True
+                    task.result.put((None, TaskTimeoutError(task.timeout_code, started=False)))
+                    self.task_queue.task_done()
+                    logger.info("queue.task.expired kind=%s started=false", task.kind)
+                    continue
+                task.started = True
+            task_type, args, res_q = task.kind, task.args, task.result
             result: Any = None
             exc: Optional[Exception] = None
             from .template_runtime import operation_scope
@@ -113,8 +144,8 @@ class Dispatcher:
                         result = ({"qqNumber": number} if number is not None else
                                   {"qqNumber": None, "skipped": True, "reason": "QQ_CONTACT_NUMBER_COPY_UNAVAILABLE"})
                     elif task_type == "qidian_wake":
-                        link, target_qq_number = args
-                        result = self.wake_qidian_impl(link, target_qq_number)
+                        link, target_qq_number, metadata, mappings = args
+                        result = self.wake_qidian_impl(link, target_qq_number, metadata, mappings)
                     elif task_type == "check_capture_ready":
                         result = self.check_capture_ready_impl()
                     else:
@@ -138,81 +169,44 @@ class Dispatcher:
 
         # ========= 对外API：全部入队列，阻塞等待 =========
 
-    def identify_current_contact(self, timeout: float = 30.0) -> Tuple[dict, Optional[Exception]]:
-        res_q = queue.Queue(maxsize=1)
-        self.task_queue.put(("identify_current_contact", (), {}, res_q))
+    def _submit(self, kind: str, args: tuple, timeout: float, code: str, empty):
+        task = _Task(kind, args, time.monotonic() + max(0, timeout), code)
+        self.task_queue.put(task)
         try:
-            return res_q.get(timeout=timeout)
+            return task.result.get(timeout=max(0, task.deadline - time.monotonic()))
         except queue.Empty:
-            return {}, TimeoutError("QQ_CONTACT_NUMBER_QUEUE_TIMEOUT")
+            with task.lock:
+                # 完成可能刚好发生在等待超时边界，优先返回真实结果。
+                try:
+                    return task.result.get_nowait()
+                except queue.Empty:
+                    if not task.started:
+                        task.cancelled = True
+                    logger.warning("queue.task.timeout kind=%s started=%s", kind, task.started)
+                    return empty, TaskTimeoutError(code, started=task.started)
+
+    def identify_current_contact(self, timeout: float = 30.0) -> Tuple[dict, Optional[Exception]]:
+        return self._submit("identify_current_contact", (), timeout, "QQ_CONTACT_NUMBER_QUEUE_TIMEOUT", {})
 
     def wake_qidian(self, link: str, target_qq_number: str,
-                    timeout: float = 45.0) -> Tuple[dict, Optional[Exception]]:
-        """qidian 唤醒（打开链接 → 等会话稳定 → 识别接待人），入队列串行执行。
-
-        ``target_qq_number``（必填）是调用方从华强搜索结果页读到的商家 QQ 号，原样透传给实现层；
-        实现层只用它当目标号，不解析链接。
-
-        整段唤醒比普通任务长（约 25 秒预算）；排队超时只表示"没等到结果"，
-        任务本身不被取消（与其它入口的超时语义一致）。
-        """
-        res_q = queue.Queue(maxsize=1)
-        self.task_queue.put(("qidian_wake", (link, target_qq_number), {}, res_q))
-        try:
-            return res_q.get(timeout=timeout)
-        except queue.Empty:
-            return {}, TimeoutError("QQ_QIDIAN_QUEUE_TIMEOUT")
+                    timeout: float = 45.0, *, metadata: dict, mappings) -> Tuple[dict, Optional[Exception]]:
+        """整段唤醒与核号串行执行；尚未开始的过期任务不再打开链接。"""
+        return self._submit("qidian_wake", (link, target_qq_number, metadata, mappings),
+                            timeout, "QQ_QIDIAN_QUEUE_TIMEOUT", {})
 
     def check_capture_ready(self, timeout: float = 30.0) -> Tuple[dict, Optional[Exception]]:
-        """把截图能力检查也放入串行队列，避免与联系人/消息操作并发控制 QQ。"""
-        res_q = queue.Queue(maxsize=1)
-        self.task_queue.put(("check_capture_ready", (), {}, res_q))
-        try:
-            return res_q.get(timeout=timeout)
-        except queue.Empty:
-            return {}, TimeoutError("check_capture_ready task timeout")
+        return self._submit("check_capture_ready", (), timeout, "QQ_CAPTURE_QUEUE_TIMEOUT", {})
 
     def get_contact_list(self, timeout: float = 120.0, contact_name: str | None = None,
                          all_contacts: bool = False) -> Tuple[dict, Optional[Exception]]:
-        """获取联系人名单，入队列串行执行（all_contacts=True 时滚动扫掠整张名单）。"""
-        # 结果队列（容量 1：只放一个 (result, exc)）
-        res_q = queue.Queue(maxsize=1)
-        # 入队
-        self.task_queue.put(("get_contact_list", (contact_name, all_contacts), {}, res_q))
-        try:
-            # 阻塞等待结果（最长 timeout 秒）
-            return res_q.get(timeout=timeout)
-        except queue.Empty:
-            # 超时：返回空结果 + 超时异常（不保证任务未执行）
-            return {}, TimeoutError("get_contact_list task timeout")
+        return self._submit("get_contact_list", (contact_name, all_contacts),
+                            timeout, "QQ_CONTACTS_QUEUE_TIMEOUT", {})
 
     def send_message(self, contact_name: str, text: str, timeout: float = 120.0) -> Tuple[bool, Optional[Exception]]:
-        """提交发送任务到队列，阻塞等待执行完成
-        返回 (成功bool, 异常对象 or None)
-        """
-        # 结果队列
-        res_q = queue.Queue(maxsize=1)
-        # 入队（worker 串行执行）
-        self.task_queue.put(("send_message", (contact_name, text), {}, res_q))
-        try:
-            # 阻塞等待
-            return res_q.get(timeout=timeout)
-        except queue.Empty:
-            # 超时：返回失败 + 超时异常
-            return False, TimeoutError("send_message task timeout")
+        return self._submit("send_message", (contact_name, text), timeout, "QQ_SEND_QUEUE_TIMEOUT", False)
 
     def read_message_list(self, contact_name: str, timeout: float = 120.0) -> Tuple[dict, Optional[Exception]]:
-        """提交读取消息任务到队列，阻塞等待执行完成。"""
-        # 结果队列
-        res_q = queue.Queue(maxsize=1)
-        # 入队
-        self.task_queue.put(("read_message_list", (contact_name,), {}, res_q))
-        try:
-            # 阻塞等待
-            return res_q.get(timeout=timeout)
-        except queue.Empty:
-            # 超时：返回空结果 + 超时异常
-            return {}, TimeoutError("read_message_list task timeout")
+        return self._submit("read_message_list", (contact_name,), timeout, "QQ_MESSAGES_QUEUE_TIMEOUT", {})
 
     # ========= 内部真正实现（在worker线程运行） =========
     def check_capture_ready_impl(self) -> dict:
@@ -222,11 +216,11 @@ class Dispatcher:
         win = ensure_qq_window_with_retry()
         return {"ready": True, "windowTitle": getattr(win, "title", None)}
 
-    def wake_qidian_impl(self, link: str, target_qq_number: str) -> dict:
+    def wake_qidian_impl(self, link: str, target_qq_number: str, metadata: dict, mappings) -> dict:
         """实际实现：qidian 链接唤醒 + 会话稳定等待 + 当前接待人识别。"""
-        from .qidian import wake_and_identify
+        from .qidian import resolve_verified
 
-        return wake_and_identify(link, target_qq_number)
+        return resolve_verified(link, target_qq_number, metadata, mappings)
 
     def get_contact_list_impl(self, contact_name: str | None = None,
                               all_contacts: bool = False) -> dict:

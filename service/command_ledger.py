@@ -104,8 +104,8 @@ class CommandLedger:
             logger.info("ledger.idempotent command_id=%s status=%s", command_id, row[1])
             return False, row[1], _decode_result(row[2])
 
-    def resolve(self, command_id: str, status: Literal["SUCCEEDED", "FAILED"], result: dict[str, Any]) -> None:
-        """执行结束后把命令落到终态（SUCCEEDED / FAILED），并保存执行结果。"""
+    def resolve(self, command_id: str, status: Literal["SUCCEEDED", "FAILED", "EFFECT_UNKNOWN"], result: dict[str, Any]) -> None:
+        """把执行结果或执行中的超时记为 SUCCEEDED / FAILED / EFFECT_UNKNOWN，并保存执行结果。"""
         with self._lock, closing(self._connect()) as connection, connection:
             # 更新状态 + 结果 JSON（压缩格式减小体积）
             connection.execute(

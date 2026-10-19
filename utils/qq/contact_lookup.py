@@ -43,6 +43,7 @@ from .accessibility import (
     AccessibilityPane,
     AccessibilityRow,
     AccessibilityUnavailableError,
+    ScrollPatternUnsupported,
     accessibility_chat,
     accessibility_pane,
     accessibility_scroll_state,
@@ -53,7 +54,7 @@ from ..core.mouse import click_at, scroll_at
 # 无焦点置顶上下文（点击/滚轮前保证窗口在屏内可见）
 from ..core.window import WindowCaptureCtx
 # 窗口就绪保证
-from .window_ops import ensure_qq_window_with_retry
+from .window_ops import ensure_qq_session_ready
 
 
 logger = logging.getLogger("qq_service.contact_lookup")
@@ -285,20 +286,37 @@ def _rows_fit_pane(pane: AccessibilityPane) -> bool:
 
 
 def read_pane(hwnd: int) -> AccessibilityPane:
-    """读一屏名单，等到元素树稳定（连续两次读到同一份名单）再返回。"""
-    deadline = time.monotonic() + SETTLE_TIMEOUT_SECONDS
-    pane = accessibility_pane(hwnd)
+    """在同一预算内等待列表可读、名单稳定；节点缺失不能当成空名单。"""
+    started = time.monotonic()
+    deadline = started + SETTLE_TIMEOUT_SECONDS
     previous = None
+    failures = 0
     while True:
+        try:
+            pane = accessibility_pane(hwnd)
+        except AccessibilityUnavailableError as exc:
+            # 窗口可截图不代表 UIA 列表已发布。重建期间继续等，仍占用原串行任务。
+            # 丢弃上一份指纹，避免跨越一次树缺失后把旧名单算作连续稳定。
+            previous = None
+            failures += 1
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning("contacts.pane.timeout hwnd=%s failures=%d elapsed_ms=%.1f reason=%s",
+                               hwnd, failures, (time.monotonic() - started) * 1000, exc)
+                raise
+            logger.info("contacts.pane.wait hwnd=%s failures=%d remaining_ms=%.1f reason=%s",
+                        hwnd, failures, remaining * 1000, exc)
+            time.sleep(min(SETTLE_INTERVAL_SECONDS, remaining))
+            continue
         signature = _pane_signature(pane)
-        # 元素树重建期间会瞬时返回空名单：继续等到有行或超时为止
-        if signature == previous and pane.rows:
-            return pane
-        if time.monotonic() >= deadline:
+        # 有容器但没有行仍沿用原来的有界等待；合法空名单可以返回。
+        if (signature == previous and pane.rows) or time.monotonic() >= deadline:
+            if failures:
+                logger.info("contacts.pane.recovered hwnd=%s failures=%d rows=%d elapsed_ms=%.1f",
+                            hwnd, failures, len(pane.rows), (time.monotonic() - started) * 1000)
             return pane
         previous = signature
-        time.sleep(SETTLE_INTERVAL_SECONDS)
-        pane = accessibility_pane(hwnd)
+        time.sleep(min(SETTLE_INTERVAL_SECONDS, max(0, deadline - time.monotonic())))
 
 
 def _match(pane: AccessibilityPane, name: str) -> tuple[AccessibilityRow | None, int]:
@@ -486,6 +504,125 @@ def _reveal(hwnd: int, row: AccessibilityRow, pane: AccessibilityPane) -> Access
     return None
 
 
+def _unique_name_by_wheel(hwnd: int, name: str, deadline: float) -> None:
+    """Fallback for QQ builds without ScrollPattern; never merge rows by nickname."""
+    pane = read_pane(hwnd)
+    x = (pane.rect[0] + pane.rect[2]) // 2
+    y = (pane.rect[1] + pane.rect[3]) // 2
+
+    def scroll(delta):
+        if time.monotonic() >= deadline:
+            raise ContactLookupError('QQ_CONTACT_AMBIGUOUS: 名单扫描超时，无法确认名称唯一')
+        with WindowCaptureCtx(hwnd):
+            scroll_at(x, y, delta)
+        return read_pane(hwnd)
+
+    def signature(current):
+        return tuple((row.runtime_id, row.name, row.rect) for row in current.rows)
+
+    # Require two settled observations at each edge, and an unclipped edge row.
+    still = 0
+    for _ in range(WHEEL_MAX_STEPS):
+        following = scroll(120)
+        still = still + 1 if signature(following) == signature(pane) else 0
+        pane = following
+        if still >= 2 and pane.rows and pane.rows[0].rect[1] >= pane.rect[1]:
+            break
+    else:
+        raise ContactLookupError('QQ_CONTACT_AMBIGUOUS: 无法确认名单顶部')
+    seen = {}
+    targets = set()
+    previous = set()
+    still = 0
+    for _ in range(WHEEL_MAX_STEPS):
+        current = set()
+        for row in pane.rows:
+            key = row.runtime_id
+            if not key or key in current or (key in seen and seen[key] != row.name):
+                raise ContactLookupError('QQ_CONTACT_AMBIGUOUS: 会话标识不稳定，无法确认名称唯一')
+            seen[key] = row.name
+            current.add(key)
+            if row.name == name:
+                targets.add(key)
+        if len(targets) > 1:
+            raise ContactAmbiguousError(name, len(targets))
+        if not current or (previous and not current.intersection(previous)):
+            raise ContactLookupError('QQ_CONTACT_AMBIGUOUS: 名单扫描跳段，无法确认名称唯一')
+        following = scroll(-120)
+        still = still + 1 if signature(following) == signature(pane) else 0
+        if still >= 2 and following.rows and following.rows[-1].rect[3] <= following.rect[3]:
+            if not targets:
+                raise ContactNotFoundError(name)
+            return
+        previous = current
+        pane = following
+    raise ContactLookupError('QQ_CONTACT_AMBIGUOUS: 无法确认名单底部')
+
+
+def assert_unique_name(hwnd: int, name: str, timeout: float = 8.0) -> None:
+    """Require complete UIA coverage before trusting a name, including offscreen rows.
+
+    Runtime IDs only deduplicate overlapping scan pages. They are never persisted.
+    A changing tree or incomplete scan refuses name reuse. Unsupported UIA
+    scrolling falls back to small wheel steps with overlap and edge checks.
+
+    """
+    deadline = time.monotonic() + timeout
+    try:
+        state = accessibility_scroll_state(hwnd)
+    except ScrollPatternUnsupported:
+        return _unique_name_by_wheel(hwnd, name, deadline)
+    home = state.position_percent if state.scrollable else None
+    seen: dict[tuple[int, ...], tuple[str, float]] = {}
+    previous: set[tuple[int, ...]] = set()
+    target_ids: set[tuple[int, ...]] = set()
+    try:
+        if state.scrollable:
+            accessibility_set_scroll_percent(hwnd, 0.0)
+        for _ in range(SCAN_MAX_STEPS):
+            pane = read_pane(hwnd)
+            state = accessibility_scroll_state(hwnd)
+            if not state.scrollable:
+                count = len(pane.rows_named(name))
+                if count > 1:
+                    raise ContactAmbiguousError(name, count)
+                if not count:
+                    raise ContactNotFoundError(name)
+                return
+            viewport = max(1, pane.rect[3] - pane.rect[1])
+            content = state.content_height(viewport)
+            offset = (content - viewport) * state.position_percent / 100.0
+            current = set()
+            for row in pane.rows:
+                key = row.runtime_id
+                if not key or key in current:
+                    raise ContactLookupError('QQ_CONTACT_AMBIGUOUS: 无法区分列表中的会话行')
+                position = row.rect[1] - pane.rect[1] + offset
+                old = seen.get(key)
+                if old and (old[0] != row.name or abs(old[1] - position) > 4):
+                    raise ContactLookupError('QQ_CONTACT_AMBIGUOUS: 列表在扫描期间变化，请重新识别')
+                seen[key] = (row.name, position)
+                current.add(key)
+                if row.name == name:
+                    target_ids.add(key)
+            if len(target_ids) > 1:
+                raise ContactAmbiguousError(name, len(target_ids))
+            if not current or (previous and not previous.intersection(current)):
+                raise ContactLookupError('QQ_CONTACT_AMBIGUOUS: 名单覆盖不完整，无法确认名称唯一')
+            if state.position_percent >= 99.99:
+                if not target_ids:
+                    raise ContactNotFoundError(name)
+                return
+            if time.monotonic() >= deadline:
+                break
+            previous = current
+            step = _scan_step_percent(state, pane, SCAN_SAFETY_RATIO)
+            accessibility_set_scroll_percent(hwnd, min(100.0, state.position_percent + step))
+        raise ContactLookupError('QQ_CONTACT_AMBIGUOUS: 名单扫描超时，无法确认名称唯一')
+    finally:
+        _restore_position(hwnd, home)
+
+
 def locate(contact_name: str, hwnd: int | None = None) -> AccessibilityRow:
     """按昵称精确定位一个"完整可见、可安全点击"的会话行。
 
@@ -493,15 +630,17 @@ def locate(contact_name: str, hwnd: int | None = None) -> AccessibilityRow:
     ContactAmbiguousError，无障碍树不可用抛 AccessibilityUnavailableError。
     """
     name = normalize_name(contact_name)
-    hwnd = hwnd or ensure_qq_window_with_retry()._hWnd
+    hwnd = hwnd or ensure_qq_session_ready()._hWnd
     started = time.monotonic()
     pane = read_pane(hwnd)
-    home_percent = _scroll_percent(hwnd)
     row, count = _match(pane, name)
     if count > 1:
         raise ContactAmbiguousError(name, count)
     if row is not None and row.visible_in(pane.rect):
+        logger.info("contacts.locate contact=%s mode=visible duration_ms=%.1f",
+                    name, (time.monotonic() - started) * 1000)
         return row
+    home_percent = _scroll_percent(hwnd)
     # 已渲染但被视口裁掉：先按内容高度把它推进视口，省掉整轮扫掠
     if row is not None:
         revealed = _reveal(hwnd, row, pane)
@@ -648,15 +787,15 @@ def _scan_by_wheel(hwnd: int) -> tuple[list[AccessibilityRow], bool]:
 def _screen_is_complete(hwnd: int, pane: AccessibilityPane) -> bool:
     """当前这一屏是否就等于整张名单。
 
-    判据：容器明确报"不可滚动"，或树里渲染出的行整块都完整落在列表区内（没有被视口
-    边缘切断）——后者覆盖容器不发布 ScrollPattern、读不到滚动状态的机器。不确定时不谎报。
+    只有容器明确报不可滚动才确认全量。没有发布接口与不可滚动不同，
+    仅凭已渲染的行完整可见不能排除虚拟列表尚未渲染的行。
     """
     try:
         if not accessibility_scroll_state(hwnd).scrollable:
             return True
     except AccessibilityUnavailableError:
         pass
-    return _rows_fit_pane(pane)
+    return False
 
 
 def scan_all_contacts(hwnd: int,
@@ -695,14 +834,15 @@ def activate(contact_name: str, hwnd: int | None = None) -> str:
     切掉）；否则点击命中行中心，并用聊天区标题（失败时用激活行标记）复核。
     """
     name = normalize_name(contact_name)
-    hwnd = hwnd or ensure_qq_window_with_retry()._hWnd
+    hwnd = hwnd or ensure_qq_session_ready()._hWnd
     started = time.monotonic()
-    pane = read_pane(hwnd)
+    # Identity-changing operations retain the complete-name check; read-only lookup does not.
+    assert_unique_name(hwnd, name)
+    row = locate(name, hwnd=hwnd)
     if _selected_name(hwnd) == name and _contact_name_of(hwnd) == name:
         logger.info("contacts.activate contact=%s mode=already duration_ms=%.1f",
                     name, (time.monotonic() - started) * 1000)
         return name
-    row = locate(name, hwnd=hwnd)
     x, y = row.center
     # 保留置顶：无激活置顶只改 Z 序，不移动窗口、不抢焦点。
     with WindowCaptureCtx(hwnd):
@@ -741,7 +881,7 @@ def query_contacts(contact_name: str | None = None,
     ``complete`` 如实标注"这份名单是否覆盖了全部会话"：容器能力或扫掠自检不能确认时
     返回 False，绝不谎报全量。
     """
-    hwnd = ensure_qq_window_with_retry()._hWnd
+    hwnd = ensure_qq_session_ready()._hWnd
     if all_contacts:
         # 名单不足一屏时不扫掠：先读当前屏，确认整张名单都在视口内就直接返回，不滚动列表。
         pane = read_pane(hwnd)
@@ -753,9 +893,17 @@ def query_contacts(contact_name: str | None = None,
             }
         contacts, complete = scan_all_contacts(hwnd, include_non_copyable)
         return {"contacts": contacts, "complete": complete}
-    if contact_name:
-        locate(contact_name, hwnd=hwnd)
     pane = read_pane(hwnd)
+    if contact_name:
+        name = normalize_name(contact_name)
+        row, count = _match(pane, name)
+        if count > 1:
+            raise ContactAmbiguousError(name, count)
+        if row is not None and row.visible_in(pane.rect):
+            logger.info("contacts.query mode=visible contact=%s rows=%d", name, len(pane.rows))
+        else:
+            locate(name, hwnd=hwnd)
+            pane = read_pane(hwnd)
     return {
         "contacts": _assemble(pane.rows, confirmed_refusals(), include_non_copyable),
         "complete": _screen_is_complete(hwnd, pane),
@@ -773,7 +921,7 @@ def ensure_message_copy_supported(contact_name: str, hwnd: int | None = None) ->
     # 已经学过"QQ 拒绝复制"的会话不必再读一次树：毫秒级报同一个业务错误。
     if is_refused(name):
         raise ContactNotCopyableError(name)
-    hwnd = hwnd or ensure_qq_window_with_retry()._hWnd
+    hwnd = hwnd or ensure_qq_session_ready()._hWnd
     try:
         pane = accessibility_pane(hwnd)
     except AccessibilityUnavailableError:
@@ -785,6 +933,6 @@ def ensure_message_copy_supported(contact_name: str, hwnd: int | None = None) ->
 
 def current_contact_name(hwnd: int | None = None) -> str | None:
     """当前会话名（聊天区标题）；读不到时返回 None（无障碍树不可用）。"""
-    hwnd = hwnd or ensure_qq_window_with_retry()._hWnd
+    hwnd = hwnd or ensure_qq_session_ready()._hWnd
     name = _contact_name_of(hwnd)
     return name or None

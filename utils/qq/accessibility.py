@@ -110,7 +110,7 @@ class AccessibilityUnavailableError(RuntimeError):
 class ScrollPatternUnsupported(AccessibilityUnavailableError):
     """列表容器不发布 ScrollPattern（内容不足一屏时的正常状态）。
 
-    这是"当前这份名单本来就不用滚"的确定性结论，不是元素树瞬时重建，重连重试
+    只表示未发布滚动接口，不代表名单不可滚动或已读全。它不是元素树瞬时重建，重连重试
     只会白连三次（真机实测每次都白连，且重连本身是 0xC0000005 崩溃的放大器）。
     因此它继承可回退的业务错误，但被 is_transient_error 明确排除，不触发重试。
     """
@@ -192,6 +192,8 @@ class AccessibilityRow:
     unread: bool = False
     # 未读条数：角标里的数字；纯圆点角标无数字时为 None
     unread_count: int | None = None
+    # Only valid within the current UIA tree; never persisted as a contact identity.
+    runtime_id: tuple[int, ...] = ()
 
     @property
     def center(self) -> tuple[int, int]:
@@ -481,13 +483,41 @@ class ContactListAccessibility:
             UIA.TreeScope_Descendants,
             iuia.CreatePropertyCondition(UIA.UIA_NamePropertyId, LIST_PANE_NAME),
         )
-        if element is None:
-            raise AccessibilityUnavailableError("pane {name!r} not found".format(name=LIST_PANE_NAME))
+        if not element:
+            logger.warning("accessibility.pane.missing hwnd=%s window_name=%r window_class=%r",
+                           hwnd, window.CurrentName, window.CurrentClassName)
+            raise AccessibilityUnavailableError("pane {name!r} not found (null UIA element)".format(name=LIST_PANE_NAME))
         return element
+
+    def window_kind(self, hwnd: int) -> str:
+        """只探测主界面锚点，不枚举行或依赖滚动能力；缺节点不是 COM 失败。"""
+        with self._lock:
+            try:
+                iuia = _iuia()
+                window = self._window_element(hwnd)
+                pane = window.FindFirst(
+                    UIA.TreeScope_Descendants,
+                    iuia.CreatePropertyCondition(UIA.UIA_NamePropertyId, LIST_PANE_NAME),
+                )
+                if pane:
+                    return "session"
+                sidebar = window.FindFirst(
+                    UIA.TreeScope_Descendants,
+                    iuia.CreatePropertyCondition(UIA.UIA_ClassNamePropertyId, "sidebar-nav"),
+                )
+                return "main" if sidebar else "unknown"
+            except Exception as error:
+                self._reset()
+                if not is_transient_error(error):
+                    raise
+                raise AccessibilityUnavailableError(f"window probe failed: {error}") from error
 
     def _scroll_pattern(self, hwnd: int):
         """取会话列表的 ScrollPattern 接口；容器不发布时抛非瞬态业务错误。"""
         element = self._pane_element(hwnd)
+        if not element.GetCurrentPropertyValue(UIA.UIA_IsScrollPatternAvailablePropertyId):
+            raise ScrollPatternUnsupported(
+                "pane {name!r} does not expose ScrollPattern".format(name=LIST_PANE_NAME))
         pattern = element.GetCurrentPattern(UIA.UIA_ScrollPatternId)
         # 元素不支持该 Pattern 时 GetCurrentPattern 返回空指针（不抛异常）；
         # 直接 QueryInterface 会得到 comtypes 的 "NULL COM pointer access"，
@@ -591,10 +621,7 @@ class ContactListAccessibility:
         window = self._window_element(hwnd)
         descendants = UIA.TreeScope_Descendants
         # 会话列表容器：按 Name 精确查找
-        pane_condition = iuia.CreatePropertyCondition(UIA.UIA_NamePropertyId, LIST_PANE_NAME)
-        pane_element = window.FindFirst(descendants, pane_condition)
-        if pane_element is None:
-            raise AccessibilityUnavailableError("pane {name!r} not found".format(name=LIST_PANE_NAME))
+        pane_element = self._pane_element(hwnd)
         pane = _element_rect(pane_element)
         # 行元素统一是 Group，再用 ClassName 里的 recent-contact-item 过滤
         group_condition = iuia.CreatePropertyCondition(
@@ -617,6 +644,10 @@ class ContactListAccessibility:
                 if value:
                     texts.append(value)
             copyable, unread, unread_count = _row_traits(iuia, element)
+            try:
+                runtime_id = tuple(element.GetRuntimeId() or ())
+            except (ValueError, OSError, comtypes.COMError):
+                runtime_id = ()
             rows.append(
                 AccessibilityRow(
                     name=texts[0] if texts else "",
@@ -627,6 +658,7 @@ class ContactListAccessibility:
                     copyable=copyable,
                     unread=unread,
                     unread_count=unread_count,
+                    runtime_id=runtime_id,
                 )
             )
         elapsed_ms = (time.perf_counter() - started) * 1000
@@ -648,7 +680,7 @@ class ContactListAccessibility:
             descendants,
             iuia.CreatePropertyCondition(UIA.UIA_NamePropertyId, MESSAGE_AREA_NAME),
         )
-        if area_element is None:
+        if not area_element:
             raise AccessibilityUnavailableError(
                 "message area {name!r} not found".format(name=MESSAGE_AREA_NAME))
         area_rect = _element_rect(area_element)
@@ -657,7 +689,7 @@ class ContactListAccessibility:
             descendants,
             iuia.CreatePropertyCondition(UIA.UIA_ClassNamePropertyId, CHAT_NAME_CLASS_MARKER),
         )
-        contact_name = (name_element.CurrentName or "") if name_element is not None else ""
+        contact_name = (name_element.CurrentName or "") if name_element else ""
         # 消息：只在消息区容器范围内找根元素 ClassName == "message"
         elements = area_element.FindAll(
             descendants,
@@ -760,7 +792,7 @@ def accessibility_set_scroll_percent(hwnd: int, percent: float) -> Accessibility
 
 
 def accessibility_pane(hwnd: int) -> AccessibilityPane:
-    """模块级便捷入口：枚举一次会话列表。"""
+    """模块级便捷入口：枚举一次会话列表；后台观察可降低成功日志级别。"""
     return ContactListAccessibility().pane(hwnd)
 
 
