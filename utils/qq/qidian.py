@@ -193,12 +193,23 @@ def wake_and_identify(link: str, target_qq_number: str, *,
                         logger.info("qidian.wake.confirmation attempt=%d contact=%r qq=%s consecutive=%d required=2",
                                     attempt, name, number, 2 if confirmed else 1)
                         if confirmed:
-                            from .contact_lookup import assert_unique_name
+                            from .contact_lookup import assert_unique_name, restore_verified_contact
                             stage = "unique_name"
                             assert_unique_name(hwnd, name, timeout=max(0.1, deadline - time.monotonic()))
+                            stage = "restore_active"
+                            restore_verified_contact(name, hwnd, deadline=deadline)
                             stage = "confirm_active"
                             if _active_name(hwnd) != name or time.monotonic() >= deadline:
-                                raise QidianError("QQ_QIDIAN_SESSION_NOT_STABLE", "验证期间会话变化或超过预算")
+                                raise QidianError("QQ_QIDIAN_SESSION_NOT_STABLE", "恢复目标后激活会话变化或超过预算")
+                            stage = "final_number"
+                            final_number = _identify_active_qq(hwnd, deadline)
+                            logger.info("qidian.wake.final_number contact=%r matched=%s elapsed_ms=%.1f",
+                                        name, final_number == target, (time.monotonic() - started) * 1000)
+                            if final_number != target:
+                                raise QidianError("QQ_QIDIAN_SESSION_NOT_STABLE", "恢复目标后 QQ 号码与网站号码不一致")
+                            stage = "confirm_active"
+                            if _active_name(hwnd) != name or time.monotonic() >= deadline:
+                                raise QidianError("QQ_QIDIAN_SESSION_NOT_STABLE", "最终核号后激活会话变化或超过预算")
                             logger.info("qidian.wake.verified contact=%r qq=%s elapsed_ms=%.1f", name, number,
                                         (time.monotonic() - started) * 1000)
                             return dict(linkHash=link_hash(normalized), contactName=name, qqNumber=number,
@@ -225,6 +236,8 @@ def wake_and_identify(link: str, target_qq_number: str, *,
 def resolve_verified(link: str, target_qq_number: str, metadata: dict, mappings) -> dict:
     """Called only inside the Dispatcher: activation and persistence share the desktop slot."""
     from .contact_lookup import activate
+    audit = metadata.get("audit") or {}
+    logger.info("qidian.resolve.begin batch=%s target_id=%s", audit.get("batchId"), audit.get("targetId"))
     target = require_target_qq(target_qq_number)
     normalized = normalize_link(link)
     scope = metadata['account_scope']

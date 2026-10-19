@@ -400,6 +400,11 @@ def _assemble(rows, refused: dict[str, dict],
     return contacts
 
 
+def _check_lookup_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise ContactLookupError("QQ_CONTACT_SCAN_LIMIT: 恢复目标会话超过总等待预算")
+
+
 # ── 滚动查找 ────────────────────────────────────────────────────────
 def _sweep_step_percent(state, pane: AccessibilityPane) -> float:
     """扫掠步长：不超过"已渲染行跨度"的 SWEEP_SAFETY_RATIO，保证相邻两段重叠。"""
@@ -413,7 +418,7 @@ def _sweep_step_percent(state, pane: AccessibilityPane) -> float:
 
 
 def _sweep_by_percent(
-        hwnd: int, name: str, pane: AccessibilityPane) -> tuple[AccessibilityRow | None, bool]:
+        hwnd: int, name: str, pane: AccessibilityPane, deadline: float | None = None) -> tuple[AccessibilityRow | None, bool]:
     """用 ScrollPattern 从列表顶部按步长扫到底部，逐段精确匹配。
 
     返回 ``(命中行, 是否已覆盖全表)``。``covered=True`` 表示百分比扫掠已经把整张
@@ -430,6 +435,7 @@ def _sweep_by_percent(
     step = _sweep_step_percent(state, pane)
     percent = 0.0
     for _ in range(SWEEP_MAX_STEPS + 1):
+        _check_lookup_deadline(deadline)
         try:
             accessibility_set_scroll_percent(hwnd, percent)
         except AccessibilityUnavailableError:
@@ -446,7 +452,7 @@ def _sweep_by_percent(
     raise ContactLookupError("QQ_CONTACT_SCAN_LIMIT: 会话列表滚动扫掠超过步数上限")
 
 
-def _wheel_sweep(hwnd: int, name: str, pane: AccessibilityPane, delta: int) -> AccessibilityRow | None:
+def _wheel_sweep(hwnd: int, name: str, pane: AccessibilityPane, delta: int, deadline: float | None = None) -> AccessibilityRow | None:
     """滚轮逐段滚动并逐段匹配，直到名单不再变化（到顶/到底）。
 
     返回命中行或 None；同时把最后一段名单写回 ``pane`` 的调用方（此处不需要）。
@@ -455,6 +461,7 @@ def _wheel_sweep(hwnd: int, name: str, pane: AccessibilityPane, delta: int) -> A
     y = (pane.rect[1] + pane.rect[3]) // 2
     previous = _pane_signature(pane)
     for _ in range(WHEEL_MAX_STEPS):
+        _check_lookup_deadline(deadline)
         with WindowCaptureCtx(hwnd):
             scroll_at(x, y, delta)
         current = read_pane(hwnd)
@@ -470,14 +477,14 @@ def _wheel_sweep(hwnd: int, name: str, pane: AccessibilityPane, delta: int) -> A
     raise ContactLookupError("QQ_CONTACT_SCAN_LIMIT: 滚轮滚动查找超过步数上限")
 
 
-def _sweep_wheel(hwnd: int, name: str, pane: AccessibilityPane) -> AccessibilityRow | None:
+def _sweep_wheel(hwnd: int, name: str, pane: AccessibilityPane, deadline: float | None = None) -> AccessibilityRow | None:
     """滚轮回退路径：先回到列表顶部，再逐段向下查找。"""
     # 目标可能在视口上方：只向下滚永远找不到，先向上滚到不再移动为止
-    up = _wheel_sweep(hwnd, name, pane, -WHEEL_DELTA)
+    up = _wheel_sweep(hwnd, name, pane, -WHEEL_DELTA, deadline)
     if up is not None:
         return up
     current = read_pane(hwnd)
-    return _wheel_sweep(hwnd, name, current, WHEEL_DELTA)
+    return _wheel_sweep(hwnd, name, current, WHEEL_DELTA, deadline)
 
 
 def _reveal(hwnd: int, row: AccessibilityRow, pane: AccessibilityPane) -> AccessibilityRow | None:
@@ -623,12 +630,13 @@ def assert_unique_name(hwnd: int, name: str, timeout: float = 8.0) -> None:
         _restore_position(hwnd, home)
 
 
-def locate(contact_name: str, hwnd: int | None = None) -> AccessibilityRow:
+def locate(contact_name: str, hwnd: int | None = None, *, deadline: float | None = None) -> AccessibilityRow:
     """按昵称精确定位一个"完整可见、可安全点击"的会话行。
 
     目标不在当前视口时滚动查找；没找到抛 ContactNotFoundError，同名多行抛
     ContactAmbiguousError，无障碍树不可用抛 AccessibilityUnavailableError。
     """
+    _check_lookup_deadline(deadline)
     name = normalize_name(contact_name)
     hwnd = hwnd or ensure_qq_session_ready()._hWnd
     started = time.monotonic()
@@ -649,10 +657,10 @@ def locate(contact_name: str, hwnd: int | None = None) -> AccessibilityRow:
                         name, (time.monotonic() - started) * 1000)
             return revealed
     # 整轮扫掠；失败时把列表滚回原来的位置，别把用户的名单留在别处
-    found, covered = _sweep_by_percent(hwnd, name, pane)
+    found, covered = _sweep_by_percent(hwnd, name, pane, deadline)
     # 百分比扫掠已经覆盖全表时，别再做一遍慢速滚轮回退（查找未命中是常见路径）
     if found is None and not covered:
-        found = _sweep_wheel(hwnd, name, read_pane(hwnd))
+        found = _sweep_wheel(hwnd, name, read_pane(hwnd), deadline)
     if found is None:
         _restore_position(hwnd, home_percent)
         logger.info("contacts.locate contact=%s mode=miss duration_ms=%.1f",
@@ -835,10 +843,20 @@ def activate(contact_name: str, hwnd: int | None = None) -> str:
     """
     name = normalize_name(contact_name)
     hwnd = hwnd or ensure_qq_session_ready()._hWnd
-    started = time.monotonic()
     # Identity-changing operations retain the complete-name check; read-only lookup does not.
     assert_unique_name(hwnd, name)
-    row = locate(name, hwnd=hwnd)
+    return restore_verified_contact(name, hwnd, deadline=None)
+
+
+def restore_verified_contact(name: str, hwnd: int, *, deadline: float | None) -> str:
+    """Restore visibility after the caller's complete-name scan, within its budget.
+
+    Internal to the serialized dispatcher. The caller must verify the fresh
+    selected row and QQ number after restoration before persisting identity.
+    """
+    started = time.monotonic()
+    row = locate(name, hwnd=hwnd, deadline=deadline)
+    _check_lookup_deadline(deadline)
     if _selected_name(hwnd) == name and _contact_name_of(hwnd) == name:
         logger.info("contacts.activate contact=%s mode=already duration_ms=%.1f",
                     name, (time.monotonic() - started) * 1000)
@@ -853,7 +871,7 @@ def activate(contact_name: str, hwnd: int | None = None) -> str:
     #    标题读取也可能撞上 COM 瞬态失败）。
     # 两个信号在每一轮都判，不做"先只信标题、超时再补判标记"——真机实测后者会把
     # 一次瞬态 COM 失败放大成 ACTIVATION_FAILED 假阴性。
-    deadline = time.monotonic() + ACTIVATE_CONFIRM_TIMEOUT_SECONDS
+    deadline = min(deadline if deadline is not None else float("inf"), time.monotonic() + ACTIVATE_CONFIRM_TIMEOUT_SECONDS)
     actual = ""
     while True:
         actual = _contact_name_of(hwnd)
@@ -867,7 +885,7 @@ def activate(contact_name: str, hwnd: int | None = None) -> str:
             return name
         if time.monotonic() >= deadline:
             raise ContactActivationError(name, actual)
-        time.sleep(ACTIVATE_CONFIRM_INTERVAL_SECONDS)
+        time.sleep(min(ACTIVATE_CONFIRM_INTERVAL_SECONDS, max(0, deadline - time.monotonic())))
 
 
 def query_contacts(contact_name: str | None = None,
