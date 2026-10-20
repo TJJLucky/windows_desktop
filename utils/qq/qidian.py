@@ -6,10 +6,10 @@ from __future__ import annotations
 import hashlib
 # logging：逐阶段耗时日志
 import logging
-# os：startfile 把链接交给默认浏览器
-import os
 # re：QQ 号格式校验
 import re
+# threading：保证浏览器唤醒槽一次只服务一个映射
+import threading
 # time：轮询与总预算
 import time
 # datetime：wokeAt（带时区偏移的 ISO 8601）
@@ -29,13 +29,30 @@ WAKE_POLL_INTERVAL_SECONDS = 0.15
 # QQ 号格式（与 /v1/contacts/current:identify 契约一致）
 _QQ_PATTERN = re.compile(r"^[1-9][0-9]{4,19}$")
 
+# 浏览器唤醒始终一对一：打开一个、关闭一个，再允许下一个映射进入。
+_QIDIAN_BROWSER_LOCK = threading.Lock()
+
 
 class QidianError(RuntimeError):
     """qidian 唤醒链路的业务失败；``code`` 是 ``QQ_QIDIAN_*`` 错误码。"""
 
-    def __init__(self, code: str, message: str = "") -> None:
+    def __init__(self, code: str, message: str = "", *, stage: str | None = None,
+                 observed_qq_number: str | None = None, target_qq_number: str | None = None) -> None:
         self.code = code
+        self.stage = stage
+        self.observed_qq_number = observed_qq_number
+        self.target_qq_number = target_qq_number
         super().__init__(f"{code}: {message}" if message else code)
+
+    def public_detail(self) -> str:
+        """只公开固定阶段和已校验号码，底层异常原文保留在服务日志。"""
+        stages = {"session_ready", "active_row", "copy_number", "compare_number", "confirm_active"}
+        parts = [f"阶段 {self.stage}："] if self.stage in stages else []
+        if self.code == "QQ_QIDIAN_NUMBER_MISMATCH":
+            observed, target = self.observed_qq_number, self.target_qq_number
+            if isinstance(observed, str) and isinstance(target, str) and _QQ_PATTERN.fullmatch(observed) and _QQ_PATTERN.fullmatch(target):
+                parts.append(f"当前接待人号码 {observed} 与网站号码 {target} 不一致")
+        return "".join(parts)
 
 
 def normalize_link(link: str) -> str:
@@ -109,7 +126,8 @@ def _identify_active_qq(hwnd: int, deadline: float) -> str | None:
     from .contact_number import ContactNumberReader
 
     try:
-        return ContactNumberReader().identify_current(deadline=deadline, expected_hwnd=hwnd)
+        return ContactNumberReader().identify_current(
+            deadline=deadline, expected_hwnd=hwnd, require_unique_name=False)
     except RuntimeError as exc:
         code = str(exc)
         if "QQ_CONTACT_NUMBER_ACTIVE_AMBIGUOUS" in code:
@@ -126,12 +144,24 @@ def _active_name(hwnd):
     if len(selected) != 1:
         code = "QQ_QIDIAN_ACTIVE_AMBIGUOUS" if selected else "QQ_QIDIAN_ACTIVE_NOT_FOUND"
         raise QidianError(code, f"需要唯一激活会话（名单 {len(pane.rows)} 行，激活 {len(selected)} 行）")
-    name = selected[0].name
-    if sum(row.name == name for row in pane.rows) != 1:
-        raise QidianError("QQ_QIDIAN_ACTIVE_AMBIGUOUS", "存在同名会话")
-    return name
+    return selected[0].name
 
 def wake_and_identify(link: str, target_qq_number: str, *,
+                      timeout: float = WAKE_TIMEOUT_BUDGET_SECONDS) -> dict:
+    from .qidian_browser import QidianBrowserWindow
+
+    with _QIDIAN_BROWSER_LOCK:
+        browser = QidianBrowserWindow(normalize_link(link), target_qq_number)
+        try:
+            return _wake_and_identify(link, target_qq_number, browser, timeout=timeout)
+        finally:
+            try:
+                browser.close()
+            except Exception as exc:
+                logger.warning("qidian.browser.cleanup_failed type=%s", type(exc).__name__)
+
+
+def _wake_and_identify(link: str, target_qq_number: str, browser, *,
                       timeout: float = WAKE_TIMEOUT_BUDGET_SECONDS) -> dict:
     """Open once; mismatches and transient tree states are polled until the deadline."""
     normalized = normalize_link(link)
@@ -141,10 +171,17 @@ def wake_and_identify(link: str, target_qq_number: str, *,
     from .qidian_refusal import QidianRefusalProbe
     refusal = QidianRefusalProbe(target)
     try:
-        os.startfile(normalized)
+        browser.open()
         logger.info("qidian.wake.dispatched target=%s awaiting=two_matching_observations", target)
     except OSError as exc:
         raise QidianError("QQ_QIDIAN_WAKE_FAILED", str(exc)) from exc
+    # Let the protocol handoff reveal an add-only profile before window recovery
+    # foregrounds QQ and dismisses it. This remains inside the same total budget.
+    grace_deadline = min(deadline, time.monotonic() + 2.5)
+    while time.monotonic() < grace_deadline:
+        if refusal.poll() is not None:
+            raise QidianError("QQ_QIDIAN_FRIEND_REQUIRED", "目标商家仅显示加好友入口，已跳过")
+        time.sleep(min(0.15, max(0, grace_deadline - time.monotonic())))
     # GoClient opens a browser above QQ. Keep each observation visible so QQ can
     # repaint its accessibility provider; visibility itself is never identity proof.
     from ..core.window import WindowCaptureCtx
@@ -152,15 +189,18 @@ def wake_and_identify(link: str, target_qq_number: str, *,
     last_error = "尚未读到接待人"
     previous = None
     # First-time mapping requires two full name/number observations, separated by
-    # the existing poll interval. Any mismatch or read failure resets confirmation.
+    # the existing poll interval. It deliberately does not scan the whole list for
+    # name uniqueness; the active row and the website QQ number are the identity.
     verified_pair = None
     attempt = 0
+    number_mismatch = False
+    number = None
     stage = "active_row"
     while time.monotonic() < deadline:
         attempt += 1
         # Outside the transient-UIA retry catch: explicit refusal is terminal.
         if refusal.poll() is not None:
-            raise QidianError("QQ_QIDIAN_FRIEND_REQUIRED", "企点提示无法发起临时会话，需先添加好友")
+            raise QidianError("QQ_QIDIAN_FRIEND_REQUIRED", "目标商家需先添加好友或仅显示加好友入口，已跳过")
         try:
             stage = "session_ready"
             current_hwnd = _ensure_qq_window(deadline)._hWnd
@@ -179,6 +219,7 @@ def wake_and_identify(link: str, target_qq_number: str, *,
                     number = _identify_active_qq(hwnd, deadline)
                     stage = "compare_number"
                     matched = number == target
+                    number_mismatch = number is not None and not matched
                     logger.info("qidian.wake.compare attempt=%d contact=%r observed=%s target=%s matched=%s elapsed_ms=%.1f",
                                 attempt, name, number, target, matched,
                                 (time.monotonic() - started) * 1000)
@@ -193,23 +234,14 @@ def wake_and_identify(link: str, target_qq_number: str, *,
                         logger.info("qidian.wake.confirmation attempt=%d contact=%r qq=%s consecutive=%d required=2",
                                     attempt, name, number, 2 if confirmed else 1)
                         if confirmed:
-                            from .contact_lookup import assert_unique_name, restore_verified_contact
-                            stage = "unique_name"
-                            assert_unique_name(hwnd, name, timeout=max(0.1, deadline - time.monotonic()))
-                            stage = "restore_active"
-                            restore_verified_contact(name, hwnd, deadline=deadline)
+                            # The target row is already selected and the website
+                            # QQ number has matched twice. Scanning the complete
+                            # list for name uniqueness can rebuild the UIA tree and
+                            # burn the budget; re-activating the same session is
+                            # unnecessary and would force another copy for no gain.
                             stage = "confirm_active"
                             if _active_name(hwnd) != name or time.monotonic() >= deadline:
-                                raise QidianError("QQ_QIDIAN_SESSION_NOT_STABLE", "恢复目标后激活会话变化或超过预算")
-                            stage = "final_number"
-                            final_number = _identify_active_qq(hwnd, deadline)
-                            logger.info("qidian.wake.final_number contact=%r matched=%s elapsed_ms=%.1f",
-                                        name, final_number == target, (time.monotonic() - started) * 1000)
-                            if final_number != target:
-                                raise QidianError("QQ_QIDIAN_SESSION_NOT_STABLE", "恢复目标后 QQ 号码与网站号码不一致")
-                            stage = "confirm_active"
-                            if _active_name(hwnd) != name or time.monotonic() >= deadline:
-                                raise QidianError("QQ_QIDIAN_SESSION_NOT_STABLE", "最终核号后激活会话变化或超过预算")
+                                raise QidianError("QQ_QIDIAN_SESSION_NOT_STABLE", "二次核号后激活会话变化或超过预算")
                             logger.info("qidian.wake.verified contact=%r qq=%s elapsed_ms=%.1f", name, number,
                                         (time.monotonic() - started) * 1000)
                             return dict(linkHash=link_hash(normalized), contactName=name, qqNumber=number,
@@ -222,6 +254,8 @@ def wake_and_identify(link: str, target_qq_number: str, *,
                                       f"当前接待人号码 {number} 与网站号码 {target} 不一致")
                 previous = name
         except Exception as exc:
+            if isinstance(exc, QidianError) and exc.code == "QQ_QIDIAN_NUMBER_MISMATCH":
+                raise
             # UIA may temporarily rebuild while GoClient opens the conversation.
             previous = None
             verified_pair = None
@@ -230,24 +264,29 @@ def wake_and_identify(link: str, target_qq_number: str, *,
                         attempt, stage, (time.monotonic() - started) * 1000, exc)
         time.sleep(min(WAKE_POLL_INTERVAL_SECONDS, max(0, deadline - time.monotonic())))
     logger.warning("qidian.wake.timeout stage=%s target=%s reason=%s", stage, target, last_error)
-    raise QidianError("QQ_QIDIAN_SESSION_NOT_STABLE", f"阶段 {stage}：{last_error}")
+    code = "QQ_QIDIAN_NUMBER_MISMATCH" if number_mismatch else "QQ_QIDIAN_SESSION_NOT_STABLE"
+    raise QidianError(code, f"阶段 {stage}：{last_error}", stage=stage,
+                      observed_qq_number=number, target_qq_number=target)
 
 
-def resolve_verified(link: str, target_qq_number: str, metadata: dict, mappings) -> dict:
+def resolve_verified(link: str, target_qq_number: str, metadata: dict, mappings, *, force_reverify: bool = False) -> dict:
     """Called only inside the Dispatcher: activation and persistence share the desktop slot."""
-    from .contact_lookup import activate
+    from .contact_lookup import restore_verified_contact
     audit = metadata.get("audit") or {}
     logger.info("qidian.resolve.begin batch=%s target_id=%s", audit.get("batchId"), audit.get("targetId"))
     target = require_target_qq(target_qq_number)
     normalized = normalize_link(link)
     scope = metadata['account_scope']
-    cached = mappings.conversation(scope, target)
+    if force_reverify:
+        mappings.invalidate(scope, target)
+        logger.info("qidian.reverify.forced batch=%s target_id=%s", audit.get("batchId"), audit.get("targetId"))
+    cached = None if force_reverify else mappings.conversation(scope, target)
     result = None
     if cached:
         try:
             hwnd = _ensure_qq_window(time.monotonic() + WAKE_TIMEOUT_BUDGET_SECONDS)._hWnd
             name = cached['contact_name']
-            activate(name, hwnd=hwnd)
+            restore_verified_contact(name, hwnd=hwnd, deadline=time.monotonic() + WAKE_TIMEOUT_BUDGET_SECONDS)
             if _active_name(hwnd) != name:
                 raise QidianError("QQ_QIDIAN_ACTIVE_NOT_FOUND", "复用激活结果不一致")
             time.sleep(WAKE_POLL_INTERVAL_SECONDS)
