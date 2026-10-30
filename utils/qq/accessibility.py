@@ -56,8 +56,6 @@ logger = logging.getLogger("qq_service.accessibility")
 LIST_PANE_NAME = "会话列表"
 # 行元素的 ClassName 关键字
 ROW_CLASS_MARKER = "recent-contact-item"
-# 右击菜单里的同名元素（ClassName 也含 recent-contact-item），必须排除
-MENU_CLASS_MARKER = "menu"
 # 行 ClassName 里表示"当前打开的会话"的标记
 ROW_SELECTED_MARKER = "--selected"
 # 行 ClassName 里表示"置顶"的标记
@@ -633,8 +631,9 @@ class ContactListAccessibility:
         for index in range(elements.Length):
             element = elements.GetElement(index)
             class_name = element.CurrentClassName or ""
-            # 只保留会话行；右击菜单条目 ClassName 也含同名关键字，必须排除
-            if ROW_CLASS_MARKER not in class_name or MENU_CLASS_MARKER in class_name:
+            # 按完整类名保留真正的会话行，排除仅带此前缀的菜单/内容节点。
+            # 右键打开时原行会增加 recent-contact-item--menu，仍是同一激活行。
+            if ROW_CLASS_MARKER not in class_name.split():
                 continue
             rect = _element_rect(element)
             texts: list[str] = []

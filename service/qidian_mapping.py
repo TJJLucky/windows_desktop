@@ -52,8 +52,8 @@ class QidianMappingStore:
         with self._lock, closing(self._connect()) as connection, connection:
             previous = connection.execute('SELECT * FROM qidian_verified_supplier WHERE account_scope=? AND site_id=? AND supplier_id=?', (account_scope, site_id, supplier_id)).fetchone()
             old = connection.execute('SELECT * FROM qidian_verified_conversation WHERE account_scope=? AND qq_number=?', (account_scope, number)).fetchone()
-            count = (old['wake_count'] if old else 0) + (0 if result['reused'] else 1)
-            verified_at = old['verified_at'] if result['reused'] and old else now
+            count = (old['wake_count'] if old else 0) + 1
+            verified_at = now
             connection.execute('INSERT OR REPLACE INTO qidian_verified_conversation VALUES (?,?,?,?,?,?)', (account_scope, number, result['contactName'], verified_at, now, count))
             connection.execute('INSERT OR REPLACE INTO qidian_verified_supplier VALUES (?,?,?,?,?,?,?)', (account_scope, site_id, supplier_id, supplier_name, result['linkHash'], number, now))
             connection.execute('INSERT INTO qidian_verified_log(account_scope,site_id,supplier_id,payload,previous,created_at) VALUES (?,?,?,?,?,?)', (account_scope, site_id, supplier_id, json.dumps({**result, 'audit': audit}, ensure_ascii=False), json.dumps({'supplier': dict(previous) if previous else None, 'conversation': dict(old) if old else None}, ensure_ascii=False), now))

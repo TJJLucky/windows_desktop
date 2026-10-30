@@ -41,6 +41,7 @@ _ERROR_CODE_PREFIXES = (
     "QQ_CONTACT_NAME_INVALID",
     "QQ_CONTACT_AMBIGUOUS",
     "QQ_CONTACT_ACTIVATION_FAILED",
+    "QQ_CONTACT_ACTIVATION_QUEUE_TIMEOUT",
     "QQ_CONTACT_NOT_COPYABLE",
     "QQ_CONTACT_NUMBER_INVALID",
     "QQ_CONTACT_NUMBER_ACTIVE_NOT_FOUND",
@@ -63,6 +64,7 @@ _ERROR_CODE_PREFIXES = (
     "QQ_WINDOW_NOT_READY",
     "QQ_QIDIAN_LINK_INVALID",
     "QQ_QIDIAN_QQ_UNRESOLVED",
+    "QQ_QIDIAN_NUMBER_MISMATCH",
     "QQ_QIDIAN_WAKE_FAILED",
     "QQ_QIDIAN_FRIEND_REQUIRED",
     "QQ_QIDIAN_SESSION_NOT_STABLE",
@@ -124,6 +126,10 @@ class QqAutomationPort(Protocol):
 
     def read_messages(self, contact_name: str) -> dict:
         """读取指定联系人会话的可见消息，返回含 messages 列表的 dict。"""
+        ...
+
+    def activate_contact(self, contact_name: str) -> dict:
+        """按名称激活唯一会话，返回实际激活名、稳定状态和耗时。"""
         ...
 
     def wake_qidian(self, link: str, target_qq_number: str, *, metadata: dict, mappings) -> dict:
@@ -229,6 +235,13 @@ class LegacyQqAutomationFacade:
             "error": None,
         }
 
+    def activate_contact(self, contact_name: str) -> dict:
+        """按名称激活一个已确认会话，不读取、不发送。"""
+        result, error = self._operator().activate_contact(contact_name, timeout=30.0)
+        if error is not None:
+            _raise_operation_error(error, contact_name, "QQ_CONTACT_ACTIVATION_FAILED")
+        return result
+
     def wake_qidian(self, link: str, target_qq_number: str, *, metadata: dict, mappings) -> dict:
         """打开 qidian 链接唤醒 QQ 会话并识别当前接待人（Dispatcher 内串行）。
 
@@ -236,14 +249,17 @@ class LegacyQqAutomationFacade:
         避免合法的排队被误判成超时；真排队超时抛 QQ_QIDIAN_QUEUE_TIMEOUT。
         """
         # 惰性 import：保持本模块在没有桌面依赖的环境里也能加载
-        from utils.qq.qidian import WAKE_TIMEOUT_BUDGET_SECONDS
+        from utils.qq.qidian import QidianError, WAKE_TIMEOUT_BUDGET_SECONDS
 
         operator = self._operator()
         # 队列里已有的任务数 × 单次预算 + 余量；上限兜底防止失控等待
         timeout = min(180.0, WAKE_TIMEOUT_BUDGET_SECONDS * (operator.pending_task_count + 1) + 15.0)
         result, error = operator.wake_qidian(link, target_qq_number, timeout=timeout, metadata=metadata, mappings=mappings)
         if error is not None:
-            raise QqAutomationError(_operation_error_code(error, "QQ_QIDIAN_WAKE_FAILED")) from error
+            code = _operation_error_code(error, "QQ_QIDIAN_WAKE_FAILED")
+            detail = error.public_detail() if isinstance(error, QidianError) else ""
+            logger.warning("qidian.wake.failed code=%s stage=%s reason=%s", code, getattr(error, "stage", None), error)
+            raise QqAutomationError(f"{code}: {detail}" if detail else code) from error
         return result
 
     def check_capture_ready(self) -> dict:

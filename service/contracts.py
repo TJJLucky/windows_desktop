@@ -73,6 +73,26 @@ class ListContactsResponse(StrictModel):
     )
 
 
+class ActivateContactRequest(StrictModel):
+    """按名称激活指定 QQ 会话，不读取或发送消息。"""
+
+    contact_name: str = Field(
+        alias="contactName",
+        min_length=1,
+        max_length=256,
+        title="联系人名",
+        description="已确认的 QQ 会话列表行名；必须来自 contacts:query 或已验证映射。",
+    )
+
+
+class ActivateContactResponse(StrictModel):
+    """联系人激活结果。"""
+
+    contact_name: str = Field(alias="contactName", title="实际激活联系人", description="激活后复核得到的会话名。")
+    active_stable: bool = Field(alias="activeStable", title="激活是否稳定", description="true = 激活后已写入 phone 复核选中行。")
+    elapsed_ms: int = Field(alias="elapsedMs", ge=0, title="激活耗时", description="本次激活与复核耗时，单位毫秒。")
+
+
 class ReadMessagesRequest(StrictModel):
     """读取指定联系人可见消息的请求。"""
 
@@ -326,7 +346,7 @@ class QidianWakeResponse(StrictModel):
     link_hash: str = Field(
         alias="linkHash",
         title="链接指纹",
-        description="qidian 链接的 sha256 指纹，用于审计与映射查询；复用按资料范围和网站 QQ 判断。",
+        description="qidian 链接的 sha256 指纹，仅用于审计与映射查询；每次映射都必须重新核验。",
     )
     site_id: str = Field(alias="siteId", title="站点 ID", description="本次请求的站点标识。")
     supplier_id: str = Field(alias="supplierId", title="供应商 ID", description="本次请求的供应商标识。")
@@ -358,16 +378,32 @@ class QidianWakeResponse(StrictModel):
     active_stable: bool = Field(
         alias="activeStable",
         title="激活行是否稳定",
-        description="true = 连续两次读到同一唯一激活行，并通过号码验证或已验证映射复用。",
+        description="true = 连续两次读到同一唯一激活行并通过目标号码验证。",
     )
-    reused: bool = Field(
-        title="是否复用",
-        description="true = 同一资料范围、同一 QQ 的已验证映射已通过无障碍树重新激活，本次没有再次打开链接。",
+    activation_attempts: int = Field(
+        alias="activationAttempts", ge=1, le=2,
+        title="唤醒尝试次数",
+        description="本次 qidian 映射打开链接的次数；只在首轮 8 秒无接管信号时受控重开一次。",
+    )
+    handoff_observed: bool = Field(
+        alias="handoffObserved",
+        title="是否观察到 QQ 接管",
+        description="true = 已观察到企点页面跳转、QQ 激活或本次唯一激活行变化。",
+    )
+    activation_stage: str = Field(
+        alias="activationStage",
+        title="最终激活阶段",
+        description="成功时固定为 confirm_active；失败时用于区分接管、列表、读号和核号阶段。",
+    )
+    elapsed_ms: int = Field(
+        alias="elapsedMs", ge=0,
+        title="链路耗时",
+        description="从 qidian 映射操作开始到完成或失败的毫秒数。",
     )
     woke_at: str = Field(
         alias="wokeAt",
         title="唤醒时间",
-        description="本次号码验证或复用激活完成时间，ISO 8601 带时区偏移。",
+        description="本次号码验证完成时间，ISO 8601 带时区偏移。",
     )
 
 
@@ -433,4 +469,4 @@ class QidianMappingResponse(StrictModel):
     target_qq_number: str | None = Field(alias="targetQqNumber", default=None, title="目标 QQ 号", description="最近一次唤醒时调用方传入的商家 QQ 号。")
     source: Literal["qidian_wake"] | None = Field(default=None, title="映射来源", description="映射写入来源，当前只有 qidian_wake。")
     updated_at: str | None = Field(alias="updatedAt", default=None, title="更新时间", description="最近一次覆盖写入时间，ISO 8601 带时区偏移。")
-    wake_count: int | None = Field(alias="wakeCount", default=None, ge=0, title="唤醒次数", description="当前资料范围与 QQ 会话验证记录累计真实唤醒次数，复用不增加；记录失效重建后重新计数。")
+    wake_count: int | None = Field(alias="wakeCount", default=None, ge=0, title="唤醒次数", description="当前资料范围与 QQ 会话验证记录累计真实唤醒次数；每次成功的新鲜核验都会增加。")

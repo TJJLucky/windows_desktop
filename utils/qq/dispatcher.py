@@ -146,6 +146,9 @@ class Dispatcher:
                     elif task_type == "qidian_wake":
                         link, target_qq_number, metadata, mappings = args
                         result = self.wake_qidian_impl(link, target_qq_number, metadata, mappings)
+                    elif task_type == "activate_contact":
+                        contact_name, = args
+                        result = self.activate_contact_impl(contact_name)
                     elif task_type == "check_capture_ready":
                         result = self.check_capture_ready_impl()
                     else:
@@ -194,6 +197,12 @@ class Dispatcher:
         return self._submit("qidian_wake", (link, target_qq_number, metadata, mappings),
                             timeout, "QQ_QIDIAN_QUEUE_TIMEOUT", {})
 
+    def activate_contact(self, contact_name: str,
+                         timeout: float = 30.0) -> Tuple[dict, Optional[Exception]]:
+        """按名称激活会话；与发送、读取、映射共用同一个 QQ 单消费者。"""
+        return self._submit("activate_contact", (contact_name,),
+                            timeout, "QQ_CONTACT_ACTIVATION_QUEUE_TIMEOUT", {})
+
     def check_capture_ready(self, timeout: float = 30.0) -> Tuple[dict, Optional[Exception]]:
         return self._submit("check_capture_ready", (), timeout, "QQ_CAPTURE_QUEUE_TIMEOUT", {})
 
@@ -221,6 +230,18 @@ class Dispatcher:
         from .qidian import resolve_verified
 
         return resolve_verified(link, target_qq_number, metadata, mappings)
+
+    def activate_contact_impl(self, contact_name: str) -> dict:
+        """实际实现：按名称定位并激活联系人，返回实际激活名与耗时。"""
+        from .contact_lookup import activate
+
+        started = time.monotonic()
+        actual = activate(contact_name)
+        return {
+            "contactName": actual,
+            "activeStable": True,
+            "elapsedMs": int(round((time.monotonic() - started) * 1000)),
+        }
 
     def get_contact_list_impl(self, contact_name: str | None = None,
                               all_contacts: bool = False) -> dict:

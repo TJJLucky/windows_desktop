@@ -34,7 +34,7 @@ from .command_ledger import CommandConflictError, CommandLedger
 # QidianMappingStore：qidian 唤醒映射与唤醒日志（资料范围内供应商和 QQ 会话分别存储）
 from .qidian_mapping import QidianMappingStore
 # 全部 Pydantic 请求/响应契约模型（API 的输入输出 schema）
-from .contracts import IdentifyCurrentContactRequest, IdentifyCurrentContactResponse, API_VERSION, CaptureCheckResponse, ChatHistoryRequest, ChatHistoryResponse, CommandResponse, ListContactsRequest, ListContactsResponse, QidianMappingQuery, QidianMappingResponse, QidianWakeRequest, QidianWakeResponse, ReadMessagesRequest, ReadMessagesResponse, SendMessageRequest, ServiceHealthResponse
+from .contracts import ActivateContactRequest, ActivateContactResponse, IdentifyCurrentContactRequest, IdentifyCurrentContactResponse, API_VERSION, CaptureCheckResponse, ChatHistoryRequest, ChatHistoryResponse, CommandResponse, ListContactsRequest, ListContactsResponse, QidianMappingQuery, QidianMappingResponse, QidianWakeRequest, QidianWakeResponse, ReadMessagesRequest, ReadMessagesResponse, SendMessageRequest, ServiceHealthResponse
 # QqAutomationPort：自动化端口抽象（测试时可注入替身）；LegacyQqAutomationFacade：真实实现（视觉 RPA）；QqAutomationError：QQ 操作失败统一异常
 from .facade import LegacyQqAutomationFacade, QqAutomationError, QqAutomationPort, QqContactNotFoundError
 
@@ -238,6 +238,27 @@ def create_app(
                        details={"reason": payload.reason} if payload.skipped else None)
         return payload
 
+    # —— 激活联系人接口（后续复用与消息操作统一入口） ——
+    @app.post(
+        "/v1/contacts:activate",
+        response_model=ActivateContactResponse,
+        summary="按名称激活唯一 QQ 会话",
+        description="通过无障碍树定位并激活一个已确认名称的会话，返回实际激活名、稳定状态和耗时；"
+                    "整段操作仍在 QQ 单消费者队列内串行执行。",
+        tags=["联系人"],
+        response_description="实际激活结果",
+    )
+    def activate_contact(request: ActivateContactRequest) -> ActivateContactResponse:
+        operation_started = time.perf_counter()
+        try:
+            payload = facade.activate_contact(request.contact_name)
+        except QqAutomationError as exc:
+            record_attempt("CONTACT_ACTIVATE", operation_started, status="FAILED", failure_code=str(exc))
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        record_attempt("CONTACT_ACTIVATE", operation_started, contact_name=payload["contactName"], status="SUCCESS",
+                       details={"elapsedMs": payload["elapsedMs"]})
+        return ActivateContactResponse.model_validate(payload)
+
     # —— 读取联系人列表接口 ——
     @app.post(
         "/v1/contacts:query",
@@ -437,7 +458,8 @@ def create_app(
                     "（服务端不解析链接里的号）→ 用默认浏览器打开链接 → 等无障碍树会话名单"
                     "稳定并出现唯一激活行 → 复制当前接待人 QQ 号 → 按 (accountScope, siteId, supplierId) 写入已验证映射。"
                     "整段唤醒都在内部单消费者队列里串行执行，多个 qidian 同时到达不会交叉。"
-                    "同一资料范围和网站 QQ 的已验证映射经无障碍树重新定位激活后复用（reused=true）；未命中时打开链接并轮询号码完全匹配后保存。",
+                    "首次 8 秒无接管时受控重开一次；一旦接管只轮询列表、读号和复核，不再重复打开浏览器。"
+                    "只有目标号码连续两次匹配且激活行稳定才保存映射。",
         tags=["qidian"],
         responses={503: {"description": "唤醒失败 / 会话不稳定 / 读不到唯一激活行"}},
         response_description="本次（或命中的上次）唤醒结果与映射",
@@ -464,8 +486,11 @@ def create_app(
         except QqAutomationError as exc:
             record_attempt("QIDIAN_WAKE", operation_started, status="FAILED", failure_code=str(exc))
             raise HTTPException(status_code=503, detail=str(exc)) from exc
-        record_attempt("QIDIAN_WAKE", operation_started, contact_name=result["contactName"],
-                       status="REUSED" if result["reused"] else "SUCCESS")
+        record_attempt("QIDIAN_WAKE", operation_started, contact_name=result["contactName"], status="SUCCESS",
+                       details={"activationAttempts": result.get("activationAttempts"),
+                                "handoffObserved": result.get("handoffObserved"),
+                                "activationStage": result.get("activationStage"),
+                                "elapsedMs": result.get("elapsedMs")})
         return QidianWakeResponse.model_validate(result)
 
     # —— qidian 映射查询接口（纯本地 SQLite，不触碰 QQ） ——

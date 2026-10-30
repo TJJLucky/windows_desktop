@@ -105,7 +105,7 @@ class QidianBrowserWindow:
         self.browser_pids: set[int] = set()
         self.owned_windows: set[tuple[int, int]] = set()
 
-    def open(self) -> None:
+    def open(self, *, wait_for_window: bool = True) -> None:
         self.executable = _browser_executable()
         if not self.executable:
             raise OSError("未找到可管理的 Edge/Chrome，无法保证 qidian 窗口可关闭")
@@ -130,12 +130,15 @@ class QidianBrowserWindow:
         )
         self.browser_pids.add(self.process.pid)
         logger.info("qidian.browser.opened owner=%s pid=%s profile=%s", self.owner, self.process.pid, self.profile)
-        self._capture_owned_window(time.monotonic() + 5.0)
-        logger.info(
-            "qidian.browser.slot_ready owner=%s windows=%s",
-            self.owner,
-            ",".join(str(hwnd) for hwnd, _ in sorted(self.owned_windows)) or "pending",
-        )
+        if wait_for_window:
+            self._capture_owned_window(time.monotonic() + 5.0)
+            logger.info(
+                "qidian.browser.slot_ready owner=%s windows=%s",
+                self.owner,
+                ",".join(str(hwnd) for hwnd, _ in sorted(self.owned_windows)) or "pending",
+            )
+        else:
+            logger.info("qidian.browser.slot_ready owner=%s windows=async", self.owner)
 
     def _capture_owned_window(self, deadline: float) -> None:
         next_refresh = 0.0

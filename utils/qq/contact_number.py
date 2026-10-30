@@ -1,7 +1,6 @@
-"""头像行 → 右键菜单模板 → 复制 QQ 号；不执行昵称 OCR 或识别回退。"""
+"""无障碍树激活行 → 右键菜单模板 → 复制 QQ 号；不执行昵称 OCR 或颜色选行。"""
 from __future__ import annotations
 
-from dataclasses import dataclass
 import itertools
 import logging
 import re
@@ -17,10 +16,11 @@ from ..core.clipboard import ClipboardCopy, ClipboardCopyError
 from ..core.mouse import click_at, move_to, right_click_at
 from ..core.screenshot import WGCCapture, WgcCaptureError
 from ..core.window import WindowCaptureCtx
+from .accessibility import AccessibilityPane, AccessibilityRow, accessibility_pane
+from .contact_lookup import locate, read_pane
 from .hotkeys import send_hotkey
 from .regions import RegionResult, get_userList_region_and_image
 from .template_runtime import find_unique_template, load_image, window_signature
-from .user_list import UserList
 from .window_ops import ensure_qq_session_ready
 
 logger = logging.getLogger("qq_service.contact_number")
@@ -41,10 +41,9 @@ MENU_PANEL_WHITE_FRACTION = 0.05
 MENU_POLL_SECONDS = 0.03
 # 面板已出现但始终没有"复制 QQ 号"（例如群聊菜单）时的确认窗口，避免空等满 2s。
 MENU_ABSENT_CONFIRM_SECONDS = 0.3
-# 鼠标指针会被 WGC 一起采进画面：指针压在头像上会改变头像像素，让「该行未变」
-# 的核对直接误判（实测同一行头像掩膜内均差 8~12，远高于 2.0 门槛）。所以任何要
-# 用来做身份比对的截图之前，都必须先把指针停到不覆盖好友行的空白处。
-# 停靠点取窗口右下角的聊天输入区：既不在好友列表行上，也不在列表右上标题区里。
+# 菜单截图期间将指针停到列表外的空白处，避免悬停状态影响菜单/窗口画面检查。
+# 联系人身份只由 UIA 已选中行及其前后复核决定，不从截图颜色推断。
+# 停靠点取窗口右下角的聊天输入区，不落在好友列表行或标题区。
 PARK_MARGIN_RIGHT = 60
 PARK_MARGIN_BOTTOM = 60
 # 相邻两次停靠错开几像素，保证停靠本身一定产生画面变化，随后取到的一定是新帧。
@@ -59,76 +58,79 @@ IDENTIFY_RETRY_WAIT_SECONDS = 0.25
 _park_offsets = itertools.cycle((0, PARK_JITTER))
 
 
-@dataclass(frozen=True)
-class ContactRow:
-    """本次截图中的内部行坐标；不接受来自 HTTP 的坐标。"""
-
-    avatar: tuple[int, int, int]
-    rect: tuple[int, int, int, int]
-
-
-def _row_image(region: RegionResult, row: ContactRow) -> Image.Image:
-    x, _, radius = row.avatar
-    _, top, right, bottom = row.rect
-    return region.image.crop((x + radius + 5, top, right, bottom))
-
-
-def _active_row(region: RegionResult) -> ContactRow:
-    """返回当前列表中落在"已激活会话"绝对色带内的那一行。
-
-    真机实测：未激活行 245 灰、被鼠标悬停的未激活行 235 灰、激活行 226 灰（深色主题
-    对应更低一档）。悬停在激活行上不会改变它的底色，因此色带判定与指针位置无关，也
-    不需要"相对离群"兜底——那种兜底会把常驻 235 灰的未读行也算成候选，在激活行滚出
-    可视区时报出假歧义。色带内唯一命中即采纳，多行判歧义，无命中即当前无可见激活会话。
-    """
-    rows = [ContactRow(avatar, rect) for avatar, rect in UserList.crop_user_row_by_avatar(region.image)]
-    if not rows:
+def _selected_contact_row(pane: AccessibilityPane, *, require_visible: bool = True,
+                          require_unique_name: bool = True) -> AccessibilityRow:
+    """Return the selected row; name uniqueness is optional for qidian verification."""
+    selected = pane.selected_rows()
+    if not selected:
+        logger.warning("contacts.number.active_not_found rows=%d", len(pane.rows))
         raise RuntimeError("QQ_CONTACT_NUMBER_ACTIVE_NOT_FOUND")
-    absolute = [index for index, row in enumerate(rows)
-                if UserList.is_active_bg(_row_image(region, row))]
-    if len(absolute) == 1:
-        return rows[absolute[0]]
-    if len(absolute) > 1:
-        # 歧义基本只有一个来源：某一行正被鼠标悬停。色带里本该只有一个真激活行，但
-        # 常驻 235 灰的行（实测「我的手机」）被悬停时会画成 226 灰，落进同一色带。
-        # 打印候选行的纵坐标与底色，让日志能直接指出是哪几行，而不是只留一个错误码。
-        logger.warning("contacts.number.active_ambiguous candidates=%s",
-                       [(rows[index].avatar[1], UserList.modal_color(_row_image(region, rows[index])))
-                        for index in absolute])
+    if len(selected) != 1:
+        logger.warning("contacts.number.active_ambiguous selected=%d rows=%d",
+                       len(selected), len(pane.rows))
         raise RuntimeError("QQ_CONTACT_NUMBER_ACTIVE_AMBIGUOUS")
-    raise RuntimeError("QQ_CONTACT_NUMBER_ACTIVE_NOT_FOUND")
+    row = selected[0]
+    if not row.name:
+        logger.warning("contacts.number.active_ambiguous name=%r", row.name)
+        raise RuntimeError("QQ_CONTACT_NUMBER_ACTIVE_AMBIGUOUS")
+    if require_unique_name:
+        name_matches = pane.rows_named(row.name)
+        if len(name_matches) != 1:
+            logger.warning("contacts.number.active_ambiguous name=%r matches=%d",
+                           row.name, len(name_matches))
+            raise RuntimeError("QQ_CONTACT_NUMBER_ACTIVE_AMBIGUOUS")
+    if require_visible and not row.visible_in(pane.rect):
+        logger.warning("contacts.number.active_not_visible name=%r rect=%s pane=%s",
+                       row.name, row.rect, pane.rect)
+        raise RuntimeError("QQ_CONTACT_NUMBER_ACTIVE_NOT_FOUND")
+    return row
 
 
-def _same_image(first: Image.Image, second: Image.Image) -> bool:
-    if first.size != second.size:
-        return False
-    return float(np.abs(np.asarray(first.convert("RGB"), dtype=np.int16) -
-                        np.asarray(second.convert("RGB"), dtype=np.int16)).mean()) <= 2.0
+def _same_accessibility_row(expected: AccessibilityRow, actual: AccessibilityRow) -> bool:
+    """Compare same-call UIA identity; runtime IDs are only supplemental within this call."""
+    same_runtime_id = (not expected.runtime_id or not actual.runtime_id or
+                       expected.runtime_id == actual.runtime_id)
+    return (actual.selected and expected.name == actual.name and
+            expected.rect == actual.rect and same_runtime_id)
 
 
-def _same_avatar(first: Image.Image, second: Image.Image) -> bool:
-    if first.size != second.size:
-        return False
-    width, height = first.size
-    yy, xx = np.ogrid[:height, :width]
-    # 圆外是行背景；菜单激活会改变背景，不属于头像身份。
-    mask = (xx - width / 2) ** 2 + (yy - height / 2) ** 2 <= (min(width, height) * 0.45) ** 2
-    difference = np.abs(np.asarray(first.convert("RGB"), dtype=np.int16) -
-                        np.asarray(second.convert("RGB"), dtype=np.int16))
-    return float(difference[mask].mean()) <= 2.0
+def _verify_selected_row(hwnd: int, expected: AccessibilityRow, *,
+                         require_unique_name: bool = True) -> None:
+    """Fail closed unless a fresh UIA snapshot still selects the exact same row."""
+    actual = _selected_contact_row(accessibility_pane(hwnd),
+                                   require_unique_name=require_unique_name)
+    if not _same_accessibility_row(expected, actual):
+        logger.warning("contacts.number.identity_changed part=accessibility_row "
+                       "expected=%r expected_rect=%s actual=%r actual_rect=%s",
+                       expected.name, expected.rect, actual.name, actual.rect)
+        raise RuntimeError("QQ_CONTACT_NUMBER_ROW_CHANGED")
 
 
-def visible_rows(region: RegionResult) -> list[ContactRow]:
-    """Enumerate avatar-backed rows in the current captured list, top to bottom."""
-    rows = [ContactRow(avatar, rect) for avatar, rect in UserList.crop_user_row_by_avatar(region.image)]
-    return sorted(rows, key=lambda row: row.avatar[1])
-
-
-def _same_row_geometry(first: ContactRow, second: ContactRow) -> bool:
-    return (abs(first.avatar[0] - second.avatar[0]) <= 2 and
-            abs(first.avatar[1] - second.avatar[1]) <= 2 and
-            abs(first.avatar[2] - second.avatar[2]) <= 2 and
-            all(abs(a - b) <= 2 for a, b in zip(first.rect, second.rect)))
+def _row_image_coordinates(
+    region: RegionResult, row: AccessibilityRow
+) -> tuple[tuple[int, int, int, int], tuple[int, int]]:
+    """Map the UIA screen rectangle into the captured list crop for menu ROI checks."""
+    screen = region.screen_region
+    screen_width = screen["right"] - screen["left"]
+    screen_height = screen["bottom"] - screen["top"]
+    if screen_width <= 0 or screen_height <= 0:
+        raise RuntimeError("QQ_CONTACT_NUMBER_ROW_CHANGED")
+    scale_x = region.image.width / screen_width
+    scale_y = region.image.height / screen_height
+    left, top, right, bottom = row.rect
+    crop_rect = (round((left - screen["left"]) * scale_x),
+                 round((top - screen["top"]) * scale_y),
+                 round((right - screen["left"]) * scale_x),
+                 round((bottom - screen["top"]) * scale_y))
+    if (crop_rect[0] < 0 or crop_rect[1] < 0 or
+            crop_rect[2] > region.image.width or crop_rect[3] > region.image.height or
+            crop_rect[0] >= crop_rect[2] or crop_rect[1] >= crop_rect[3]):
+        logger.warning("contacts.number.active_outside_capture name=%r row=%s screen=%s image=%s",
+                       row.name, row.rect, screen, region.image.size)
+        raise RuntimeError("QQ_CONTACT_NUMBER_ACTIVE_NOT_FOUND")
+    center = ((crop_rect[0] + crop_rect[2]) // 2,
+              (crop_rect[1] + crop_rect[3]) // 2)
+    return crop_rect, center
 
 
 def _menu_roi(rect: dict, x: int, y: int, width: int, height: int) -> tuple[int, int, int, int]:
@@ -158,8 +160,7 @@ def _has_white_panel(crop: Image.Image) -> bool:
 def park_pointer(window) -> None:
     """把指针停到窗口右下角的聊天输入区，等画面停在停靠后的状态。
 
-    停靠点既不落在好友列表行上，也不落在列表右上角的会话标题区，因此不会进入任何
-    身份比对区域；相邻两次停靠错开 PARK_JITTER 像素，保证后续读取拿到的是新帧。
+    停靠点不落在好友列表行或标题区；相邻两次停靠错开少量像素，确保后续截图是新帧。
     """
     left, top, right, bottom = win32gui.GetWindowRect(window._hWnd)
     x = min(max(right - PARK_MARGIN_RIGHT, 1), 32767)
@@ -185,7 +186,8 @@ class ContactNumberReader:
         return get_userList_region_and_image(window, image)
 
     def identify_current(self, *, attempts: int = IDENTIFY_RETRY_ATTEMPTS,
-                         deadline: float | None = None, expected_hwnd: int | None = None) -> str | None:
+                         deadline: float | None = None, expected_hwnd: int | None = None,
+                         require_unique_name: bool = True) -> str | None:
         """复制当前激活行的 QQ 号；窗口捕获面被重建（WINDOW_CHANGED）时整段重试。
 
         读取本身无副作用且幂等，重试只会重新截取一帧再复制一次，因此只对瞬时
@@ -198,8 +200,25 @@ class ContactNumberReader:
                 raise RuntimeError("QQ_CONTACT_NUMBER_WINDOW_CHANGED")
             try:
                 with WindowCaptureCtx(window._hWnd):
+                    pane = read_pane(window._hWnd)
+                    selected = _selected_contact_row(pane, require_visible=False,
+                                                     require_unique_name=require_unique_name)
+                    if not selected.visible_in(pane.rect):
+                        # Scroll only: never activate a name inferred from an old tree.
+                        # Re-read selection after scrolling before copying any number.
+                        reveal_deadline = min(deadline, time.monotonic() + 3.0) if deadline is not None else time.monotonic() + 3.0
+                        locate(selected.name, hwnd=window._hWnd, deadline=reveal_deadline)
+                        pane = read_pane(window._hWnd)
+                        current = _selected_contact_row(pane, require_unique_name=require_unique_name)
+                        if (current.name != selected.name or
+                                (selected.runtime_id and current.runtime_id and
+                                 selected.runtime_id != current.runtime_id)):
+                            raise RuntimeError("QQ_CONTACT_NUMBER_ROW_CHANGED")
+                        logger.info("contacts.number.active_revealed name=%r", current.name)
+                    row = _selected_contact_row(pane, require_unique_name=require_unique_name)
                     region = self.capture_region(window)
-                    return self.copy_row(window, region, _active_row(region))
+                    _row_image_coordinates(region, row)
+                    return self.copy_row(window, region, row, require_unique_name=require_unique_name)
             except RuntimeError as error:
                 if (str(error) != "QQ_CONTACT_NUMBER_WINDOW_CHANGED"
                         or attempt == attempts):
@@ -222,18 +241,17 @@ class ContactNumberReader:
         self._generation = frame.info.generation
         return frame.image
 
-    def copy_row(self, window, region: RegionResult, row: ContactRow, *, require_active: bool = True) -> str | None:
-        """复制内部已识别的行；当前阶段只由 identify_current 调用。"""
+    def copy_row(self, window, region: RegionResult, row: AccessibilityRow, *,
+                 require_active: bool = True, require_unique_name: bool = True) -> str | None:
+        """Copy QQ number from the row selected by UIA; screenshots never choose a contact."""
         started = time.monotonic()
         signature = window_signature(window)
         rect = region.image_region
         full = region.full_image
-        x, y, radius = row.avatar
-        avatar_box = (rect["left"] + x - radius, rect["top"] + y - radius,
-                      rect["left"] + x + radius, rect["top"] + y + radius)
-        header_box = (rect["right"], max(0, rect["top"] - 60), full.width, rect["top"])
-        # 左侧菜单会遮住头像，菜单期间核对标题，关闭后再核对完整行和头像。
-        avatar_image, header_image = full.crop(avatar_box), full.crop(header_box)
+        if full is None:
+            raise RuntimeError("QQ_CONTACT_NUMBER_WINDOW_CHANGED")
+        _, (x, y) = _row_image_coordinates(region, row)
+        click_x, click_y = row.center
         menu_open = False
         require_foreground = False
         code = "SUCCESS"
@@ -253,29 +271,15 @@ class ContactNumberReader:
             if frame.size != full.size:
                 logger.warning("contacts.number.identity_changed part=frame_size")
                 raise RuntimeError("QQ_CONTACT_NUMBER_ROW_CHANGED")
-            if not menu_open and not _same_avatar(avatar_image, frame.crop(avatar_box)):
-                logger.warning("contacts.number.identity_changed part=avatar")
-                raise RuntimeError("QQ_CONTACT_NUMBER_ROW_CHANGED")
-            # 标题区（列表右上方的活跃会话标题/聊天区）会因对方发来消息或界面动画
-            # 随时重绘（真机实测偶发），与"这一行还是不是同一行"无关；枚举阶段（
-            # require_active=False）跳过该比对，行身份由窗口签名、头像掩膜与关闭菜单后
-            # 的几何核对保证。激活链路仍保留标题区核对以做最强一致性确认。
-            if require_active and not _same_image(header_image, frame.crop(header_box)):
-                logger.warning("contacts.number.identity_changed part=header")
-                raise RuntimeError("QQ_CONTACT_NUMBER_ROW_CHANGED")
             return frame
 
         def menu_action(frame):
-            """返回 (面板是否出现, "复制 QQ 号"命中坐标或 None)。
-
-            只匹配点击点附近的小 ROI，并先用近白面板占比做廉价预筛。
-            """
+            """Return menu presence and the Copy QQ Number template match, if any."""
             roi = _menu_roi(rect, x, y, frame.width, frame.height)
             local = frame.crop(roi)
             if not _has_white_panel(local):
                 return False, None
             origin = (roi[0], roi[1])
-            # 菜单与模板同尺寸：先固定尺度快路径，未命中再回退多尺度。
             match = find_unique_template(local, template, threshold=0.90,
                                          origin=origin, multiscale=False)
             if match is None:
@@ -292,15 +296,11 @@ class ContactNumberReader:
                     template = load_image("copy_qq_number.png")
                 except (LayoutError, OSError) as exc:
                     raise RuntimeError("QQ_CONTACT_NUMBER_TEMPLATE_UNAVAILABLE") from exc
-                # 上一次操作可能把指针留在了本行头像上（例如上一行的菜单项位置），
-                # 先停离列表，保证下面这次基准核对的两帧都不含指针。
+                # Move the pointer away from the contact list before taking fresh evidence.
                 park_pointer(window)
                 checked_frame()
-                click_x = region.screen_region["left"] + x
-                click_y = region.screen_region["top"] + y
-                if (radius <= 0 or not (0 <= x < region.image.width) or
-                        not (0 <= row.rect[1] < y < row.rect[3] <= region.image.height)):
-                    raise RuntimeError("QQ_CONTACT_NUMBER_ROW_CHANGED")
+                if require_active:
+                    _verify_selected_row(window._hWnd, row, require_unique_name=require_unique_name)
                 menu_open = True
                 right_click_at(click_x, click_y, restore=False, smooth=False)
                 action_barrier = self._clock()
@@ -313,8 +313,6 @@ class ContactNumberReader:
                     if action is not None:
                         break
                     if panel:
-                        # 面板已出现但看不到"复制 QQ 号"（例如群聊菜单是"复制群号"）：
-                        # 只需极短确认窗口即可判定不可用，不再空等满 MENU_WAIT_SECONDS。
                         if absent_deadline is None:
                             absent_deadline = time.monotonic() + MENU_ABSENT_CONFIRM_SECONDS
                         elif time.monotonic() >= absent_deadline:
@@ -323,40 +321,30 @@ class ContactNumberReader:
                 if action is None:
                     code = "SKIPPED_COPY_UNAVAILABLE"
                     return None
-                # 点击前用新截图确认菜单仍在同一位置，不点击缓存菜单坐标。
+                # Recheck both the selected UIA row and the live menu before copying anything.
+                if require_active:
+                    _verify_selected_row(window._hWnd, row, require_unique_name=require_unique_name)
                 current = menu_action(checked_frame())[1]
                 if current is None or any(abs(current[key] - action[key]) > 2 for key in ("left", "top", "right", "bottom")):
                     raise RuntimeError("QQ_CONTACT_NUMBER_MENU_CHANGED")
                 clipboard = ClipboardCopy()
                 clipboard.mark()
                 click_at(signature["left"] + current["left"] + (current["right"] - current["left"]) // 2,
-                         signature["top"] + current["top"] + (current["bottom"] - current["top"]) // 2, restore=False, smooth=False)
+                         signature["top"] + current["top"] + (current["bottom"] - current["top"]) // 2,
+                         restore=False, smooth=False)
                 action_barrier = self._clock()
                 value = clipboard.read(expected_pid=signature["pid"]).strip()
                 if not re.fullmatch(r"[1-9][0-9]{4,19}", value):
                     raise RuntimeError("QQ_CONTACT_NUMBER_INVALID")
-                # 点击菜单项后指针就停在菜单项上，而菜单紧贴被点的行出现：指针可能正压着
-                # 相邻的一行。真机实测常驻 235 灰的行（如「我的手机」）被悬停时画成 226 灰，
-                # 与激活行同档，于是下面的激活行复核会同时命中两行，误报 ACTIVE_AMBIGUOUS。
-                # 复制动作已经结束，这里先把指针停回列表外的空白处再取复核帧，让复核帧与
-                # 开头基准帧保持同一不变式：没有悬停高亮、也没有压在行上的指针。
+                # Closing the menu and moving the pointer do not infer identity from row color.
                 park_pointer(window)
                 action_barrier = self._clock()
                 frame = checked_frame()
                 if menu_action(frame)[1] is not None:
                     raise RuntimeError("QQ_CONTACT_NUMBER_MENU_CHANGED")
                 menu_open = False
-                # 菜单关闭后，原头像和文字区必须仍属于同一行。扫描非激活行时不能要求它
-                # 已经是激活行；激活/发送链路仍用 require_active=True 做严格复核。
-                local = frame.crop((rect["left"], rect["top"], rect["right"], rect["bottom"]))
-                after = RegionResult(region.screen_region, region.image_region, local, frame)
-                same_geometry = any(_same_row_geometry(row, candidate) for candidate in visible_rows(after))
-                if not same_geometry or not _same_avatar(avatar_image, frame.crop(avatar_box)):
-                    logger.warning("contacts.number.identity_changed part=closed_row")
-                    raise RuntimeError("QQ_CONTACT_NUMBER_ROW_CHANGED")
-                if require_active and not _same_row_geometry(row, _active_row(after)):
-                    logger.warning("contacts.number.identity_changed part=active_row")
-                    raise RuntimeError("QQ_CONTACT_NUMBER_ROW_CHANGED")
+                if require_active:
+                    _verify_selected_row(window._hWnd, row, require_unique_name=require_unique_name)
                 return value
         except ClipboardCopyError as exc:
             code = f"QQ_CONTACT_NUMBER_{exc}"
